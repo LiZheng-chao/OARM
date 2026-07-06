@@ -3,9 +3,15 @@ from typing import Dict
 import torch
 
 
-def reaction_margin_metrics(margin: torch.Tensor, threshold: float = 0.0) -> Dict[str, torch.Tensor]:
+def reaction_margin_metrics(
+    margin: torch.Tensor,
+    threshold: float = 0.0,
+    valid_mask: torch.Tensor = None,
+) -> Dict[str, torch.Tensor]:
     margin = margin.float()
     finite = torch.isfinite(margin)
+    if valid_mask is not None:
+        finite = finite & valid_mask.reshape_as(margin).bool()
     zero = torch.zeros((), device=margin.device)
     if not bool(finite.any()):
         return {
@@ -26,10 +32,16 @@ def reaction_margin_metrics(margin: torch.Tensor, threshold: float = 0.0) -> Dic
     }
 
 
-def margin_prediction_metrics(pred_margin: torch.Tensor, label_margin: torch.Tensor) -> Dict[str, torch.Tensor]:
+def margin_prediction_metrics(
+    pred_margin: torch.Tensor,
+    label_margin: torch.Tensor,
+    valid_mask: torch.Tensor = None,
+) -> Dict[str, torch.Tensor]:
     pred_margin = pred_margin.reshape_as(label_margin).float()
     label_margin = label_margin.float()
     finite = torch.isfinite(pred_margin) & torch.isfinite(label_margin)
+    if valid_mask is not None:
+        finite = finite & valid_mask.reshape_as(label_margin).bool()
     zero = torch.zeros((), device=pred_margin.device)
     if not bool(finite.any()):
         return {
@@ -105,6 +117,7 @@ def pairwise_ranking_accuracy(
     margin_label: torch.Tensor,
     traj_num: int,
     margin_delta: float = 0.15,
+    valid_mask: torch.Tensor = None,
 ) -> Dict[str, torch.Tensor]:
     if traj_num <= 1 or utility_score.numel() % traj_num != 0:
         zero = torch.zeros((), device=utility_score.device)
@@ -113,6 +126,8 @@ def pairwise_ranking_accuracy(
     utility = utility_score.reshape(batch_size, traj_num)
     margin = margin_label.reshape(batch_size, traj_num)
     finite = torch.isfinite(utility) & torch.isfinite(margin)
+    if valid_mask is not None:
+        finite = finite & valid_mask.reshape(batch_size, traj_num).bool()
     preference = (margin[:, :, None] - margin[:, None, :]) > margin_delta
     preference = preference & finite[:, :, None] & finite[:, None, :]
     if not bool(preference.any()):

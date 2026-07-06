@@ -189,8 +189,8 @@ if __name__ == "__main__":
         experiment_options={
             "stage": args.stage,
             "config": args.config,
-"seed": args.seed,
-"argv": sys.argv,
+            "seed": args.seed,
+            "argv": sys.argv,
             "epoch": args.epoch,
             "batch_size": args.batch_size,
             "lr": args.lr,

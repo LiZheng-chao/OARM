@@ -21,11 +21,11 @@ class OARMAnchorSet:
 
 
 class OARMCandidateGenerator:
-    """OARM-V3 anchor generator scaffold.
+    """OARM anchor generator with stage-aware typed candidates.
 
-    V0-V2 still use YOPO's lattice anchors. This class adds explicit candidate
-    types so later experiments can split progress/probe/brake anchors without
-    changing the network output contract.
+    V0 can use plain YOPO anchors for baseline isolation. V1/V2 use
+    occlusion-conditioned progress/probe/brake typed anchors, while V3/Full
+    can opt into additional yield anchors through ``enable_yield``.
     """
 
     PROGRESS = 0
@@ -67,7 +67,8 @@ class OARMCandidateGenerator:
         """Generate typed anchors from depth-frontier evidence.
 
         Low-frontier cells keep fast progress anchors. Medium frontier cells
-        become probe anchors. Higher-risk cells become brake or yield anchors.
+        become probe anchors. Higher-risk cells become brake anchors, with
+        yield anchors only when the V3/Full switch enables them.
         This is still a lightweight proxy, but the decoding path now actually
         depends on OARM anchors instead of hard-coded YOPO lattice anchors.
         """

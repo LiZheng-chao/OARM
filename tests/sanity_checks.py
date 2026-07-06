@@ -1,11 +1,13 @@
 import argparse
 import math
+from types import SimpleNamespace
 
 import torch
 from torch.utils.data import DataLoader
 
 from OARM.config import oarm_cfg
 from OARM.dataset import OARMDataset
+from OARM.eval.eval_dataset import maybe_generate_reaction_margin_labels
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_state_transform import rotate_body2world, state_body2world
@@ -191,6 +193,70 @@ def check_goal_yaw_matches_yopo_calculate_yaw(device):
     print("goal_yaw_matches_yopo_calculate_yaw ok", float((yaw_ref - expected).abs().max().detach().cpu()))
 
 
+class CaptureYawLabeler:
+    def __call__(
+        self,
+        sampled_pos_w,
+        sampled_time,
+        yaw_ref,
+        risk_points_w,
+        risk_weight=None,
+        visibility_mask=None,
+    ):
+        label = yaw_ref.mean(dim=1)
+        return {
+            "reaction_margin_softmin": label,
+            "reaction_margin_min": label,
+            "reaction_margin_valid": torch.ones_like(label, dtype=torch.bool),
+            "arrival_time_min": torch.zeros_like(label),
+        }
+
+
+def check_eval_label_generation_uses_deployed_yaw_mode(device):
+    start_state = torch.tensor([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], device=device)
+    end_state = torch.tensor([[[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], device=device)
+    flat = {
+        "traj_time": torch.ones(1, device=device),
+        "yaw_terminal": torch.zeros(1, device=device),
+    }
+    flat_labels = {
+        "risk_points_w": torch.tensor([[[1.0, 1.0, 0.0]]], device=device),
+        "risk_weight": torch.ones(1, 1, device=device),
+        "yaw0": torch.zeros(1, device=device),
+        "yaw_rate0": torch.zeros(1, device=device),
+    }
+    args = SimpleNamespace(eval_reaction_margin=True)
+    map_id = torch.zeros(1, dtype=torch.long, device=device)
+    goal_w = torch.tensor([[0.0, 5.0, 0.0]], device=device)
+    goal_labels = maybe_generate_reaction_margin_labels(
+        dict(flat_labels),
+        flat,
+        start_state,
+        end_state,
+        map_id,
+        goal_w,
+        args,
+        CaptureYawLabeler(),
+        None,
+        OARMLoss(deployed_yaw_mode="goal"),
+    )
+    predicted_labels = maybe_generate_reaction_margin_labels(
+        dict(flat_labels),
+        flat,
+        start_state,
+        end_state,
+        map_id,
+        goal_w,
+        args,
+        CaptureYawLabeler(),
+        None,
+        OARMLoss(deployed_yaw_mode="predicted"),
+    )
+    assert "reaction_margin_valid" in goal_labels
+    assert not torch.allclose(goal_labels["reaction_margin"], predicted_labels["reaction_margin"])
+    print("eval_label_generation_uses_deployed_yaw_mode ok")
+
+
 def check_dataset_sample(dataset_root=None):
     try:
         dataset = OARMDataset(mode="train", dataset_root=dataset_root)
@@ -291,6 +357,7 @@ def main():
     check_candidate_device(device)
     check_risk_point_guidance(device)
     check_goal_yaw_matches_yopo_calculate_yaw(device)
+    check_eval_label_generation_uses_deployed_yaw_mode(device)
     if not args.skip_dataset:
         check_dataset_sample(args.dataset_root or None)
     if args.one_batch_loss:

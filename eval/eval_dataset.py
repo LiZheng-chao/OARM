@@ -19,7 +19,7 @@ from OARM.eval.metrics_reaction_margin import (
 from OARM.loss import OARMLoss
 from OARM.loss.reaction_margin_loss import weak_margin_label_from_risk
 from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
-from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial, sample_yaw_cubic, yaw_cubic_coefficients
+from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_state_transform import rotate_body2world, state_body2world
 from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
@@ -84,6 +84,8 @@ def flatten_labels(labels, flat, device, args):
         flat_labels["occlusion_risk"] = labels["occlusion_risk"].to(device).reshape(-1)
     if args.eval_reaction_margin and "reaction_margin" in labels:
         flat_labels["reaction_margin"] = labels["reaction_margin"].to(device).reshape(-1)
+        if "reaction_margin_valid" in labels:
+            flat_labels["reaction_margin_valid"] = labels["reaction_margin_valid"].to(device).reshape(-1)
     elif args.eval_reaction_margin and args.use_weak_margin_label and "occlusion_risk" in flat_labels:
         flat_labels["reaction_margin"] = weak_margin_label_from_risk(flat["traj_time"], flat_labels["occlusion_risk"])
     if args.eval_yield_feasibility and "yield_feasible" in labels:
@@ -146,9 +148,11 @@ def maybe_generate_reaction_margin_labels(
     start_state_w,
     end_state_w,
     map_id_expanded,
+    goal_w,
     args,
     labeler,
     line_of_sight,
+    yaw_helper,
 ):
     if "reaction_margin" in flat_labels or not args.eval_reaction_margin:
         return flat_labels
@@ -158,7 +162,7 @@ def maybe_generate_reaction_margin_labels(
     eval_points = 30
     traj_time = flat["traj_time"]
     coeff = quintic_coefficients(start_state_w, end_state_w, traj_time)
-    sampled_pos, _, _, _ = sample_polynomial(coeff, traj_time, eval_points, include_zero=True)
+    sampled_pos, sampled_vel, _, _ = sample_polynomial(coeff, traj_time, eval_points, include_zero=True)
     sampled_time = sampled_time_grid(traj_time, eval_points, include_zero=True)
 
     risk_points_w = expand_candidate_label(flat_labels["risk_points_w"], traj_time.shape[0], traj_time)
@@ -178,8 +182,16 @@ def maybe_generate_reaction_margin_labels(
     else:
         yaw_rate0 = expand_candidate_label(yaw_rate0, traj_time.shape[0], traj_time)
 
-    yaw_coeff = yaw_cubic_coefficients(yaw0, yaw_rate0, flat["yaw_terminal"], traj_time)
-    yaw_ref, _ = sample_yaw_cubic(yaw_coeff, traj_time, eval_points, include_zero=True)
+    yaw_ref, _ = yaw_helper.deployed_yaw_reference(
+        yaw0,
+        yaw_rate0,
+        flat["yaw_terminal"],
+        traj_time,
+        sampled_pos,
+        sampled_vel,
+        sampled_time,
+        goal_w,
+    )
     visibility_mask = None
     if line_of_sight is not None:
         visibility_mask = line_of_sight(sampled_pos, risk_points_w, map_id_expanded.reshape(-1))
@@ -192,6 +204,7 @@ def maybe_generate_reaction_margin_labels(
         visibility_mask=visibility_mask,
     )
     flat_labels["reaction_margin"] = margin_labels["reaction_margin_softmin"].detach()
+    flat_labels["reaction_margin_valid"] = margin_labels["reaction_margin_valid"].detach()
     return flat_labels
 
 
@@ -224,9 +237,16 @@ def selected_candidate_stats(candidate, accumulator, flat_labels=None):
     if flat_labels is not None and "reaction_margin" in flat_labels:
         flat_margin = flat_labels["reaction_margin"].reshape(batch_size, -1)
         finite_margin = torch.isfinite(flat_margin)
+        valid_margin = flat_labels.get("reaction_margin_valid")
+        if valid_margin is not None:
+            finite_margin = finite_margin & valid_margin.reshape_as(flat_margin).bool()
         add_metric(accumulator, "selected_margin_finite_rate", finite_margin.float().mean(), batch_size)
+        add_metric(accumulator, "selected_margin_valid_rate", finite_margin.float().mean(), batch_size)
         selected_margin = flat_margin.gather(1, best_id[:, None]).squeeze(1)
         selected_finite = torch.isfinite(selected_margin)
+        if valid_margin is not None:
+            selected_valid_mask = valid_margin.reshape_as(flat_margin).bool().gather(1, best_id[:, None]).squeeze(1)
+            selected_finite = selected_finite & selected_valid_mask
         if bool(selected_finite.any()):
             selected_valid = selected_margin[selected_finite]
             selected_weight = int(selected_valid.numel())
@@ -256,6 +276,7 @@ def selected_candidate_stats(candidate, accumulator, flat_labels=None):
             oracle_weight = int(oracle_type.numel())
             for type_id, name in TYPE_NAMES.items():
                 add_metric(accumulator, f"oracle_{name}_rate", (oracle_type == type_id).float().mean(), oracle_weight)
+
 
 def evaluate(args):
     apply_eval_stage(args)
@@ -340,9 +361,11 @@ def evaluate(args):
                 start_state_w,
                 end_state_w,
                 map_id_expanded,
+                goal_w,
                 args,
                 margin_labeler,
                 line_of_sight,
+                loss_fn,
             )
             loss_dict = loss_fn(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
 
@@ -354,16 +377,18 @@ def evaluate(args):
             selected_candidate_stats(candidate, accumulator, flat_labels)
 
             if "reaction_margin" in flat_labels:
-                margin_metrics = reaction_margin_metrics(flat_labels["reaction_margin"])
+                margin_valid = flat_labels.get("reaction_margin_valid")
+                margin_metrics = reaction_margin_metrics(flat_labels["reaction_margin"], valid_mask=margin_valid)
                 for key, value in margin_metrics.items():
                     add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
-                pred_metrics = margin_prediction_metrics(flat["margin_pred"], flat_labels["reaction_margin"])
+                pred_metrics = margin_prediction_metrics(flat["margin_pred"], flat_labels["reaction_margin"], valid_mask=margin_valid)
                 for key, value in pred_metrics.items():
                     add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
                 ranking_metrics = pairwise_ranking_accuracy(
                     flat["utility_score"],
                     flat_labels["reaction_margin"],
                     cfg["traj_num"],
+                    valid_mask=margin_valid,
                 )
                 for key, value in ranking_metrics.items():
                     add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
