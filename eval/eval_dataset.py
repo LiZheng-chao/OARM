@@ -1,0 +1,471 @@
+import argparse
+import json
+import math
+import os
+from collections import defaultdict
+
+import torch
+from torch.utils.data import DataLoader
+
+from OARM.dataset import OARMDataset
+from OARM.config import get_oarm_training_preset
+from OARM.eval.metrics_backup_feasibility import backup_feasibility_metrics
+from OARM.eval.metrics_reaction_margin import (
+    margin_prediction_metrics,
+    pairwise_ranking_accuracy,
+    reaction_margin_metrics,
+    risk_calibration_metrics,
+)
+from OARM.loss import OARMLoss
+from OARM.loss.reaction_margin_loss import weak_margin_label_from_risk
+from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
+from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial, sample_yaw_cubic, yaw_cubic_coefficients
+from OARM.policy.oarm_network import OARMNetwork
+from OARM.policy.oarm_state_transform import rotate_body2world, state_body2world
+from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
+from OARM.utils.visible_free_distance import visible_free_distance_from_depth
+from OARM.utils.yopo_compat import ensure_yopo_path
+from OARM.utils.yopo_dataset_context import yopo_dataset_cfg
+from OARM.visibility.reaction_margin_labeler import ReactionMarginLabeler
+
+ensure_yopo_path()
+from config.config import cfg
+
+
+TYPE_NAMES = {
+    OARMCandidateGenerator.PROGRESS: "progress",
+    OARMCandidateGenerator.PROBE: "probe",
+    OARMCandidateGenerator.BRAKE: "brake",
+    OARMCandidateGenerator.YIELD: "yield",
+}
+
+
+EVAL_STAGE_MAP = {
+    "eval_occlusion_risk": "train_occlusion_risk",
+    "eval_risk_point_guidance": "train_risk_point_guidance",
+    "eval_reaction_margin": "train_reaction_margin",
+    "eval_margin_ranking": "train_margin_ranking",
+    "eval_backup_feasibility": "train_yield_feasibility",
+    "eval_yield_feasibility": "train_yield_feasibility",
+    "use_weak_margin_label": "use_weak_margin_label",
+    "use_esdf_collision": "use_esdf_collision",
+    "use_occlusion_aware_visibility": "use_occlusion_aware_visibility",
+    "use_privileged_risk_filter": "use_privileged_risk_filter",
+}
+
+
+def tensor_scalar(value):
+    if torch.is_tensor(value):
+        return float(value.detach().cpu())
+    return float(value)
+
+
+def add_metric(accumulator, key, value, weight=1):
+    value = tensor_scalar(value)
+    if weight <= 0 or not math.isfinite(value):
+        return
+    accumulator[key].append((value, weight))
+
+
+def finalize_metrics(accumulator):
+    metrics = {}
+    for key, values in accumulator.items():
+        finite_values = [(v, w) for v, w in values if math.isfinite(v) and w > 0]
+        if not finite_values:
+            continue
+        total_weight = sum(w for _, w in finite_values)
+        metrics[key] = sum(v * w for v, w in finite_values) / max(total_weight, 1)
+    return metrics
+
+
+def flatten_labels(labels, flat, device, args):
+    flat_labels = {}
+    if args.eval_occlusion_risk and "occlusion_risk" in labels:
+        flat_labels["occlusion_risk"] = labels["occlusion_risk"].to(device).reshape(-1)
+    if args.eval_reaction_margin and "reaction_margin" in labels:
+        flat_labels["reaction_margin"] = labels["reaction_margin"].to(device).reshape(-1)
+    elif args.eval_reaction_margin and args.use_weak_margin_label and "occlusion_risk" in flat_labels:
+        flat_labels["reaction_margin"] = weak_margin_label_from_risk(flat["traj_time"], flat_labels["occlusion_risk"])
+    if args.eval_yield_feasibility and "yield_feasible" in labels:
+        flat_labels["backup_feasible"] = labels["yield_feasible"].to(device).reshape(-1)
+    elif args.eval_yield_feasibility and "backup_feasible" in labels:
+        flat_labels["backup_feasible"] = labels["backup_feasible"].to(device).reshape(-1)
+    if args.eval_risk_point_guidance and "risk_points_w" in labels:
+        flat_labels["risk_points_w"] = labels["risk_points_w"].to(device)
+        if "risk_weight" in labels:
+            flat_labels["risk_weight"] = labels["risk_weight"].to(device)
+        if "yaw0" in labels:
+            flat_labels["yaw0"] = labels["yaw0"].to(device)
+        if "yaw_rate0" in labels:
+            flat_labels["yaw_rate0"] = labels["yaw_rate0"].to(device)
+    return flat_labels
+
+
+def build_world_states(pos, rot, obs_b, flat):
+    goal_w = rotate_body2world(rot, obs_b[:, 6:9])
+    start_vel_w = rotate_body2world(rot, obs_b[:, 0:3])
+    start_acc_w = rotate_body2world(rot, obs_b[:, 3:6])
+    start_state_w = torch.stack([pos, start_vel_w, start_acc_w], dim=1)
+
+    traj_num = cfg["traj_num"]
+    endstate_flat = flat["end_state_b"]
+    pos_expanded = pos.repeat_interleave(traj_num, dim=0)
+    rot_expanded = rot.repeat_interleave(traj_num, dim=0)
+    start_state_w = start_state_w.repeat_interleave(traj_num, dim=0)
+    goal_w = goal_w.repeat_interleave(traj_num, dim=0)
+
+    end_pos_w, end_vel_w, end_acc_w = state_body2world(
+        pos_expanded,
+        rot_expanded,
+        endstate_flat[:, 0:3],
+        endstate_flat[:, 3:6],
+        endstate_flat[:, 6:9],
+    )
+    end_state_w = torch.stack([end_pos_w, end_vel_w, end_acc_w], dim=1)
+    return start_state_w, end_state_w, goal_w
+
+
+def expand_candidate_label(label, candidate_count, like):
+    label = label.to(device=like.device, dtype=like.dtype)
+    if label.shape[0] == candidate_count:
+        return label
+    if candidate_count % label.shape[0] != 0:
+        raise ValueError(f"Cannot expand label with first dim {label.shape[0]} to {candidate_count} candidates")
+    return label.repeat_interleave(candidate_count // label.shape[0], dim=0)
+
+
+def sampled_time_grid(traj_time, eval_points, include_zero=True):
+    start = 0.0 if include_zero else 1.0 / eval_points
+    tau = torch.linspace(start, 1.0, eval_points, device=traj_time.device, dtype=traj_time.dtype)
+    return traj_time[:, None] * tau[None, :]
+
+
+def maybe_generate_reaction_margin_labels(
+    flat_labels,
+    flat,
+    start_state_w,
+    end_state_w,
+    map_id_expanded,
+    args,
+    labeler,
+    line_of_sight,
+):
+    if "reaction_margin" in flat_labels or not args.eval_reaction_margin:
+        return flat_labels
+    if "risk_points_w" not in flat_labels:
+        return flat_labels
+
+    eval_points = 30
+    traj_time = flat["traj_time"]
+    coeff = quintic_coefficients(start_state_w, end_state_w, traj_time)
+    sampled_pos, _, _, _ = sample_polynomial(coeff, traj_time, eval_points, include_zero=True)
+    sampled_time = sampled_time_grid(traj_time, eval_points, include_zero=True)
+
+    risk_points_w = expand_candidate_label(flat_labels["risk_points_w"], traj_time.shape[0], traj_time)
+    risk_weight = flat_labels.get("risk_weight")
+    if risk_weight is None:
+        risk_weight = torch.ones(risk_points_w.shape[:-1], device=traj_time.device, dtype=traj_time.dtype)
+    else:
+        risk_weight = expand_candidate_label(risk_weight, traj_time.shape[0], traj_time)
+    yaw0 = flat_labels.get("yaw0")
+    if yaw0 is None:
+        yaw0 = torch.zeros_like(traj_time)
+    else:
+        yaw0 = expand_candidate_label(yaw0, traj_time.shape[0], traj_time)
+    yaw_rate0 = flat_labels.get("yaw_rate0")
+    if yaw_rate0 is None:
+        yaw_rate0 = torch.zeros_like(traj_time)
+    else:
+        yaw_rate0 = expand_candidate_label(yaw_rate0, traj_time.shape[0], traj_time)
+
+    yaw_coeff = yaw_cubic_coefficients(yaw0, yaw_rate0, flat["yaw_terminal"], traj_time)
+    yaw_ref, _ = sample_yaw_cubic(yaw_coeff, traj_time, eval_points, include_zero=True)
+    visibility_mask = None
+    if line_of_sight is not None:
+        visibility_mask = line_of_sight(sampled_pos, risk_points_w, map_id_expanded.reshape(-1))
+    margin_labels = labeler(
+        sampled_pos,
+        sampled_time,
+        yaw_ref,
+        risk_points_w,
+        risk_weight,
+        visibility_mask=visibility_mask,
+    )
+    flat_labels["reaction_margin"] = margin_labels["reaction_margin_softmin"].detach()
+    return flat_labels
+
+
+def selected_candidate_stats(candidate, accumulator, flat_labels=None):
+    utility = candidate.utility_score.reshape(candidate.utility_score.shape[0], -1)
+    best_id = utility.argmax(dim=1)
+    batch_size = utility.shape[0]
+    add_metric(accumulator, "selected_utility", utility.gather(1, best_id[:, None]).mean(), batch_size)
+
+    flat_time = candidate.traj_time.reshape(batch_size, -1)
+    add_metric(accumulator, "selected_time", flat_time.gather(1, best_id[:, None]).mean(), batch_size)
+
+    if candidate.risk_logit is not None:
+        flat_risk = torch.sigmoid(candidate.risk_logit.reshape(batch_size, -1))
+        add_metric(accumulator, "selected_pred_risk", flat_risk.gather(1, best_id[:, None]).mean(), batch_size)
+
+    if candidate.backup_logit is not None:
+        flat_backup = torch.sigmoid(candidate.backup_logit.reshape(batch_size, -1))
+        selected_backup = flat_backup.gather(1, best_id[:, None]).mean()
+        add_metric(accumulator, "selected_pred_backup", selected_backup, batch_size)
+        add_metric(accumulator, "selected_pred_yield", selected_backup, batch_size)
+
+    if candidate.candidate_type is not None:
+        flat_type = candidate.candidate_type.reshape(batch_size, -1)
+        selected_type = flat_type.gather(1, best_id[:, None]).squeeze(1)
+        for type_id, name in TYPE_NAMES.items():
+            add_metric(accumulator, f"selected_{name}_rate", (selected_type == type_id).float().mean(), batch_size)
+            add_metric(accumulator, f"all_{name}_rate", (flat_type == type_id).float().mean(), batch_size)
+
+    if flat_labels is not None and "reaction_margin" in flat_labels:
+        flat_margin = flat_labels["reaction_margin"].reshape(batch_size, -1)
+        finite_margin = torch.isfinite(flat_margin)
+        add_metric(accumulator, "selected_margin_finite_rate", finite_margin.float().mean(), batch_size)
+        selected_margin = flat_margin.gather(1, best_id[:, None]).squeeze(1)
+        selected_finite = torch.isfinite(selected_margin)
+        if bool(selected_finite.any()):
+            selected_valid = selected_margin[selected_finite]
+            selected_weight = int(selected_valid.numel())
+            add_metric(accumulator, "selected_reaction_margin", selected_valid.mean(), selected_weight)
+            add_metric(accumulator, "selected_reaction_margin_violation_rate", (selected_valid < 0.0).float().mean(), selected_weight)
+            add_metric(accumulator, "selected_rmvr", (selected_valid < 0.0).float().mean(), selected_weight)
+        oracle_valid = finite_margin.any(dim=1)
+        oracle_source = flat_margin.masked_fill(~finite_margin, -torch.inf)
+        oracle_margin, oracle_id = oracle_source.max(dim=1)
+        safe_available = (oracle_margin > 0.0) & oracle_valid
+        add_metric(accumulator, "safe_candidate_available_rate", safe_available.float().mean(), batch_size)
+        if bool(oracle_valid.any()):
+            oracle_valid_margin = oracle_margin[oracle_valid]
+            oracle_weight = int(oracle_valid_margin.numel())
+            add_metric(accumulator, "oracle_best_reaction_margin", oracle_valid_margin.mean(), oracle_weight)
+            add_metric(accumulator, "oracle_margin_selected_rate", (best_id[oracle_valid] == oracle_id[oracle_valid]).float().mean(), oracle_weight)
+        gap_mask = oracle_valid & selected_finite
+        if bool(gap_mask.any()):
+            selected_safe = selected_margin[gap_mask] > 0.0
+            gap_weight = int(gap_mask.float().sum().item())
+            oracle_gap = oracle_margin[gap_mask] - selected_margin[gap_mask]
+            add_metric(accumulator, "margin_oracle_gap", oracle_gap.mean(), gap_weight)
+            add_metric(accumulator, "safe_candidate_missed_rate", (safe_available[gap_mask] & ~selected_safe).float().mean(), gap_weight)
+        if candidate.candidate_type is not None and bool(oracle_valid.any()):
+            flat_type = candidate.candidate_type.reshape(batch_size, -1)
+            oracle_type = flat_type.gather(1, oracle_id[:, None]).squeeze(1)[oracle_valid]
+            oracle_weight = int(oracle_type.numel())
+            for type_id, name in TYPE_NAMES.items():
+                add_metric(accumulator, f"oracle_{name}_rate", (oracle_type == type_id).float().mean(), oracle_weight)
+
+def evaluate(args):
+    apply_eval_stage(args)
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
+    device = torch.device(args.device)
+
+    dataset = OARMDataset(
+        mode=args.mode,
+        dataset_root=args.dataset_root or None,
+        use_privileged_risk_filter=args.use_privileged_risk_filter,
+    )
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+
+    policy = OARMNetwork(
+        candidate_mode=args.candidate_mode,
+        backbone_mode=args.backbone_mode,
+        enable_yield_candidates=args.enable_yield_candidates,
+    ).to(device)
+    if args.checkpoint:
+        state_dict, checkpoint_metadata = load_oarm_checkpoint(args.checkpoint, map_location=device)
+        validate_checkpoint_metadata(
+            checkpoint_metadata,
+            args.candidate_mode,
+            args.backbone_mode,
+            allow_mismatch=args.allow_checkpoint_mismatch,
+            enable_yield_candidates=args.enable_yield_candidates,
+            deployed_yaw_mode=args.deployed_yaw_mode,
+        )
+        policy.load_state_dict(state_dict)
+        print(f"Loaded checkpoint: {args.checkpoint}")
+    else:
+        print("No checkpoint provided; evaluating randomly initialized OARMNetwork.")
+    policy.eval()
+
+    with yopo_dataset_cfg(args.dataset_root or None):
+        loss_fn = OARMLoss(
+            use_esdf_collision=args.use_esdf_collision,
+            use_occlusion_aware_visibility=args.use_occlusion_aware_visibility,
+            enable_occlusion_risk=args.eval_occlusion_risk,
+            enable_risk_point_guidance=args.eval_risk_point_guidance,
+            enable_reaction_margin=args.eval_reaction_margin,
+            enable_margin_ranking=args.eval_margin_ranking,
+            enable_yaw_visibility=args.eval_yaw_visibility,
+            deployed_yaw_mode=args.deployed_yaw_mode,
+            enable_yield_feasibility=args.eval_backup_feasibility,
+        )
+        line_of_sight = None
+        if args.use_occlusion_aware_visibility:
+            from OARM.visibility.esdf_visibility import ESDFLineOfSight
+
+            line_of_sight = ESDFLineOfSight(device=device)
+    margin_labeler = ReactionMarginLabeler()
+    accumulator = defaultdict(list)
+    seen_batches = 0
+
+    with torch.inference_mode():
+        for batch_id, (depth, pos, rot, obs_b, map_id, labels) in enumerate(loader):
+            if args.max_batches is not None and batch_id >= args.max_batches:
+                break
+
+            depth = depth.to(device)
+            pos = pos.to(device)
+            rot = rot.to(device)
+            obs_b = obs_b.to(device)
+            map_id = map_id.to(device)
+
+            candidate = policy.inference(depth, obs_b)
+            flat = candidate.flatten()
+            flat_labels = flatten_labels(labels, flat, device, args)
+
+            start_state_w, end_state_w, goal_w = build_world_states(pos, rot, obs_b, flat)
+            if args.eval_yield_feasibility:
+                flat_labels["visible_free_distance"] = visible_free_distance_from_depth(
+                    depth,
+                    flat["end_state_b"][:, 0:3],
+                )
+            map_id_expanded = map_id.repeat_interleave(cfg["traj_num"], dim=0)
+            flat_labels = maybe_generate_reaction_margin_labels(
+                flat_labels,
+                flat,
+                start_state_w,
+                end_state_w,
+                map_id_expanded,
+                args,
+                margin_labeler,
+                line_of_sight,
+            )
+            loss_dict = loss_fn(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
+
+            batch_size = depth.shape[0]
+            for key, value in loss_dict.items():
+                if torch.is_tensor(value) and value.dim() == 0:
+                    add_metric(accumulator, key, value, batch_size)
+
+            selected_candidate_stats(candidate, accumulator, flat_labels)
+
+            if "reaction_margin" in flat_labels:
+                margin_metrics = reaction_margin_metrics(flat_labels["reaction_margin"])
+                for key, value in margin_metrics.items():
+                    add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
+                pred_metrics = margin_prediction_metrics(flat["margin_pred"], flat_labels["reaction_margin"])
+                for key, value in pred_metrics.items():
+                    add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
+                ranking_metrics = pairwise_ranking_accuracy(
+                    flat["utility_score"],
+                    flat_labels["reaction_margin"],
+                    cfg["traj_num"],
+                )
+                for key, value in ranking_metrics.items():
+                    add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
+
+            if "occlusion_risk" in flat_labels:
+                risk_metrics = risk_calibration_metrics(flat["risk_logit"], flat_labels["occlusion_risk"])
+                for key, value in risk_metrics.items():
+                    add_metric(accumulator, key, value, flat_labels["occlusion_risk"].numel())
+
+            if "backup_feasible" in flat_labels:
+                backup_metrics = backup_feasibility_metrics(
+                    flat["backup_logit"],
+                    flat_labels["backup_feasible"],
+                    flat_labels.get("reaction_margin"),
+                )
+                for key, value in backup_metrics.items():
+                    add_metric(accumulator, key, value, flat_labels["backup_feasible"].numel())
+
+            seen_batches += 1
+
+    metrics = finalize_metrics(accumulator)
+    metrics["batches"] = seen_batches
+    metrics["samples"] = seen_batches * args.batch_size
+    metrics["stage"] = args.stage
+    metrics["dataset_root"] = args.dataset_root
+    metrics["online_inputs"] = ["depth", "state", "goal"]
+    metrics["yield_feasibility_eval"] = bool(args.eval_yield_feasibility)
+    metrics["enable_yield_candidates"] = bool(args.enable_yield_candidates)
+    metrics["deployed_yaw_mode"] = args.deployed_yaw_mode
+    metrics["eval_yaw_visibility"] = bool(args.eval_yaw_visibility)
+    metrics["privileged_training"] = bool(
+        args.use_privileged_risk_filter
+        or args.use_occlusion_aware_visibility
+        or args.use_esdf_collision
+        or args.eval_reaction_margin
+        or args.eval_risk_point_guidance
+    )
+    metrics["mapless_online_inference"] = True
+    print(json.dumps(metrics, indent=2, sort_keys=True))
+
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, sort_keys=True)
+        print(f"Wrote metrics: {args.output}")
+
+
+def parser():
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--stage",
+        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "full"],
+        default="v0",
+        help="named evaluation preset matching OARM/train_oarm.py",
+    )
+    p.add_argument("--checkpoint", type=str, default="")
+    p.add_argument("--allow-checkpoint-mismatch", action="store_true")
+    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier"], default="")
+    p.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="")
+    p.add_argument("--enable-yield-candidates", action="store_true")
+    p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
+    p.add_argument("--mode", choices=["train", "valid"], default="valid")
+    p.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--max-batches", type=int, default=None)
+    p.add_argument("--dataset-root", type=str, default="")
+    p.add_argument("--eval-occlusion-risk", action="store_true")
+    p.add_argument("--eval-reaction-margin", action="store_true")
+    p.add_argument("--eval-margin-ranking", action="store_true")
+    p.add_argument("--eval-risk-point-guidance", action="store_true")
+    p.add_argument("--eval-yaw-visibility", action="store_true")
+    p.add_argument("--use-weak-margin-label", action="store_true")
+    p.add_argument("--eval-backup-feasibility", action="store_true")
+    p.add_argument("--eval-yield-feasibility", action="store_true")
+    p.add_argument("--use-esdf-collision", action="store_true")
+    p.add_argument("--use-occlusion-aware-visibility", action="store_true")
+    p.add_argument("--use-privileged-risk-filter", action="store_true")
+    p.add_argument("--output", type=str, default="")
+    return p
+
+
+def apply_eval_stage(args):
+    preset = get_oarm_training_preset(args.stage)
+    if not args.candidate_mode:
+        args.candidate_mode = preset.candidate_mode
+    if not args.backbone_mode:
+        args.backbone_mode = preset.backbone_mode
+    if not args.deployed_yaw_mode:
+        args.deployed_yaw_mode = preset.deployed_yaw_mode
+    if preset.enable_yield_candidates and not args.enable_yield_candidates:
+        args.enable_yield_candidates = True
+    for eval_key, preset_key in EVAL_STAGE_MAP.items():
+        if getattr(preset, preset_key) and not getattr(args, eval_key):
+            setattr(args, eval_key, True)
+    if preset.train_yaw_visibility and not args.eval_yaw_visibility:
+        args.eval_yaw_visibility = True
+    if args.eval_backup_feasibility:
+        args.eval_yield_feasibility = True
+    if args.eval_yield_feasibility:
+        args.eval_backup_feasibility = True
+
+
+if __name__ == "__main__":
+    evaluate(parser().parse_args())

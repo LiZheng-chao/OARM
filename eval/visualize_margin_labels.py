@@ -1,0 +1,257 @@
+import argparse
+import json
+import math
+import os
+
+import torch
+
+from OARM.dataset import OARMDataset
+from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
+from OARM.policy.oarm_network import OARMNetwork
+from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial, sample_yaw_cubic, yaw_cubic_coefficients
+from OARM.policy.oarm_state_transform import rotate_body2world, state_body2world
+from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
+from OARM.visibility.first_visible_time import arrival_time_to_points, first_visible_time
+from OARM.visibility.reaction_margin_labeler import ReactionMarginLabeler
+from OARM.utils.yopo_compat import ensure_yopo_path
+
+ensure_yopo_path()
+from config.config import cfg
+
+
+TYPE_NAMES = {
+    OARMCandidateGenerator.PROGRESS: "progress",
+    OARMCandidateGenerator.PROBE: "probe",
+    OARMCandidateGenerator.BRAKE: "brake",
+    OARMCandidateGenerator.YIELD: "yield",
+}
+
+
+def load_policy(
+    checkpoint,
+    device,
+    candidate_mode,
+    backbone_mode,
+    allow_checkpoint_mismatch,
+    enable_yield_candidates=False,
+    deployed_yaw_mode="goal",
+):
+    policy = OARMNetwork(
+        candidate_mode=candidate_mode,
+        backbone_mode=backbone_mode,
+        enable_yield_candidates=enable_yield_candidates,
+    ).to(device)
+    if checkpoint:
+        state_dict, checkpoint_metadata = load_oarm_checkpoint(checkpoint, map_location=device)
+        validate_checkpoint_metadata(
+            checkpoint_metadata,
+            candidate_mode,
+            backbone_mode,
+            allow_mismatch=allow_checkpoint_mismatch,
+            enable_yield_candidates=enable_yield_candidates,
+            deployed_yaw_mode=deployed_yaw_mode,
+        )
+        policy.load_state_dict(state_dict)
+    policy.eval()
+    return policy
+
+
+def sampled_time_grid(traj_time, eval_points, include_zero=True):
+    start = 0.0 if include_zero else 1.0 / eval_points
+    tau = torch.linspace(start, 1.0, eval_points, device=traj_time.device, dtype=traj_time.dtype)
+    return traj_time[:, None] * tau[None, :]
+
+
+def build_margin_labels(policy, dataset, sample_id, device, eval_points):
+    depth, pos, rot, obs_b, _map_id, labels = dataset[sample_id]
+    depth = depth.to(device).unsqueeze(0)
+    pos = torch.as_tensor(pos, dtype=torch.float32, device=device).unsqueeze(0)
+    rot = torch.as_tensor(rot, dtype=torch.float32, device=device).unsqueeze(0)
+    obs_b = torch.as_tensor(obs_b, dtype=torch.float32, device=device).unsqueeze(0)
+
+    with torch.inference_mode():
+        candidate = policy.inference(depth, obs_b)
+        flat = candidate.flatten()
+
+        traj_num = cfg["traj_num"]
+        start_vel_w = rotate_body2world(rot, obs_b[:, 0:3])
+        start_acc_w = rotate_body2world(rot, obs_b[:, 3:6])
+        start_state_w = torch.stack([pos, start_vel_w, start_acc_w], dim=1).repeat_interleave(traj_num, dim=0)
+
+        pos_expanded = pos.repeat_interleave(traj_num, dim=0)
+        rot_expanded = rot.repeat_interleave(traj_num, dim=0)
+        end_pos_w, end_vel_w, end_acc_w = state_body2world(
+            pos_expanded,
+            rot_expanded,
+            flat["end_state_b"][:, 0:3],
+            flat["end_state_b"][:, 3:6],
+            flat["end_state_b"][:, 6:9],
+        )
+        end_state_w = torch.stack([end_pos_w, end_vel_w, end_acc_w], dim=1)
+
+        coeff = quintic_coefficients(start_state_w, end_state_w, flat["traj_time"])
+        sampled_pos_w, _, _, _ = sample_polynomial(coeff, flat["traj_time"], eval_points, include_zero=True)
+        sampled_time = sampled_time_grid(flat["traj_time"], eval_points, include_zero=True)
+
+        risk_points_w = labels["risk_points_w"].to(device).unsqueeze(0).repeat_interleave(traj_num, dim=0)
+        risk_weight = labels["risk_weight"].to(device).unsqueeze(0).repeat_interleave(traj_num, dim=0)
+        yaw0 = labels.get("yaw0", torch.zeros((), dtype=torch.float32)).to(device).reshape(1).repeat_interleave(traj_num)
+        yaw_rate0 = labels.get("yaw_rate0", torch.zeros((), dtype=torch.float32)).to(device).reshape(1).repeat_interleave(traj_num)
+        yaw_coeff = yaw_cubic_coefficients(yaw0, yaw_rate0, flat["yaw_terminal"], flat["traj_time"])
+        yaw_ref, _ = sample_yaw_cubic(yaw_coeff, flat["traj_time"], eval_points, include_zero=True)
+
+        labeler = ReactionMarginLabeler()
+        margin_labels = labeler(sampled_pos_w, sampled_time, yaw_ref, risk_points_w, risk_weight)
+        first_vis = first_visible_time(
+            sampled_pos_w,
+            sampled_time,
+            yaw_ref,
+            risk_points_w,
+            horizon_fov_rad=math.radians(cfg["horizon_camera_fov"]),
+            vertical_fov_rad=math.radians(cfg["vertical_camera_fov"]),
+        )
+        arrival = arrival_time_to_points(sampled_pos_w, sampled_time, risk_points_w)
+
+    return {
+        "depth": depth.squeeze(0).detach().cpu(),
+        "frontier_map": labels["frontier_map"].detach().cpu(),
+        "risk_points_w": labels["risk_points_w"].detach().cpu(),
+        "risk_weight": labels["risk_weight"].detach().cpu(),
+        "start_pos_w": pos.squeeze(0).detach().cpu(),
+        "sampled_pos_w": sampled_pos_w.detach().cpu(),
+        "utility": flat["utility_score"].detach().cpu(),
+        "candidate_type": flat.get("candidate_type", torch.zeros(traj_num, dtype=torch.long, device=device)).detach().cpu(),
+        "traj_time": flat["traj_time"].detach().cpu(),
+        "margin_pred": flat["margin_pred"].detach().cpu(),
+        "margin_label": margin_labels["reaction_margin_softmin"].detach().cpu(),
+        "margin_min": margin_labels["reaction_margin_min"].detach().cpu(),
+        "first_visible_time_min": first_vis.detach().cpu().amin(dim=-1),
+        "arrival_time_min": arrival.detach().cpu().amin(dim=-1),
+    }
+
+
+def render_sample(data, output_png, output_json, top_k):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    utility = data["utility"]
+    selected = int(torch.argmax(utility))
+    top_ids = torch.topk(utility, k=min(top_k, utility.numel())).indices.tolist()
+    candidate_ids = sorted(set(top_ids + [selected]))
+    start = data["start_pos_w"]
+    risk_xy = data["risk_points_w"][:, :2] - start[:2]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    axes[0].imshow(data["depth"].squeeze(0), cmap="gray")
+    axes[0].set_title("depth")
+    axes[0].axis("off")
+
+    axes[1].imshow(data["frontier_map"].squeeze(0), cmap="magma")
+    axes[1].set_title("frontier / risk proxy")
+    axes[1].axis("off")
+
+    type_colors = {
+        "progress": "tab:blue",
+        "probe": "tab:green",
+        "brake": "tab:orange",
+        "yield": "tab:red",
+    }
+    for idx in candidate_ids:
+        ctype = TYPE_NAMES.get(int(data["candidate_type"][idx]), str(int(data["candidate_type"][idx])))
+        xy = data["sampled_pos_w"][idx, :, :2] - start[:2]
+        linewidth = 2.8 if idx == selected else 1.2
+        label = f"{idx}:{ctype} m={float(data['margin_label'][idx]):.2f}"
+        axes[2].plot(xy[:, 0], xy[:, 1], color=type_colors.get(ctype, "k"), linewidth=linewidth, label=label)
+    if risk_xy.numel() > 0:
+        axes[2].scatter(
+            risk_xy[:, 0],
+            risk_xy[:, 1],
+            c=data["risk_weight"],
+            cmap="Reds",
+            edgecolors="black",
+            linewidths=0.3,
+            s=35,
+            label="risk points",
+        )
+    axes[2].scatter([0.0], [0.0], marker="x", color="black", label="start")
+    axes[2].set_aspect("equal", adjustable="box")
+    axes[2].set_title("candidate trajectories")
+    axes[2].set_xlabel("x rel. [m]")
+    axes[2].set_ylabel("y rel. [m]")
+    axes[2].legend(fontsize=7, loc="best")
+    fig.tight_layout()
+    fig.savefig(output_png, dpi=180)
+    plt.close(fig)
+
+    rows = []
+    for idx in range(utility.numel()):
+        ctype = TYPE_NAMES.get(int(data["candidate_type"][idx]), str(int(data["candidate_type"][idx])))
+        rows.append(
+            {
+                "candidate_id": int(idx),
+                "candidate_type": ctype,
+                "selected": bool(idx == selected),
+                "utility": float(data["utility"][idx]),
+                "traj_time": float(data["traj_time"][idx]),
+                "margin_pred": float(data["margin_pred"][idx]),
+                "reaction_margin": float(data["margin_label"][idx]),
+                "reaction_margin_min": float(data["margin_min"][idx]),
+                "first_visible_time_min": float(data["first_visible_time_min"][idx]),
+                "arrival_time_min": float(data["arrival_time_min"][idx]),
+            }
+        )
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump({"selected_id": selected, "candidates": rows}, f, indent=2, sort_keys=True)
+
+
+def parser():
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint", type=str, default="")
+    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier"], default="typed_frontier")
+    p.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="yopo_original")
+    p.add_argument("--enable-yield-candidates", action="store_true")
+    p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="goal")
+    p.add_argument("--allow-checkpoint-mismatch", action="store_true")
+    p.add_argument("--mode", choices=["train", "valid"], default="valid")
+    p.add_argument("--sample", type=int, default=0)
+    p.add_argument("--count", type=int, default=8)
+    p.add_argument("--top-k", type=int, default=6)
+    p.add_argument("--eval-points", type=int, default=40)
+    p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    p.add_argument("--use-privileged-risk-filter", action="store_true")
+    p.add_argument("--output-dir", type=str, default="OARM/results/margin_label_viz")
+    return p
+
+
+def main(args):
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
+    device = torch.device(args.device)
+    os.makedirs(args.output_dir, exist_ok=True)
+    dataset = OARMDataset(mode=args.mode, use_privileged_risk_filter=args.use_privileged_risk_filter)
+    policy = load_policy(
+        args.checkpoint,
+        device,
+        args.candidate_mode,
+        args.backbone_mode,
+        args.allow_checkpoint_mismatch,
+        enable_yield_candidates=args.enable_yield_candidates,
+        deployed_yaw_mode=args.deployed_yaw_mode,
+    )
+    end = min(args.sample + args.count, len(dataset))
+    for sample_id in range(args.sample, end):
+        data = build_margin_labels(policy, dataset, sample_id, device, args.eval_points)
+        stem = f"sample_{sample_id:06d}"
+        render_sample(
+            data,
+            os.path.join(args.output_dir, f"{stem}.png"),
+            os.path.join(args.output_dir, f"{stem}.json"),
+            args.top_k,
+        )
+        print(f"wrote {stem}")
+
+
+if __name__ == "__main__":
+    main(parser().parse_args())
