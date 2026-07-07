@@ -35,6 +35,10 @@ class OARMConfig:
     risk_point_offsets_m: Tuple[float, ...] = (0.5, 1.0, 1.5)
     risk_assoc_sigma_m: float = 1.2
     risk_assoc_distance_m: float = 3.0
+    risk_label_source: str = "proxy"
+    gt_hidden_depth_margin_m: float = 0.6
+    gt_min_forward_m: float = 0.5
+    gt_max_forward_m: float = 12.0
     use_privileged_risk_filter: bool = False
     cache_privileged_risk_labels: bool = True
     privileged_risk_cache_dir: str = "oarm_labels"

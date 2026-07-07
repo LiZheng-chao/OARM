@@ -6,6 +6,7 @@ train_occlusion_risk: true
 train_risk_point_guidance: true
 train_reaction_margin: false
 deployed_yaw_mode: goal
+risk_label_source: proxy_esdf
 train_backup_feasibility: false
 train_yield_feasibility: false
 use_esdf_collision: false

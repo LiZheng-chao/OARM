@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 from OARM.config import oarm_cfg
 from OARM.utils.occlusion import DepthFrontierExtractor, candidate_frontier_overlap
 from OARM.utils.privileged_risk_filter import PrivilegedRiskPointFilter
+from OARM.utils.gt_risk_point_sampler import GTRiskPointSampler
 from OARM.utils.risk_point_sampler import RiskPointSampler
 from OARM.utils.yopo_compat import ensure_yopo_path
 from OARM.utils.yopo_dataset_context import resolve_dataset_dir, yopo_dataset_cfg
@@ -30,6 +31,7 @@ class OARMDataset(Dataset):
         val_ratio=0.1,
         dataset_root=None,
         use_privileged_risk_filter=oarm_cfg.use_privileged_risk_filter,
+        risk_label_source=oarm_cfg.risk_label_source,
     ):
         super().__init__()
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -51,7 +53,11 @@ class OARMDataset(Dataset):
         )
         self.frontier = DepthFrontierExtractor()
         self.risk_sampler = RiskPointSampler()
-        self.use_privileged_risk_filter = use_privileged_risk_filter
+        if risk_label_source not in {"proxy", "proxy_esdf", "gt_pointcloud"}:
+            raise ValueError(f"Unknown risk_label_source: {risk_label_source}")
+        self.risk_label_source = risk_label_source
+        self.gt_risk_sampler = GTRiskPointSampler(dataset_dir) if risk_label_source == "gt_pointcloud" else None
+        self.use_privileged_risk_filter = bool(use_privileged_risk_filter or risk_label_source == "proxy_esdf")
         self.risk_filter = None
         self.vertical_num = cfg["vertical_num"]
         self.horizon_num = cfg["horizon_num"]
@@ -80,7 +86,17 @@ class OARMDataset(Dataset):
         rot_t = torch.as_tensor(rot_wb, dtype=torch.float32)
         risk_points_w = torch.matmul(rot_t, risk_points_b.unsqueeze(-1)).squeeze(-1) + pos_t
         risk_esdf = torch.full_like(risk_weight, torch.nan)
-        if self.use_privileged_risk_filter:
+        if self.risk_label_source == "gt_pointcloud":
+            cached = self.load_cached_privileged_labels(item)
+            if cached is not None and "risk_points_w" in cached:
+                risk_points_w = cached["risk_points_w"]
+                risk_weight = cached["risk_weight"]
+                risk_esdf = cached.get("risk_esdf", torch.full_like(risk_weight, torch.nan))
+            else:
+                risk_points_w, risk_weight = self.gt_risk_sampler(depth, pos_t, rot_t, map_id)
+                risk_esdf = torch.full_like(risk_weight, torch.nan)
+                self.save_cached_privileged_labels(item, risk_weight, risk_esdf, risk_points_w=risk_points_w)
+        elif self.use_privileged_risk_filter:
             cached = self.load_cached_privileged_labels(item)
             if cached is not None:
                 risk_weight = cached["risk_weight"]
@@ -102,6 +118,10 @@ class OARMDataset(Dataset):
             "risk_points_w": risk_points_w.float(),
             "risk_weight": risk_weight.float(),
             "risk_esdf": risk_esdf.float(),
+            "hidden_risk_gt": (risk_weight > 1e-6).float(),
+            "uses_gt_reaction_margin": torch.tensor(self.risk_label_source == "gt_pointcloud", dtype=torch.float32),
+            "uses_proxy_reaction_margin": torch.tensor(self.risk_label_source != "gt_pointcloud", dtype=torch.float32),
+            "reaction_margin_label_source_id": torch.tensor({"proxy": 0, "proxy_esdf": 1, "gt_pointcloud": 2}[self.risk_label_source], dtype=torch.long),
             "yaw0": yaw0.float(),
             "yaw_rate0": torch.zeros((), dtype=torch.float32),
         }
@@ -127,7 +147,7 @@ class OARMDataset(Dataset):
             return None
         image_name = os.path.splitext(os.path.basename(image_path))[0]
         map_id = int(self.base.map_idx[item])
-        return os.path.join(self.cache_dir, f"map{map_id}_{image_name}.pt")
+        return os.path.join(self.cache_dir, f"map{map_id}_{image_name}_{self.risk_label_source}.pt")
 
     def load_cached_privileged_labels(self, item):
         path = self.cache_path(item)
@@ -138,27 +158,29 @@ class OARMDataset(Dataset):
                 data = torch.load(path, map_location="cpu", weights_only=True)
             except TypeError:
                 data = torch.load(path, map_location="cpu")
-            if (
-                "risk_weight" in data
-                and "risk_esdf" in data
-                and torch.isfinite(data["risk_esdf"]).all()
-            ):
+            if "risk_weight" not in data:
+                return None
+            if self.risk_label_source == "gt_pointcloud":
+                if "risk_points_w" in data:
+                    return data
+            elif "risk_esdf" in data and torch.isfinite(data["risk_esdf"]).all():
                 return data
         except Exception:
             return None
         return None
 
-    def save_cached_privileged_labels(self, item, risk_weight, risk_esdf):
+    def save_cached_privileged_labels(self, item, risk_weight, risk_esdf, risk_points_w=None):
         path = self.cache_path(item)
         if path is None:
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp_path = f"{path}.tmp"
-        torch.save(
-            {
-                "risk_weight": risk_weight.detach().cpu(),
-                "risk_esdf": risk_esdf.detach().cpu(),
-            },
-            tmp_path,
-        )
+        data = {
+            "risk_label_source": self.risk_label_source,
+            "risk_weight": risk_weight.detach().cpu(),
+            "risk_esdf": risk_esdf.detach().cpu(),
+        }
+        if risk_points_w is not None:
+            data["risk_points_w"] = risk_points_w.detach().cpu()
+        torch.save(data, tmp_path)
         os.replace(tmp_path, path)

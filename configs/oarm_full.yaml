@@ -8,6 +8,7 @@ train_reaction_margin: true
 train_margin_ranking: true
 train_yaw_visibility: false
 deployed_yaw_mode: goal
+risk_label_source: gt_pointcloud
 train_backup_feasibility: true
 train_yield_feasibility: true
 use_esdf_collision: true

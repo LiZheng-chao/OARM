@@ -8,6 +8,7 @@ train_reaction_margin: true
 train_margin_ranking: true
 train_yaw_visibility: false
 deployed_yaw_mode: goal
+risk_label_source: proxy
 train_backup_feasibility: false
 train_yield_feasibility: false
 use_esdf_collision: false

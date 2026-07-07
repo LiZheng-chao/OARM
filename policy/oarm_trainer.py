@@ -47,6 +47,7 @@ class OARMTrainer:
         train_margin_ranking=oarm_cfg.train_margin_ranking,
         train_yaw_visibility=oarm_cfg.train_yaw_visibility,
         deployed_yaw_mode=oarm_cfg.deployed_yaw_mode,
+        risk_label_source=oarm_cfg.risk_label_source,
         use_weak_margin_label=oarm_cfg.use_weak_margin_label,
         train_backup_feasibility=oarm_cfg.train_backup_feasibility,
         train_yield_feasibility=oarm_cfg.train_yield_feasibility,
@@ -81,6 +82,7 @@ class OARMTrainer:
         self.train_margin_ranking = bool(train_margin_ranking)
         self.train_yaw_visibility = bool(train_yaw_visibility)
         self.deployed_yaw_mode = deployed_yaw_mode
+        self.risk_label_source = risk_label_source
         self.use_weak_margin_label = use_weak_margin_label
         self.train_yield_feasibility = bool(train_backup_feasibility or train_yield_feasibility)
         self.train_backup_feasibility = self.train_yield_feasibility
@@ -109,6 +111,7 @@ class OARMTrainer:
                 allow_mismatch=allow_checkpoint_mismatch,
                 enable_yield_candidates=self.enable_yield_candidates,
                 deployed_yaw_mode=self.deployed_yaw_mode,
+                risk_label_source=self.risk_label_source,
             )
             self.policy.load_state_dict(state_dict)
         self.configure_trainable_parameters()
@@ -135,14 +138,14 @@ class OARMTrainer:
             self.optimizer = torch.optim.AdamW(self.trainable_parameters(), lr=learning_rate)
 
         self.train_dataloader = DataLoader(
-            OARMDataset(mode="train", dataset_root=self.dataset_root, use_privileged_risk_filter=self.use_privileged_risk_filter),
+            OARMDataset(mode="train", dataset_root=self.dataset_root, use_privileged_risk_filter=self.use_privileged_risk_filter, risk_label_source=self.risk_label_source),
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
         )
         self.val_dataloader = DataLoader(
-            OARMDataset(mode="valid", dataset_root=self.dataset_root, use_privileged_risk_filter=self.use_privileged_risk_filter),
+            OARMDataset(mode="valid", dataset_root=self.dataset_root, use_privileged_risk_filter=self.use_privileged_risk_filter, risk_label_source=self.risk_label_source),
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=num_workers,
@@ -283,6 +286,9 @@ class OARMTrainer:
                 flat_labels["yaw0"] = labels["yaw0"].to(self.device)
             if "yaw_rate0" in labels:
                 flat_labels["yaw_rate0"] = labels["yaw_rate0"].to(self.device)
+            for source_key in ("uses_gt_reaction_margin", "uses_proxy_reaction_margin", "reaction_margin_label_source_id", "hidden_risk_gt"):
+                if source_key in labels:
+                    flat_labels[source_key] = labels[source_key].to(self.device)
 
         if self.train_reaction_margin and "reaction_margin" in labels:
             flat_labels["reaction_margin"] = labels["reaction_margin"].to(self.device).reshape(-1)
@@ -347,6 +353,7 @@ class OARMTrainer:
                 self.experiment_options,
                 enable_yield_candidates=self.enable_yield_candidates,
                 deployed_yaw_mode=self.deployed_yaw_mode,
+                risk_label_source=self.risk_label_source,
             ),
             policy_path,
         )

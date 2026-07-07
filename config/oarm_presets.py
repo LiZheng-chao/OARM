@@ -15,6 +15,7 @@ class OARMTrainingPreset:
     train_margin_ranking: bool = oarm_cfg.train_margin_ranking
     train_yaw_visibility: bool = oarm_cfg.train_yaw_visibility
     deployed_yaw_mode: str = oarm_cfg.deployed_yaw_mode
+    risk_label_source: str = oarm_cfg.risk_label_source
     use_weak_margin_label: bool = oarm_cfg.use_weak_margin_label
     train_backup_feasibility: bool = oarm_cfg.train_backup_feasibility
     train_yield_feasibility: bool = oarm_cfg.train_yield_feasibility
@@ -37,6 +38,7 @@ OARM_TRAINING_PRESETS: Dict[str, OARMTrainingPreset] = {
         train_risk_point_guidance=True,
         train_reaction_margin=True,
         train_margin_ranking=True,
+        risk_label_source="gt_pointcloud",
         use_privileged_risk_filter=True,
     ),
     "v3_yield": OARMTrainingPreset(
@@ -46,6 +48,7 @@ OARM_TRAINING_PRESETS: Dict[str, OARMTrainingPreset] = {
         train_risk_point_guidance=True,
         train_reaction_margin=True,
         train_margin_ranking=True,
+        risk_label_source="gt_pointcloud",
         train_backup_feasibility=True,
         train_yield_feasibility=True,
         use_privileged_risk_filter=True,
@@ -58,6 +61,7 @@ OARM_TRAINING_PRESETS: Dict[str, OARMTrainingPreset] = {
         train_risk_point_guidance=True,
         train_reaction_margin=True,
         train_margin_ranking=True,
+        risk_label_source="gt_pointcloud",
         train_backup_feasibility=True,
         train_yield_feasibility=True,
         use_esdf_collision=True,

@@ -207,6 +207,14 @@ class OARMLoss(nn.Module):
             losses["risk_assoc_weight_mean"] = risk_weight.mean()
             losses["risk_weight_sum_mean"] = risk_weight_sum.mean()
             losses["risk_weight_nonzero_rate"] = (risk_weight_sum > 1e-6).float().mean()
+            if "uses_gt_reaction_margin" in labels:
+                gt_source = self.expand_candidate_label(labels["uses_gt_reaction_margin"], traj_time.shape[0], traj_time)
+                losses["reaction_margin_gt_source_rate"] = gt_source.float().mean()
+            if "uses_proxy_reaction_margin" in labels:
+                proxy_source = self.expand_candidate_label(labels["uses_proxy_reaction_margin"], traj_time.shape[0], traj_time)
+                losses["reaction_margin_proxy_source_rate"] = proxy_source.float().mean()
+            if "hidden_risk_gt" in labels:
+                losses["hidden_risk_gt_rate"] = labels["hidden_risk_gt"].float().mean()
             losses["risk_min_distance"] = association.min_distance.mean()
             if oarm_cfg.train_risk_from_points and (labels is None or "occlusion_risk" not in labels):
                 point_risk_label = 1.0 - torch.exp(-risk_weight.sum(dim=-1))

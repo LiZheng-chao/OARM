@@ -92,6 +92,9 @@ def flatten_labels(labels, flat, device, args):
         flat_labels["backup_feasible"] = labels["yield_feasible"].to(device).reshape(-1)
     elif args.eval_yield_feasibility and "backup_feasible" in labels:
         flat_labels["backup_feasible"] = labels["backup_feasible"].to(device).reshape(-1)
+    for source_key in ("uses_gt_reaction_margin", "uses_proxy_reaction_margin", "reaction_margin_label_source_id", "hidden_risk_gt"):
+        if source_key in labels:
+            flat_labels[source_key] = labels[source_key].to(device)
     if args.eval_risk_point_guidance and "risk_points_w" in labels:
         flat_labels["risk_points_w"] = labels["risk_points_w"].to(device)
         if "risk_weight" in labels:
@@ -288,6 +291,7 @@ def evaluate(args):
         mode=args.mode,
         dataset_root=args.dataset_root or None,
         use_privileged_risk_filter=args.use_privileged_risk_filter,
+        risk_label_source=args.risk_label_source,
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
@@ -305,6 +309,7 @@ def evaluate(args):
             allow_mismatch=args.allow_checkpoint_mismatch,
             enable_yield_candidates=args.enable_yield_candidates,
             deployed_yaw_mode=args.deployed_yaw_mode,
+            risk_label_source=args.risk_label_source,
         )
         policy.load_state_dict(state_dict)
         print(f"Loaded checkpoint: {args.checkpoint}")
@@ -418,6 +423,7 @@ def evaluate(args):
     metrics["yield_feasibility_eval"] = bool(args.eval_yield_feasibility)
     metrics["enable_yield_candidates"] = bool(args.enable_yield_candidates)
     metrics["deployed_yaw_mode"] = args.deployed_yaw_mode
+    metrics["risk_label_source"] = args.risk_label_source
     metrics["eval_yaw_visibility"] = bool(args.eval_yaw_visibility)
     metrics["privileged_training"] = bool(
         args.use_privileged_risk_filter
@@ -450,6 +456,7 @@ def parser():
     p.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="")
     p.add_argument("--enable-yield-candidates", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
+    p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="")
     p.add_argument("--mode", choices=["train", "valid"], default="valid")
     p.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     p.add_argument("--batch-size", type=int, default=16)
@@ -479,6 +486,8 @@ def apply_eval_stage(args):
         args.backbone_mode = preset.backbone_mode
     if not args.deployed_yaw_mode:
         args.deployed_yaw_mode = preset.deployed_yaw_mode
+    if not args.risk_label_source:
+        args.risk_label_source = preset.risk_label_source
     if preset.enable_yield_candidates and not args.enable_yield_candidates:
         args.enable_yield_candidates = True
     for eval_key, preset_key in EVAL_STAGE_MAP.items():

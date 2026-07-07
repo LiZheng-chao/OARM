@@ -27,6 +27,7 @@ TRAINING_OPTION_KEYS = (
     "train_margin_ranking",
     "train_yaw_visibility",
     "deployed_yaw_mode",
+    "risk_label_source",
     "use_weak_margin_label",
     "train_backup_feasibility",
     "train_yield_feasibility",
@@ -79,6 +80,7 @@ def parser():
     p.add_argument("--train-margin-ranking", action="store_true")
     p.add_argument("--train-yaw-visibility", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
+    p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="")
     p.add_argument("--use-weak-margin-label", action="store_true")
     p.add_argument("--train-backup-feasibility", action="store_true")
     p.add_argument("--train-yield-feasibility", action="store_true")
@@ -155,6 +157,8 @@ def resolve_training_options(args):
         options["backbone_mode"] = args.backbone_mode
     if args.deployed_yaw_mode:
         options["deployed_yaw_mode"] = args.deployed_yaw_mode
+    if args.risk_label_source:
+        options["risk_label_source"] = args.risk_label_source
     if options["train_backup_feasibility"]:
         options["train_yield_feasibility"] = True
         options["enable_yield_candidates"] = True

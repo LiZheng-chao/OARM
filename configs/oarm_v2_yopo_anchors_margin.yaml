@@ -1,12 +1,14 @@
-# OARM-V0: variable time only.
+# Ablation: YOPO anchors with GT reaction-margin supervision/ranking.
 candidate_mode: yopo
 backbone_mode: yopo_original
 enable_yield_candidates: false
-train_occlusion_risk: false
-train_risk_point_guidance: false
-train_reaction_margin: false
+train_occlusion_risk: true
+train_risk_point_guidance: true
+train_reaction_margin: true
+train_margin_ranking: true
+train_yaw_visibility: false
 deployed_yaw_mode: goal
-risk_label_source: proxy_esdf
+risk_label_source: gt_pointcloud
 train_backup_feasibility: false
 train_yield_feasibility: false
 use_esdf_collision: false

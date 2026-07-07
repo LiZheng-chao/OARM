@@ -21,18 +21,22 @@ def make_oarm_checkpoint(
     training_options=None,
     enable_yield_candidates=None,
     deployed_yaw_mode=None,
+    risk_label_source=None,
 ):
     training_options = dict(training_options or {})
     if enable_yield_candidates is None:
         enable_yield_candidates = training_options.get("enable_yield_candidates")
     if deployed_yaw_mode is None:
         deployed_yaw_mode = training_options.get("deployed_yaw_mode")
+    if risk_label_source is None:
+        risk_label_source = training_options.get("risk_label_source")
     return {
         "state_dict": state_dict,
         "candidate_mode": candidate_mode,
         "backbone_mode": backbone_mode,
         "enable_yield_candidates": enable_yield_candidates,
         "deployed_yaw_mode": deployed_yaw_mode,
+        "risk_label_source": risk_label_source,
         "stage": training_options.get("stage"),
         "train_yaw_visibility": training_options.get("train_yaw_visibility"),
         "train_margin_ranking": training_options.get("train_margin_ranking"),
@@ -48,6 +52,7 @@ def validate_checkpoint_metadata(
     allow_mismatch=False,
     enable_yield_candidates=None,
     deployed_yaw_mode=None,
+    risk_label_source=None,
 ):
     mismatches = []
     expected = {
@@ -58,6 +63,8 @@ def validate_checkpoint_metadata(
         expected["enable_yield_candidates"] = bool(enable_yield_candidates)
     if deployed_yaw_mode is not None:
         expected["deployed_yaw_mode"] = deployed_yaw_mode
+    if risk_label_source is not None:
+        expected["risk_label_source"] = risk_label_source
     for key, value in expected.items():
         stored = metadata.get(key)
         if stored is None:
