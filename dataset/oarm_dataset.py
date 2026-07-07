@@ -139,6 +139,25 @@ class OARMDataset(Dataset):
             return False
         return True
 
+    def risk_cache_metadata(self):
+        metadata = {
+            "risk_label_source": self.risk_label_source,
+            "risk_point_count": oarm_cfg.risk_point_count,
+        }
+        if self.gt_risk_sampler is not None:
+            metadata.update(self.gt_risk_sampler.cache_metadata())
+        elif self.risk_label_source == "proxy_esdf":
+            metadata.update(
+                {
+                    "privileged_risk_distance_m": oarm_cfg.privileged_risk_distance_m,
+                    "privileged_risk_sigma_m": oarm_cfg.privileged_risk_sigma_m,
+                }
+            )
+        return metadata
+
+    def risk_cache_tag(self):
+        payload = repr(sorted(self.risk_cache_metadata().items())).encode("utf-8")
+        return hashlib.sha1(payload).hexdigest()[:10]
     def cache_path(self, item):
         if not oarm_cfg.cache_privileged_risk_labels:
             return None
@@ -147,7 +166,7 @@ class OARMDataset(Dataset):
             return None
         image_name = os.path.splitext(os.path.basename(image_path))[0]
         map_id = int(self.base.map_idx[item])
-        return os.path.join(self.cache_dir, f"map{map_id}_{image_name}_{self.risk_label_source}.pt")
+        return os.path.join(self.cache_dir, f"map{map_id}_{image_name}_{self.risk_cache_tag()}.pt")
 
     def load_cached_privileged_labels(self, item):
         path = self.cache_path(item)
@@ -159,6 +178,8 @@ class OARMDataset(Dataset):
             except TypeError:
                 data = torch.load(path, map_location="cpu")
             if "risk_weight" not in data:
+                return None
+            if data.get("risk_cache_tag") != self.risk_cache_tag():
                 return None
             if self.risk_label_source == "gt_pointcloud":
                 if "risk_points_w" in data:
@@ -177,6 +198,8 @@ class OARMDataset(Dataset):
         tmp_path = f"{path}.tmp"
         data = {
             "risk_label_source": self.risk_label_source,
+            "risk_cache_tag": self.risk_cache_tag(),
+            "risk_cache_metadata": self.risk_cache_metadata(),
             "risk_weight": risk_weight.detach().cpu(),
             "risk_esdf": risk_esdf.detach().cpu(),
         }

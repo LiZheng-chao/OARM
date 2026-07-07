@@ -207,6 +207,7 @@ class OARMLoss(nn.Module):
             losses["risk_assoc_weight_mean"] = risk_weight.mean()
             losses["risk_weight_sum_mean"] = risk_weight_sum.mean()
             losses["risk_weight_nonzero_rate"] = (risk_weight_sum > 1e-6).float().mean()
+            losses["candidate_hidden_risk_gt_rate"] = (risk_weight_sum > 1e-6).float().mean()
             if "uses_gt_reaction_margin" in labels:
                 gt_source = self.expand_candidate_label(labels["uses_gt_reaction_margin"], traj_time.shape[0], traj_time)
                 losses["reaction_margin_gt_source_rate"] = gt_source.float().mean()

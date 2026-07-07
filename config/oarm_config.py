@@ -39,6 +39,9 @@ class OARMConfig:
     gt_hidden_depth_margin_m: float = 0.6
     gt_min_forward_m: float = 0.5
     gt_max_forward_m: float = 12.0
+    gt_horizon_fov_expand_deg: float = 90.0
+    gt_vertical_fov_expand_deg: float = 20.0
+    gt_depth_metric: str = "forward"
     use_privileged_risk_filter: bool = False
     cache_privileged_risk_labels: bool = True
     privileged_risk_cache_dir: str = "oarm_labels"
