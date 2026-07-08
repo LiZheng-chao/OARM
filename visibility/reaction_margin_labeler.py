@@ -19,11 +19,15 @@ class ReactionMarginLabeler:
         horizon_fov_rad: float = math.radians(cfg["horizon_camera_fov"]),
         vertical_fov_rad: float = math.radians(cfg["vertical_camera_fov"]),
         reaction_time: float = oarm_cfg.reaction_time,
+        risk_arrival_radius_m: float = oarm_cfg.risk_arrival_radius_m,
+        no_arrival_margin_m: float = oarm_cfg.no_arrival_margin_m,
         softmin_tau: float = 0.15,
     ):
         self.horizon_fov_rad = horizon_fov_rad
         self.vertical_fov_rad = vertical_fov_rad
         self.reaction_time = reaction_time
+        self.risk_arrival_radius_m = risk_arrival_radius_m
+        self.no_arrival_margin_m = no_arrival_margin_m
         self.softmin_tau = softmin_tau
 
     def __call__(
@@ -44,14 +48,14 @@ class ReactionMarginLabeler:
             vertical_fov_rad=self.vertical_fov_rad,
             reaction_time=self.reaction_time,
             visibility_mask=visibility_mask,
-            max_arrival_distance_m=oarm_cfg.risk_arrival_radius_m,
-            no_arrival_margin=oarm_cfg.no_arrival_margin_m,
+            max_arrival_distance_m=self.risk_arrival_radius_m,
+            no_arrival_margin=self.no_arrival_margin_m,
         )
         arrival_time = arrival_time_to_points(
             sampled_pos_w,
             sampled_time,
             risk_points_w,
-            max_arrival_distance_m=oarm_cfg.risk_arrival_radius_m,
+            max_arrival_distance_m=self.risk_arrival_radius_m,
         )
         if risk_weight is None:
             risk_weight = torch.ones_like(point_margin)
@@ -60,7 +64,7 @@ class ReactionMarginLabeler:
         margin_min = weighted_margin.amin(dim=-1)
         margin_min = torch.where(
             torch.isinf(margin_min),
-            torch.full_like(margin_min, oarm_cfg.no_arrival_margin_m),
+            torch.full_like(margin_min, self.no_arrival_margin_m),
             margin_min,
         )
 
@@ -74,7 +78,7 @@ class ReactionMarginLabeler:
         margin_softmin = -tau * torch.logsumexp(log_weight - point_margin / tau, dim=-1)
         margin_softmin = torch.where(
             no_weight,
-            torch.full_like(margin_softmin, oarm_cfg.no_arrival_margin_m),
+            torch.full_like(margin_softmin, self.no_arrival_margin_m),
             margin_softmin,
         )
         invalid_arrival = torch.full_like(arrival_time, torch.inf)

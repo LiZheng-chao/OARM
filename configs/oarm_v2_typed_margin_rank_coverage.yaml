@@ -1,0 +1,35 @@
+# OARM-V2 coverage sweep: typed frontier + GT pointcloud labels biased toward candidate-reachable space.
+candidate_mode: typed_frontier
+backbone_mode: yopo_original
+enable_yield_candidates: false
+train_occlusion_risk: true
+train_risk_point_guidance: true
+train_reaction_margin: true
+train_margin_ranking: true
+train_yaw_visibility: false
+deployed_yaw_mode: goal
+risk_label_source: gt_pointcloud
+
+gt_risk_point_count: 64
+gt_hidden_depth_margin_m: 0.6
+gt_min_forward_m: 0.5
+gt_max_forward_m: 10.0
+gt_horizon_fov_expand_deg: 90.0
+gt_vertical_fov_expand_deg: 20.0
+gt_depth_metric: forward
+gt_reachable_forward_center_m: 5.0
+gt_reachable_forward_sigma_m: 3.0
+gt_reachable_lateral_sigma_m: 3.0
+gt_reachable_vertical_sigma_m: 1.8
+gt_reachable_score_weight: 0.65
+gt_side_score_weight: 0.25
+risk_assoc_distance_m: 5.0
+risk_assoc_sigma_m: 2.0
+risk_arrival_radius_m: 2.0
+
+use_weak_margin_label: false
+train_backup_feasibility: false
+train_yield_feasibility: false
+use_esdf_collision: false
+use_occlusion_aware_visibility: false
+use_privileged_risk_filter: false

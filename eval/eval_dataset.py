@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from OARM.dataset import OARMDataset
-from OARM.config import get_oarm_training_preset
+from OARM.config import get_oarm_training_preset, oarm_cfg
 from OARM.eval.metrics_backup_feasibility import backup_feasibility_metrics
 from OARM.eval.metrics_reaction_margin import (
     margin_prediction_metrics,
@@ -54,6 +54,44 @@ EVAL_STAGE_MAP = {
 }
 
 
+GT_SAMPLER_ARG_KEYS = (
+    "gt_risk_point_count",
+    "gt_hidden_depth_margin_m",
+    "gt_min_forward_m",
+    "gt_max_forward_m",
+    "gt_horizon_fov_expand_deg",
+    "gt_vertical_fov_expand_deg",
+    "gt_depth_metric",
+    "gt_reachable_forward_center_m",
+    "gt_reachable_forward_sigma_m",
+    "gt_reachable_lateral_sigma_m",
+    "gt_reachable_vertical_sigma_m",
+    "gt_reachable_score_weight",
+    "gt_side_score_weight",
+    "risk_assoc_distance_m",
+    "risk_assoc_sigma_m",
+    "risk_arrival_radius_m",
+)
+
+
+def gt_sampler_options_from_args(args):
+    return {
+        "point_count": args.gt_risk_point_count,
+        "hidden_depth_margin_m": args.gt_hidden_depth_margin_m,
+        "min_forward_m": args.gt_min_forward_m,
+        "max_forward_m": args.gt_max_forward_m,
+        "horizon_fov_expand_deg": args.gt_horizon_fov_expand_deg,
+        "vertical_fov_expand_deg": args.gt_vertical_fov_expand_deg,
+        "depth_metric": args.gt_depth_metric,
+        "reachable_forward_center_m": args.gt_reachable_forward_center_m,
+        "reachable_forward_sigma_m": args.gt_reachable_forward_sigma_m,
+        "reachable_lateral_sigma_m": args.gt_reachable_lateral_sigma_m,
+        "reachable_vertical_sigma_m": args.gt_reachable_vertical_sigma_m,
+        "reachable_score_weight": args.gt_reachable_score_weight,
+        "side_score_weight": args.gt_side_score_weight,
+    }
+
+
 def tensor_scalar(value):
     if torch.is_tensor(value):
         return float(value.detach().cpu())
@@ -92,7 +130,15 @@ def flatten_labels(labels, flat, device, args):
         flat_labels["backup_feasible"] = labels["yield_feasible"].to(device).reshape(-1)
     elif args.eval_yield_feasibility and "backup_feasible" in labels:
         flat_labels["backup_feasible"] = labels["backup_feasible"].to(device).reshape(-1)
-    for source_key in ("uses_gt_reaction_margin", "uses_proxy_reaction_margin", "reaction_margin_label_source_id", "hidden_risk_gt"):
+    for source_key in (
+        "uses_gt_reaction_margin",
+        "uses_proxy_reaction_margin",
+        "reaction_margin_label_source_id",
+        "hidden_risk_gt",
+        "raw_gt_risk_point_valid_rate",
+        "raw_gt_risk_point_weight_sum",
+        "raw_gt_risk_point_weight_mean",
+    ):
         if source_key in labels:
             flat_labels[source_key] = labels[source_key].to(device)
     if args.eval_risk_point_guidance and "risk_points_w" in labels:
@@ -287,11 +333,13 @@ def evaluate(args):
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
     device = torch.device(args.device)
 
+    gt_sampler_options = gt_sampler_options_from_args(args)
     dataset = OARMDataset(
         mode=args.mode,
         dataset_root=args.dataset_root or None,
         use_privileged_risk_filter=args.use_privileged_risk_filter,
         risk_label_source=args.risk_label_source,
+        gt_sampler_options=gt_sampler_options,
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
@@ -328,13 +376,16 @@ def evaluate(args):
             enable_yaw_visibility=args.eval_yaw_visibility,
             deployed_yaw_mode=args.deployed_yaw_mode,
             enable_yield_feasibility=args.eval_backup_feasibility,
+            risk_assoc_distance_m=args.risk_assoc_distance_m,
+            risk_assoc_sigma_m=args.risk_assoc_sigma_m,
+            risk_arrival_radius_m=args.risk_arrival_radius_m,
         )
         line_of_sight = None
         if args.use_occlusion_aware_visibility:
             from OARM.visibility.esdf_visibility import ESDFLineOfSight
 
             line_of_sight = ESDFLineOfSight(device=device)
-    margin_labeler = ReactionMarginLabeler()
+    margin_labeler = ReactionMarginLabeler(risk_arrival_radius_m=args.risk_arrival_radius_m)
     accumulator = defaultdict(list)
     seen_batches = 0
 
@@ -424,6 +475,8 @@ def evaluate(args):
     metrics["enable_yield_candidates"] = bool(args.enable_yield_candidates)
     metrics["deployed_yaw_mode"] = args.deployed_yaw_mode
     metrics["risk_label_source"] = args.risk_label_source
+    for key in GT_SAMPLER_ARG_KEYS:
+        metrics[key] = getattr(args, key)
     metrics["eval_yaw_visibility"] = bool(args.eval_yaw_visibility)
     metrics["privileged_training"] = bool(
         args.use_privileged_risk_filter
@@ -457,6 +510,22 @@ def parser():
     p.add_argument("--enable-yield-candidates", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
     p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="")
+    p.add_argument("--gt-risk-point-count", type=int, default=None)
+    p.add_argument("--gt-hidden-depth-margin-m", type=float, default=None)
+    p.add_argument("--gt-min-forward-m", type=float, default=None)
+    p.add_argument("--gt-max-forward-m", type=float, default=None)
+    p.add_argument("--gt-horizon-fov-expand-deg", type=float, default=None)
+    p.add_argument("--gt-vertical-fov-expand-deg", type=float, default=None)
+    p.add_argument("--gt-depth-metric", choices=["", "forward", "ray"], default="")
+    p.add_argument("--gt-reachable-forward-center-m", type=float, default=None)
+    p.add_argument("--gt-reachable-forward-sigma-m", type=float, default=None)
+    p.add_argument("--gt-reachable-lateral-sigma-m", type=float, default=None)
+    p.add_argument("--gt-reachable-vertical-sigma-m", type=float, default=None)
+    p.add_argument("--gt-reachable-score-weight", type=float, default=None)
+    p.add_argument("--gt-side-score-weight", type=float, default=None)
+    p.add_argument("--risk-assoc-distance-m", type=float, default=None)
+    p.add_argument("--risk-assoc-sigma-m", type=float, default=None)
+    p.add_argument("--risk-arrival-radius-m", type=float, default=None)
     p.add_argument("--mode", choices=["train", "valid"], default="valid")
     p.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     p.add_argument("--batch-size", type=int, default=16)
@@ -488,6 +557,10 @@ def apply_eval_stage(args):
         args.deployed_yaw_mode = preset.deployed_yaw_mode
     if not args.risk_label_source:
         args.risk_label_source = preset.risk_label_source
+    for key in GT_SAMPLER_ARG_KEYS:
+        value = getattr(args, key)
+        if value is None or value == "":
+            setattr(args, key, getattr(preset, key, getattr(oarm_cfg, key)))
     if preset.enable_yield_candidates and not args.enable_yield_candidates:
         args.enable_yield_candidates = True
     for eval_key, preset_key in EVAL_STAGE_MAP.items():

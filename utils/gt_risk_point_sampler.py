@@ -1,7 +1,7 @@
 import hashlib
 import math
 import os
-from functools import lru_cache
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -13,8 +13,21 @@ ensure_yopo_path()
 from config.config import cfg
 
 
-@lru_cache(maxsize=16)
+_POINTCLOUD_CACHE = OrderedDict()
+
+
+def pointcloud_cache_size():
+    try:
+        return max(0, int(os.environ.get("OARM_GT_POINTCLOUD_CACHE_SIZE", "2")))
+    except ValueError:
+        return 2
+
+
 def load_pointcloud_points(dataset_dir: str, map_id: int):
+    key = (os.path.abspath(dataset_dir), int(map_id))
+    if key in _POINTCLOUD_CACHE:
+        _POINTCLOUD_CACHE.move_to_end(key)
+        return _POINTCLOUD_CACHE[key]
     path = os.path.join(dataset_dir, f"pointcloud-{int(map_id)}.ply")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"GT pointcloud not found: {path}")
@@ -24,6 +37,12 @@ def load_pointcloud_points(dataset_dir: str, map_id: int):
     points = np.asarray(pointcloud.points, dtype=np.float32)
     if points.size == 0:
         raise ValueError(f"GT pointcloud has no points: {path}")
+    max_cache = pointcloud_cache_size()
+    if max_cache > 0:
+        _POINTCLOUD_CACHE[key] = points
+        _POINTCLOUD_CACHE.move_to_end(key)
+        while len(_POINTCLOUD_CACHE) > max_cache:
+            _POINTCLOUD_CACHE.popitem(last=False)
     return points
 
 
@@ -47,6 +66,12 @@ class GTRiskPointSampler:
         horizon_fov_expand_deg: float = oarm_cfg.gt_horizon_fov_expand_deg,
         vertical_fov_expand_deg: float = oarm_cfg.gt_vertical_fov_expand_deg,
         depth_metric: str = oarm_cfg.gt_depth_metric,
+        reachable_forward_center_m: float = oarm_cfg.gt_reachable_forward_center_m,
+        reachable_forward_sigma_m: float = oarm_cfg.gt_reachable_forward_sigma_m,
+        reachable_lateral_sigma_m: float = oarm_cfg.gt_reachable_lateral_sigma_m,
+        reachable_vertical_sigma_m: float = oarm_cfg.gt_reachable_vertical_sigma_m,
+        reachable_score_weight: float = oarm_cfg.gt_reachable_score_weight,
+        side_score_weight: float = oarm_cfg.gt_side_score_weight,
     ):
         self.dataset_dir = dataset_dir
         self.point_count = int(point_count)
@@ -61,6 +86,12 @@ class GTRiskPointSampler:
         self.vertical_fov = math.radians(cfg["vertical_camera_fov"])
         self.expanded_horizon_fov = self.horizon_fov + math.radians(float(horizon_fov_expand_deg))
         self.expanded_vertical_fov = self.vertical_fov + math.radians(float(vertical_fov_expand_deg))
+        self.reachable_forward_center_m = float(reachable_forward_center_m)
+        self.reachable_forward_sigma_m = max(float(reachable_forward_sigma_m), 1e-3)
+        self.reachable_lateral_sigma_m = max(float(reachable_lateral_sigma_m), 1e-3)
+        self.reachable_vertical_sigma_m = max(float(reachable_vertical_sigma_m), 1e-3)
+        self.reachable_score_weight = float(reachable_score_weight)
+        self.side_score_weight = float(side_score_weight)
 
     def __call__(self, depth: torch.Tensor, pos_w: torch.Tensor, rot_wb: torch.Tensor, map_id: int):
         if depth.dim() != 3 or depth.shape[0] != 1:
@@ -117,13 +148,19 @@ class GTRiskPointSampler:
 
         hidden_points_w = points_w[candidate_mask][hidden]
         hidden_depth = local_depth[hidden]
+        hidden_points_b = points_b[candidate_mask][hidden]
         hidden_yaw = local_yaw[hidden]
         hidden_pitch = local_pitch[hidden]
         hidden_gap = hidden_gap[hidden].clamp(min=0.0)
         hidden_score = hidden_gap / hidden_gap.max().clamp(min=1e-3)
         side_score = (hidden_yaw.abs() / max(0.5 * self.expanded_horizon_fov, 1e-3)).clamp(0.0, 1.0)
         pitch_score = (1.0 - hidden_pitch.abs() / max(0.5 * self.expanded_vertical_fov, 1e-3)).clamp(0.0, 1.0)
-        score = torch.maximum(hidden_score, 0.35 + 0.65 * side_score) * pitch_score
+        forward_score = torch.exp(-0.5 * ((hidden_points_b[:, 0] - self.reachable_forward_center_m) / self.reachable_forward_sigma_m).square())
+        lateral_score = torch.exp(-0.5 * (hidden_points_b[:, 1].abs() / self.reachable_lateral_sigma_m).square())
+        vertical_score = torch.exp(-0.5 * (hidden_points_b[:, 2].abs() / self.reachable_vertical_sigma_m).square())
+        reachable_score = forward_score * lateral_score * vertical_score
+        base_score = (hidden_score + self.side_score_weight * side_score).clamp(min=0.0)
+        score = ((1.0 - self.reachable_score_weight) * base_score + self.reachable_score_weight * reachable_score) * pitch_score
         score = score * torch.exp(-hidden_depth / max(self.max_forward_m, 1e-3))
 
         k = min(self.point_count, hidden_points_w.shape[0])
@@ -149,12 +186,19 @@ class GTRiskPointSampler:
             "expanded_horizon_fov": self.expanded_horizon_fov,
             "expanded_vertical_fov": self.expanded_vertical_fov,
             "depth_metric": self.depth_metric,
+            "reachable_forward_center_m": self.reachable_forward_center_m,
+            "reachable_forward_sigma_m": self.reachable_forward_sigma_m,
+            "reachable_lateral_sigma_m": self.reachable_lateral_sigma_m,
+            "reachable_vertical_sigma_m": self.reachable_vertical_sigma_m,
+            "reachable_score_weight": self.reachable_score_weight,
+            "side_score_weight": self.side_score_weight,
         }
 
     def cache_tag(self):
         items = sorted(self.cache_metadata().items())
         payload = repr(items).encode("utf-8")
         return hashlib.sha1(payload).hexdigest()[:10]
+
     def empty_points(self, device, dtype, pos_w):
         points = torch.zeros((self.point_count, 3), device=device, dtype=dtype)
         points[:, 0] = self.depth_max_m

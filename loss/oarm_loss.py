@@ -43,6 +43,9 @@ class OARMLoss(nn.Module):
         enable_yaw_visibility: bool = False,
         deployed_yaw_mode: str = oarm_cfg.deployed_yaw_mode,
         enable_yield_feasibility: Optional[bool] = None,
+        risk_assoc_distance_m: float = oarm_cfg.risk_assoc_distance_m,
+        risk_assoc_sigma_m: float = oarm_cfg.risk_assoc_sigma_m,
+        risk_arrival_radius_m: float = oarm_cfg.risk_arrival_radius_m,
     ):
         super().__init__()
         self.smoothness_weight = smoothness_weight
@@ -54,6 +57,9 @@ class OARMLoss(nn.Module):
         self.enable_reaction_margin = enable_reaction_margin
         self.enable_margin_ranking = enable_margin_ranking
         self.enable_yaw_visibility = enable_yaw_visibility
+        self.risk_assoc_distance_m = risk_assoc_distance_m
+        self.risk_assoc_sigma_m = risk_assoc_sigma_m
+        self.risk_arrival_radius_m = risk_arrival_radius_m
         if deployed_yaw_mode not in {"goal", "hold", "predicted"}:
             raise ValueError(f"Unknown deployed_yaw_mode: {deployed_yaw_mode}")
         self.deployed_yaw_mode = deployed_yaw_mode
@@ -67,7 +73,7 @@ class OARMLoss(nn.Module):
         else:
             self.collision_loss = None
         self.yaw_visibility_loss = YawVisibilityLoss()
-        self.margin_labeler = ReactionMarginLabeler()
+        self.margin_labeler = ReactionMarginLabeler(risk_arrival_radius_m=self.risk_arrival_radius_m)
         if use_occlusion_aware_visibility:
             from OARM.visibility.esdf_visibility import ESDFLineOfSight
 
@@ -161,7 +167,14 @@ class OARMLoss(nn.Module):
                 risk_weight = self.expand_candidate_label(risk_weight, traj_time.shape[0], traj_time)
             else:
                 risk_weight = torch.ones(risk_points_w.shape[:-1], device=traj_time.device, dtype=traj_time.dtype)
-            association = associate_risk_points_to_trajectory(margin_pos, sampled_time, risk_points_w, risk_weight)
+            association = associate_risk_points_to_trajectory(
+                margin_pos,
+                sampled_time,
+                risk_points_w,
+                risk_weight,
+                sigma_m=self.risk_assoc_sigma_m,
+                max_distance_m=self.risk_assoc_distance_m,
+            )
             risk_weight = association.associated_weight
             yaw0 = labels.get("yaw0")
             if yaw0 is None:
@@ -208,6 +221,14 @@ class OARMLoss(nn.Module):
             losses["risk_weight_sum_mean"] = risk_weight_sum.mean()
             losses["risk_weight_nonzero_rate"] = (risk_weight_sum > 1e-6).float().mean()
             losses["candidate_hidden_risk_gt_rate"] = (risk_weight_sum > 1e-6).float().mean()
+            losses['candidate_risk_assoc_valid_rate'] = association.valid_mask.float().mean()
+            losses['candidate_risk_assoc_weight_mean'] = association.association_weight.mean()
+            if 'raw_gt_risk_point_valid_rate' in labels:
+                losses['raw_gt_risk_point_valid_rate'] = labels['raw_gt_risk_point_valid_rate'].float().mean()
+            if 'raw_gt_risk_point_weight_sum' in labels:
+                losses['raw_gt_risk_point_weight_sum'] = labels['raw_gt_risk_point_weight_sum'].float().mean()
+            if 'raw_gt_risk_point_weight_mean' in labels:
+                losses['raw_gt_risk_point_weight_mean'] = labels['raw_gt_risk_point_weight_mean'].float().mean()
             if "uses_gt_reaction_margin" in labels:
                 gt_source = self.expand_candidate_label(labels["uses_gt_reaction_margin"], traj_time.shape[0], traj_time)
                 losses["reaction_margin_gt_source_rate"] = gt_source.float().mean()

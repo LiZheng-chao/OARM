@@ -34,12 +34,31 @@ def project_points(depth, pos_w, rot_wb, risk_points_w):
     return u, v, in_image
 
 
+def gt_sampler_options_from_args(args):
+    return {
+        "point_count": args.gt_risk_point_count,
+        "hidden_depth_margin_m": args.gt_hidden_depth_margin_m,
+        "min_forward_m": args.gt_min_forward_m,
+        "max_forward_m": args.gt_max_forward_m,
+        "horizon_fov_expand_deg": args.gt_horizon_fov_expand_deg,
+        "vertical_fov_expand_deg": args.gt_vertical_fov_expand_deg,
+        "depth_metric": args.gt_depth_metric,
+        "reachable_forward_center_m": args.gt_reachable_forward_center_m,
+        "reachable_forward_sigma_m": args.gt_reachable_forward_sigma_m,
+        "reachable_lateral_sigma_m": args.gt_reachable_lateral_sigma_m,
+        "reachable_vertical_sigma_m": args.gt_reachable_vertical_sigma_m,
+        "reachable_score_weight": args.gt_reachable_score_weight,
+        "side_score_weight": args.gt_side_score_weight,
+    }
+
+
 def visualize(args):
     dataset = OARMDataset(
         mode=args.mode,
         dataset_root=args.dataset_root or None,
         use_privileged_risk_filter=args.use_privileged_risk_filter,
         risk_label_source=args.risk_label_source,
+        gt_sampler_options=gt_sampler_options_from_args(args),
     )
     depth, pos, rot_wb, _obs_b, map_id, labels = dataset[args.index]
     depth_2d = depth.squeeze(0)
@@ -86,6 +105,19 @@ def parser():
     p.add_argument("--index", type=int, default=0)
     p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="gt_pointcloud")
     p.add_argument("--use-privileged-risk-filter", action="store_true")
+    p.add_argument("--gt-risk-point-count", type=int, default=oarm_cfg.gt_risk_point_count)
+    p.add_argument("--gt-hidden-depth-margin-m", type=float, default=oarm_cfg.gt_hidden_depth_margin_m)
+    p.add_argument("--gt-min-forward-m", type=float, default=oarm_cfg.gt_min_forward_m)
+    p.add_argument("--gt-max-forward-m", type=float, default=oarm_cfg.gt_max_forward_m)
+    p.add_argument("--gt-horizon-fov-expand-deg", type=float, default=oarm_cfg.gt_horizon_fov_expand_deg)
+    p.add_argument("--gt-vertical-fov-expand-deg", type=float, default=oarm_cfg.gt_vertical_fov_expand_deg)
+    p.add_argument("--gt-depth-metric", choices=["forward", "ray"], default=oarm_cfg.gt_depth_metric)
+    p.add_argument("--gt-reachable-forward-center-m", type=float, default=oarm_cfg.gt_reachable_forward_center_m)
+    p.add_argument("--gt-reachable-forward-sigma-m", type=float, default=oarm_cfg.gt_reachable_forward_sigma_m)
+    p.add_argument("--gt-reachable-lateral-sigma-m", type=float, default=oarm_cfg.gt_reachable_lateral_sigma_m)
+    p.add_argument("--gt-reachable-vertical-sigma-m", type=float, default=oarm_cfg.gt_reachable_vertical_sigma_m)
+    p.add_argument("--gt-reachable-score-weight", type=float, default=oarm_cfg.gt_reachable_score_weight)
+    p.add_argument("--gt-side-score-weight", type=float, default=oarm_cfg.gt_side_score_weight)
     p.add_argument("--min-weight", type=float, default=1e-6)
     p.add_argument("--output", default="OARM/results/gt_risk_points.png")
     p.add_argument("--dpi", type=int, default=160)

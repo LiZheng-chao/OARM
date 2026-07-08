@@ -32,6 +32,7 @@ class OARMDataset(Dataset):
         dataset_root=None,
         use_privileged_risk_filter=oarm_cfg.use_privileged_risk_filter,
         risk_label_source=oarm_cfg.risk_label_source,
+        gt_sampler_options=None,
     ):
         super().__init__()
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -56,7 +57,8 @@ class OARMDataset(Dataset):
         if risk_label_source not in {"proxy", "proxy_esdf", "gt_pointcloud"}:
             raise ValueError(f"Unknown risk_label_source: {risk_label_source}")
         self.risk_label_source = risk_label_source
-        self.gt_risk_sampler = GTRiskPointSampler(dataset_dir) if risk_label_source == "gt_pointcloud" else None
+        self.gt_sampler_options = dict(gt_sampler_options or {})
+        self.gt_risk_sampler = GTRiskPointSampler(dataset_dir, **self.gt_sampler_options) if risk_label_source == "gt_pointcloud" else None
         self.use_privileged_risk_filter = bool(use_privileged_risk_filter or risk_label_source == "proxy_esdf")
         self.risk_filter = None
         self.vertical_num = cfg["vertical_num"]
@@ -119,6 +121,9 @@ class OARMDataset(Dataset):
             "risk_weight": risk_weight.float(),
             "risk_esdf": risk_esdf.float(),
             "hidden_risk_gt": (risk_weight > 1e-6).float(),
+            "raw_gt_risk_point_valid_rate": (risk_weight > 1e-6).float().mean(),
+            "raw_gt_risk_point_weight_sum": risk_weight.float().sum(),
+            "raw_gt_risk_point_weight_mean": risk_weight.float().mean(),
             "uses_gt_reaction_margin": torch.tensor(self.risk_label_source == "gt_pointcloud", dtype=torch.float32),
             "uses_proxy_reaction_margin": torch.tensor(self.risk_label_source != "gt_pointcloud", dtype=torch.float32),
             "reaction_margin_label_source_id": torch.tensor({"proxy": 0, "proxy_esdf": 1, "gt_pointcloud": 2}[self.risk_label_source], dtype=torch.long),
@@ -158,6 +163,7 @@ class OARMDataset(Dataset):
     def risk_cache_tag(self):
         payload = repr(sorted(self.risk_cache_metadata().items())).encode("utf-8")
         return hashlib.sha1(payload).hexdigest()[:10]
+
     def cache_path(self, item):
         if not oarm_cfg.cache_privileged_risk_labels:
             return None

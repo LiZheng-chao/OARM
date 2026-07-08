@@ -1,4 +1,5 @@
 import atexit
+import contextlib
 import json
 import os
 import shutil
@@ -26,6 +27,11 @@ ensure_yopo_path()
 from config.config import cfg
 
 
+@contextlib.contextmanager
+def _null_record_function(*_args, **_kwargs):
+    yield
+
+
 class OARMTrainer:
     def __init__(
         self,
@@ -48,6 +54,22 @@ class OARMTrainer:
         train_yaw_visibility=oarm_cfg.train_yaw_visibility,
         deployed_yaw_mode=oarm_cfg.deployed_yaw_mode,
         risk_label_source=oarm_cfg.risk_label_source,
+        gt_risk_point_count=oarm_cfg.gt_risk_point_count,
+        gt_hidden_depth_margin_m=oarm_cfg.gt_hidden_depth_margin_m,
+        gt_min_forward_m=oarm_cfg.gt_min_forward_m,
+        gt_max_forward_m=oarm_cfg.gt_max_forward_m,
+        gt_horizon_fov_expand_deg=oarm_cfg.gt_horizon_fov_expand_deg,
+        gt_vertical_fov_expand_deg=oarm_cfg.gt_vertical_fov_expand_deg,
+        gt_depth_metric=oarm_cfg.gt_depth_metric,
+        gt_reachable_forward_center_m=oarm_cfg.gt_reachable_forward_center_m,
+        gt_reachable_forward_sigma_m=oarm_cfg.gt_reachable_forward_sigma_m,
+        gt_reachable_lateral_sigma_m=oarm_cfg.gt_reachable_lateral_sigma_m,
+        gt_reachable_vertical_sigma_m=oarm_cfg.gt_reachable_vertical_sigma_m,
+        gt_reachable_score_weight=oarm_cfg.gt_reachable_score_weight,
+        gt_side_score_weight=oarm_cfg.gt_side_score_weight,
+        risk_assoc_distance_m=oarm_cfg.risk_assoc_distance_m,
+        risk_assoc_sigma_m=oarm_cfg.risk_assoc_sigma_m,
+        risk_arrival_radius_m=oarm_cfg.risk_arrival_radius_m,
         use_weak_margin_label=oarm_cfg.use_weak_margin_label,
         train_backup_feasibility=oarm_cfg.train_backup_feasibility,
         train_yield_feasibility=oarm_cfg.train_yield_feasibility,
@@ -64,6 +86,8 @@ class OARMTrainer:
     ):
         self.batch_size = batch_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if num_workers and num_workers > 0:
+            torch.autograd.profiler.record_function = _null_record_function
         self.traj_num = cfg["traj_num"]
         self.max_train_batches = max_train_batches
         self.max_val_batches = max_val_batches
@@ -83,6 +107,24 @@ class OARMTrainer:
         self.train_yaw_visibility = bool(train_yaw_visibility)
         self.deployed_yaw_mode = deployed_yaw_mode
         self.risk_label_source = risk_label_source
+        self.gt_sampler_options = {
+            "point_count": gt_risk_point_count,
+            "hidden_depth_margin_m": gt_hidden_depth_margin_m,
+            "min_forward_m": gt_min_forward_m,
+            "max_forward_m": gt_max_forward_m,
+            "horizon_fov_expand_deg": gt_horizon_fov_expand_deg,
+            "vertical_fov_expand_deg": gt_vertical_fov_expand_deg,
+            "depth_metric": gt_depth_metric,
+            "reachable_forward_center_m": gt_reachable_forward_center_m,
+            "reachable_forward_sigma_m": gt_reachable_forward_sigma_m,
+            "reachable_lateral_sigma_m": gt_reachable_lateral_sigma_m,
+            "reachable_vertical_sigma_m": gt_reachable_vertical_sigma_m,
+            "reachable_score_weight": gt_reachable_score_weight,
+            "side_score_weight": gt_side_score_weight,
+        }
+        self.risk_assoc_distance_m = risk_assoc_distance_m
+        self.risk_assoc_sigma_m = risk_assoc_sigma_m
+        self.risk_arrival_radius_m = risk_arrival_radius_m
         self.use_weak_margin_label = use_weak_margin_label
         self.train_yield_feasibility = bool(train_backup_feasibility or train_yield_feasibility)
         self.train_backup_feasibility = self.train_yield_feasibility
@@ -127,6 +169,9 @@ class OARMTrainer:
                 enable_yaw_visibility=self.train_yaw_visibility,
                 deployed_yaw_mode=self.deployed_yaw_mode,
                 enable_yield_feasibility=self.train_yield_feasibility,
+                risk_assoc_distance_m=self.risk_assoc_distance_m,
+                risk_assoc_sigma_m=self.risk_assoc_sigma_m,
+                risk_arrival_radius_m=self.risk_arrival_radius_m,
             )
         if self.use_fused_adamw:
             self.optimizer = torch.optim.AdamW(
@@ -137,19 +182,25 @@ class OARMTrainer:
         else:
             self.optimizer = torch.optim.AdamW(self.trainable_parameters(), lr=learning_rate)
 
+        loader_kwargs = {}
+        if num_workers and num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 1
+
         self.train_dataloader = DataLoader(
-            OARMDataset(mode="train", dataset_root=self.dataset_root, use_privileged_risk_filter=self.use_privileged_risk_filter, risk_label_source=self.risk_label_source),
+            OARMDataset(mode="train", dataset_root=self.dataset_root, use_privileged_risk_filter=self.use_privileged_risk_filter, risk_label_source=self.risk_label_source, gt_sampler_options=self.gt_sampler_options),
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
+            **loader_kwargs,
         )
         self.val_dataloader = DataLoader(
-            OARMDataset(mode="valid", dataset_root=self.dataset_root, use_privileged_risk_filter=self.use_privileged_risk_filter, risk_label_source=self.risk_label_source),
+            OARMDataset(mode="valid", dataset_root=self.dataset_root, use_privileged_risk_filter=self.use_privileged_risk_filter, risk_label_source=self.risk_label_source, gt_sampler_options=self.gt_sampler_options),
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
+            **loader_kwargs,
         )
 
     def train(self, epoch=50):
@@ -286,7 +337,15 @@ class OARMTrainer:
                 flat_labels["yaw0"] = labels["yaw0"].to(self.device)
             if "yaw_rate0" in labels:
                 flat_labels["yaw_rate0"] = labels["yaw_rate0"].to(self.device)
-            for source_key in ("uses_gt_reaction_margin", "uses_proxy_reaction_margin", "reaction_margin_label_source_id", "hidden_risk_gt"):
+            for source_key in (
+                "uses_gt_reaction_margin",
+                "uses_proxy_reaction_margin",
+                "reaction_margin_label_source_id",
+                "hidden_risk_gt",
+                "raw_gt_risk_point_valid_rate",
+                "raw_gt_risk_point_weight_sum",
+                "raw_gt_risk_point_weight_mean",
+            ):
                 if source_key in labels:
                     flat_labels[source_key] = labels[source_key].to(self.device)
 

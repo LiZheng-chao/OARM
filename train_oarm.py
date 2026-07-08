@@ -28,6 +28,22 @@ TRAINING_OPTION_KEYS = (
     "train_yaw_visibility",
     "deployed_yaw_mode",
     "risk_label_source",
+    "gt_risk_point_count",
+    "gt_hidden_depth_margin_m",
+    "gt_min_forward_m",
+    "gt_max_forward_m",
+    "gt_horizon_fov_expand_deg",
+    "gt_vertical_fov_expand_deg",
+    "gt_depth_metric",
+    "gt_reachable_forward_center_m",
+    "gt_reachable_forward_sigma_m",
+    "gt_reachable_lateral_sigma_m",
+    "gt_reachable_vertical_sigma_m",
+    "gt_reachable_score_weight",
+    "gt_side_score_weight",
+    "risk_assoc_distance_m",
+    "risk_assoc_sigma_m",
+    "risk_arrival_radius_m",
     "use_weak_margin_label",
     "train_backup_feasibility",
     "train_yield_feasibility",
@@ -81,6 +97,22 @@ def parser():
     p.add_argument("--train-yaw-visibility", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
     p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="")
+    p.add_argument("--gt-risk-point-count", type=int, default=None)
+    p.add_argument("--gt-hidden-depth-margin-m", type=float, default=None)
+    p.add_argument("--gt-min-forward-m", type=float, default=None)
+    p.add_argument("--gt-max-forward-m", type=float, default=None)
+    p.add_argument("--gt-horizon-fov-expand-deg", type=float, default=None)
+    p.add_argument("--gt-vertical-fov-expand-deg", type=float, default=None)
+    p.add_argument("--gt-depth-metric", choices=["forward", "ray"], default="")
+    p.add_argument("--gt-reachable-forward-center-m", type=float, default=None)
+    p.add_argument("--gt-reachable-forward-sigma-m", type=float, default=None)
+    p.add_argument("--gt-reachable-lateral-sigma-m", type=float, default=None)
+    p.add_argument("--gt-reachable-vertical-sigma-m", type=float, default=None)
+    p.add_argument("--gt-reachable-score-weight", type=float, default=None)
+    p.add_argument("--gt-side-score-weight", type=float, default=None)
+    p.add_argument("--risk-assoc-distance-m", type=float, default=None)
+    p.add_argument("--risk-assoc-sigma-m", type=float, default=None)
+    p.add_argument("--risk-arrival-radius-m", type=float, default=None)
     p.add_argument("--use-weak-margin-label", action="store_true")
     p.add_argument("--train-backup-feasibility", action="store_true")
     p.add_argument("--train-yield-feasibility", action="store_true")
@@ -159,6 +191,27 @@ def resolve_training_options(args):
         options["deployed_yaw_mode"] = args.deployed_yaw_mode
     if args.risk_label_source:
         options["risk_label_source"] = args.risk_label_source
+    for key in (
+        "gt_risk_point_count",
+        "gt_hidden_depth_margin_m",
+        "gt_min_forward_m",
+        "gt_max_forward_m",
+        "gt_horizon_fov_expand_deg",
+        "gt_vertical_fov_expand_deg",
+        "gt_depth_metric",
+        "gt_reachable_forward_center_m",
+        "gt_reachable_forward_sigma_m",
+        "gt_reachable_lateral_sigma_m",
+        "gt_reachable_vertical_sigma_m",
+        "gt_reachable_score_weight",
+        "gt_side_score_weight",
+        "risk_assoc_distance_m",
+        "risk_assoc_sigma_m",
+        "risk_arrival_radius_m",
+    ):
+        value = getattr(args, key)
+        if value is not None and value != "":
+            options[key] = value
     if options["train_backup_feasibility"]:
         options["train_yield_feasibility"] = True
         options["enable_yield_candidates"] = True
