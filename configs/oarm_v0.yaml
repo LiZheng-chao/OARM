@@ -1,0 +1,14 @@
+# OARM-V0: variable time only.
+candidate_mode: yopo
+backbone_mode: yopo_original
+enable_yield_candidates: false
+train_occlusion_risk: false
+train_risk_point_guidance: false
+train_reaction_margin: false
+deployed_yaw_mode: goal
+risk_label_source: proxy_esdf
+train_backup_feasibility: false
+train_yield_feasibility: false
+use_esdf_collision: false
+use_occlusion_aware_visibility: false
+use_privileged_risk_filter: false

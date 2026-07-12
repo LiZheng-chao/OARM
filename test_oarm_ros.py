@@ -1,0 +1,1668 @@
+﻿import argparse
+import json
+import os
+import sys
+import time
+from threading import Lock
+
+import cv2
+import numpy as np
+import torch
+from scipy.spatial.transform import Rotation as R
+
+ROS_IMPORT_ERROR = None
+try:
+    import rospy
+    import std_msgs.msg
+    from geometry_msgs.msg import Point, PoseStamped
+    from nav_msgs.msg import Odometry, Path
+    from sensor_msgs import point_cloud2
+    from sensor_msgs.msg import Image, PointCloud2, PointField
+    from visualization_msgs.msg import Marker
+except ModuleNotFoundError as exc:
+    ROS_IMPORT_ERROR = exc
+
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+YOPO_DIR = os.path.join(REPO_ROOT, "YOPO")
+if YOPO_DIR not in sys.path:
+    sys.path.insert(0, YOPO_DIR)
+
+from OARM.policy.oarm_network import OARMNetwork
+from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
+from OARM.policy.oarm_state_transform import OARMStateTransform
+from OARM.utils.yopo_compat import ensure_yopo_path
+
+ensure_yopo_path()
+from config.config import cfg
+from policy.poly_solver import Poly5Solver, calculate_yaw
+
+try:
+    from control_msg import PositionCommand
+except ModuleNotFoundError as exc:
+    if ROS_IMPORT_ERROR is None:
+        ROS_IMPORT_ERROR = exc
+
+
+class OARMNet:
+    """ROS inference node for OARM.
+
+    This mirrors YOPO/test_yopo_ros.py but uses OARM's decoded candidate set:
+    utility_score selects the candidate, and each candidate carries its own
+    trajectory time.
+    """
+
+    def __init__(self, config, weight):
+        if ROS_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "ROS Python modules are unavailable. Source your ROS workspace before running "
+                "OARM/test_oarm_ros.py, for example: source Controller/devel/setup.bash"
+            ) from ROS_IMPORT_ERROR
+        self.config = config
+        rospy.init_node("oarm_net", anonymous=False)
+
+        cfg["train"] = False
+        self.height = cfg["image_height"]
+        self.width = cfg["image_width"]
+        self.min_dis, self.max_dis = 0.04, 20.0
+        self.goal = np.array(self.config["goal"], dtype=np.float32)
+        self.goal_received = self.config["start_immediately"]
+        self.plan_from_reference = self.config["plan_from_reference"]
+        self.verbose = self.config["verbose"]
+        self.visualize = self.config["visualize"]
+        self.debug = self.config["debug"]
+        self.main_experiment = self.config["main_experiment"]
+        self.selector_experiment = self.config.get("selector_experiment", False)
+        self.position_control_mode = self.config["position_control_mode"]
+        self.fast_sim_mode = self.config["fast_sim_mode"]
+        self.progress_bonus_weight = self.config["progress_bonus_weight"]
+        self.agile_progress_weight = self.config.get("agile_progress_weight", 0.0)
+        self.agile_goal_distance_weight = self.config.get("agile_goal_distance_weight", 0.0)
+        self.agile_lateral_penalty = self.config.get("agile_lateral_penalty", 0.0)
+        self.agile_time_penalty = self.config.get("agile_time_penalty", 0.0)
+        self.agile_stop_penalty = self.config.get("agile_stop_penalty", 0.0)
+        self.selector_min_goal_drop_rate = self.config.get("selector_min_goal_drop_rate", None)
+        self.selector_max_lateral_rate = self.config.get("selector_max_lateral_rate", None)
+        self.depth_clearance_weight = float(self.config.get("depth_clearance_weight", 0.0))
+        self.depth_clearance_min = float(self.config.get("depth_clearance_min", 0.35))
+        self.depth_clearance_gate = bool(self.config.get("depth_clearance_gate", False))
+        self.depth_clearance_samples = int(self.config.get("depth_clearance_samples", 9))
+        self.depth_clearance_pixel_radius = int(self.config.get("depth_clearance_pixel_radius", 1))
+        self.depth_emergency_stop = bool(self.config.get("depth_emergency_stop", False))
+        self.depth_emergency_clearance = float(self.config.get("depth_emergency_clearance", self.depth_clearance_min))
+        self.depth_emergency_critical_clearance = float(self.config.get("depth_emergency_critical_clearance", 0.15))
+        self.depth_emergency_speed_threshold = float(self.config.get("depth_emergency_speed_threshold", 1.0))
+        self.depth_emergency_traj_time = float(self.config.get("depth_emergency_traj_time", 0.45))
+        self.depth_emergency_distance_scale = float(self.config.get("depth_emergency_distance_scale", 0.0))
+        self.depth_emergency_retreat_distance = float(self.config.get("depth_emergency_retreat_distance", 0.0))
+        self.depth_emergency_target_z = self.config.get("depth_emergency_target_z", None)
+        self.depth_emergency_z_rate = float(self.config.get("depth_emergency_z_rate", 0.8))
+        self.last_depth_emergency_stop = False
+        self.last_depth_emergency_reason = None
+        self.last_depth_emergency_target = None
+        self.last_selector_force_emergency_stop = False
+        self.last_selector_force_emergency_reason = None
+        self.last_stop_fallback_count = None
+        self.last_stop_fallback_altitude_valid_count = None
+        self.selector_min_traj_z = self.config.get("selector_min_traj_z", None)
+        self.selector_max_traj_z = self.config.get("selector_max_traj_z", None)
+        self.altitude_band_weight = float(self.config.get("altitude_band_weight", 0.0))
+        self.altitude_band_samples = int(self.config.get("altitude_band_samples", self.depth_clearance_samples))
+        self.camera_fx = self.config.get("camera_fx", None)
+        self.camera_fy = self.config.get("camera_fy", None)
+        self.camera_cx = self.config.get("camera_cx", None)
+        self.camera_cy = self.config.get("camera_cy", None)
+        hfov = float(self.config.get("camera_hfov_deg", cfg["horizon_camera_fov"]))
+        vfov = float(self.config.get("camera_vfov_deg", cfg["vertical_camera_fov"]))
+        self.camera_fx = float(self.camera_fx) if self.camera_fx is not None else (self.width - 1) / (2.0 * np.tan(np.deg2rad(hfov) * 0.5))
+        self.camera_fy = float(self.camera_fy) if self.camera_fy is not None else (self.height - 1) / (2.0 * np.tan(np.deg2rad(vfov) * 0.5))
+        self.camera_cx = float(self.camera_cx) if self.camera_cx is not None else (self.width - 1) * 0.5
+        self.camera_cy = float(self.camera_cy) if self.camera_cy is not None else (self.height - 1) * 0.5
+        axis_to_index = {"x": 0, "y": 1, "z": 2}
+        self.depth_forward_axis = self.config.get("depth_forward_axis", "x")
+        self.depth_horizontal_axis = self.config.get("depth_horizontal_axis", "y")
+        self.depth_vertical_axis = self.config.get("depth_vertical_axis", "z")
+        self.depth_forward_sign = float(self.config.get("depth_forward_sign", 1.0))
+        self.depth_horizontal_sign = float(self.config.get("depth_horizontal_sign", 1.0))
+        self.depth_vertical_sign = float(self.config.get("depth_vertical_sign", -1.0))
+        depth_axes = (self.depth_forward_axis, self.depth_horizontal_axis, self.depth_vertical_axis)
+        if any(axis not in axis_to_index for axis in depth_axes) or len(set(depth_axes)) != 3:
+            raise ValueError(
+                "Depth projection axes must be a permutation of x/y/z: "
+                f"forward={self.depth_forward_axis}, horizontal={self.depth_horizontal_axis}, "
+                f"vertical={self.depth_vertical_axis}"
+            )
+        self.depth_forward_index = axis_to_index[self.depth_forward_axis]
+        self.depth_horizontal_index = axis_to_index[self.depth_horizontal_axis]
+        self.depth_vertical_index = axis_to_index[self.depth_vertical_axis]
+        self.arrival_distance = self.config.get("arrival_distance", 1.0)
+        self.accept_rviz_goal = self.config.get("accept_rviz_goal", True)
+        self.goal_segment_id = int(self.config.get("goal_segment_id", 0))
+        self.hover_on_arrival = self.config.get("hover_on_arrival", True)
+        self.first_arrival_time = None
+        self.min_goal_distance = None
+        self.run_id = self.config.get("run_id") or time.strftime("%Y%m%d_%H%M%S")
+        self.method = self.config.get("method", "oarm")
+        self.scenario = self.config.get("scenario", "unknown")
+        self.seed = int(self.config.get("seed", 0))
+        self.checkpoint_path = self.config.get("checkpoint", "")
+        agile_bonus_enabled = any(
+            abs(float(value)) > 1e-9
+            for value in (
+                self.agile_progress_weight,
+                self.agile_goal_distance_weight,
+                self.agile_lateral_penalty,
+                self.agile_time_penalty,
+                self.agile_stop_penalty,
+                self.depth_clearance_weight,
+                float(self.depth_clearance_gate),
+                float(self.depth_emergency_stop),
+            )
+        )
+        if self.main_experiment and (self.fast_sim_mode or self.progress_bonus_weight != 0.0 or agile_bonus_enabled):
+            raise ValueError(
+                "main_experiment requires all online selector bonuses to be zero. "
+                "Use --selector-experiment without --main-experiment for agile selector ablations."
+            )
+        if self.main_experiment and self.selector_experiment:
+            raise ValueError("--main-experiment and --selector-experiment are mutually exclusive.")
+        if agile_bonus_enabled and not self.selector_experiment:
+            raise ValueError(
+                "Online agile selector bonuses require --selector-experiment. "
+                "Use --main-experiment only for learned-utility paper runs."
+            )
+        self.min_command_z = self.config["min_command_z"]
+        self.max_command_z = self.config["max_command_z"]
+        self.path_max_points = self.config["path_max_points"]
+        self.log_jsonl_path = self.config.get("log_jsonl", "")
+        self.exec_log_jsonl_path = self.config.get("exec_log_jsonl", "")
+        self.log_jsonl_file = None
+        self.exec_log_jsonl_file = None
+        log_mode = "a" if self.config.get("append_logs", False) else "w"
+        if self.log_jsonl_path:
+            os.makedirs(os.path.dirname(os.path.abspath(self.log_jsonl_path)), exist_ok=True)
+            self.log_jsonl_file = open(self.log_jsonl_path, log_mode, encoding="utf-8")
+        if self.exec_log_jsonl_path:
+            os.makedirs(os.path.dirname(os.path.abspath(self.exec_log_jsonl_path)), exist_ok=True)
+            self.exec_log_jsonl_file = open(self.exec_log_jsonl_path, log_mode, encoding="utf-8")
+        if self.log_jsonl_file is not None or self.exec_log_jsonl_file is not None:
+            rospy.on_shutdown(self.close_log_jsonl)
+        self.Rotation_bc = R.from_euler("ZYX", [0, self.config["pitch_angle_deg"], 0], degrees=True).as_matrix()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.odom = Odometry()
+        self.odom_init = False
+        self.last_yaw = 0.0
+        self.ctrl_dt = 0.02
+        self.ctrl_time = None
+        self.desire_init = False
+        self.arrive = False
+        self.desire_pos = None
+        self.desire_vel = None
+        self.desire_acc = None
+        self.optimal_poly_x = None
+        self.optimal_poly_y = None
+        self.optimal_poly_z = None
+        self.selected_traj_time = cfg["sgm_time"]
+        self.lock = Lock()
+        self.last_control_msg = None
+        self.state_transform = OARMStateTransform()
+        self.lattice_primitive = self.state_transform.lattice_primitive
+
+        self.time_forward = 0.0
+        self.time_process = 0.0
+        self.time_prepare = 0.0
+        self.time_interpolation = 0.0
+        self.time_visualize = 0.0
+        self.count = 0
+        self.depth_count = 0
+        self.control_count = 0
+        self.last_status_time = 0.0
+        self.last_nav_viz_time = 0.0
+        self.last_goal_distance = None
+        self.last_selected_type = None
+        self.last_selected_time = None
+        self.last_selected_end_norm = None
+        self.last_selector_valid_count = None
+        self.last_selector_total_count = None
+        self.last_depth_clearance_selected = None
+        self.last_depth_clearance_min = None
+        self.last_depth_clearance_valid_count = None
+        self.last_depth_clearance_total_count = None
+        self.last_altitude_valid_count = None
+        self.last_altitude_total_count = None
+        self.last_candidate_min_z = None
+        self.last_candidate_max_z = None
+        self.warned_no_ctrl_subscriber = False
+        self.depth_fps = 30
+        self.executed_path = Path()
+        self.executed_path.header.frame_id = "world"
+
+        self.policy = OARMNetwork(
+            candidate_mode=self.config.get("candidate_mode", "typed_frontier"),
+            backbone_mode=self.config.get("backbone_mode", "yopo_original"),
+            enable_yield_candidates=self.config.get("enable_yield_candidates", False),
+        ).to(self.device)
+        self.load_policy(weight)
+        self.policy.eval()
+        self.warm_up()
+
+        self.lattice_traj_pub = rospy.Publisher("/oarm_net/lattice_trajs_visual", PointCloud2, queue_size=1)
+        self.best_traj_pub = rospy.Publisher("/oarm_net/best_traj_visual", PointCloud2, queue_size=1)
+        self.all_trajs_pub = rospy.Publisher("/oarm_net/trajs_visual", PointCloud2, queue_size=1)
+        self.executed_path_pub = rospy.Publisher("/oarm_net/executed_path", Path, queue_size=1)
+        self.goal_marker_pub = rospy.Publisher("/oarm_net/goal_marker", Marker, queue_size=1)
+        self.goal_line_pub = rospy.Publisher("/oarm_net/goal_line", Marker, queue_size=1)
+        self.status_text_pub = rospy.Publisher("/oarm_net/status_text", Marker, queue_size=1)
+        self.ctrl_pub = rospy.Publisher(self.config["ctrl_topic"], PositionCommand, queue_size=1)
+
+        self.odom_sub = rospy.Subscriber(
+            self.config["odom_topic"], Odometry, self.callback_odometry, queue_size=1, tcp_nodelay=True
+        )
+        self.depth_sub = rospy.Subscriber(
+            self.config["depth_topic"], Image, self.callback_depth, queue_size=1, tcp_nodelay=True
+        )
+        self.goal_sub = rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.callback_set_goal, queue_size=1)
+
+        rospy.sleep(1.0)
+        self.timer_ctrl = rospy.Timer(rospy.Duration(self.ctrl_dt), self.control_pub)
+        print("OARM Net Node Ready!")
+        self.print_topic_status()
+        rospy.spin()
+
+    def load_policy(self, weight):
+        if not weight:
+            raise ValueError("OARM checkpoint path is empty. Pass --checkpoint or --trial/--epoch.")
+        if not os.path.isfile(weight):
+            raise FileNotFoundError(f"OARM checkpoint not found: {weight}")
+        state_dict, checkpoint_metadata = load_oarm_checkpoint(weight, map_location=self.device)
+        validate_checkpoint_metadata(
+            checkpoint_metadata,
+            self.config.get("candidate_mode", "typed_frontier"),
+            self.config.get("backbone_mode", "yopo_original"),
+            allow_mismatch=self.config.get("allow_checkpoint_mismatch", False),
+            enable_yield_candidates=self.config.get("enable_yield_candidates", False),
+            deployed_yaw_mode=self.config.get("deployed_yaw_mode", "goal"),
+        )
+        self.policy.load_state_dict(state_dict)
+
+    def callback_set_goal(self, data):
+        if not self.accept_rviz_goal:
+            rospy.loginfo("Ignoring RViz goal because --disable-rviz-goal is set.")
+            return
+        self.goal = np.asarray([data.pose.position.x, data.pose.position.y, 2.0], dtype=np.float32)
+        self.goal_received = True
+        self.arrive = False
+        self.goal_segment_id += 1
+        self.first_arrival_time = None
+        self.min_goal_distance = None
+        self.last_goal_distance = None
+        self.last_selected_type = None
+        self.last_selected_time = None
+        self.last_selected_end_norm = None
+        self.reset_executed_path()
+        if self.odom_init:
+            self.desire_pos = np.array(
+                (self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z)
+            )
+            self.desire_vel = np.array(
+                (self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z)
+            )
+            self.desire_acc = np.array((0.0, 0.0, 0.0))
+            self.ctrl_time = None
+        print(f"New Goal: ({data.pose.position.x:.1f}, {data.pose.position.y:.1f})")
+
+    def callback_odometry(self, data):
+        self.odom = data
+        if not self.desire_init:
+            self.desire_pos = np.array(
+                (self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z)
+            )
+            self.desire_vel = np.array(
+                (self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z)
+            )
+            self.desire_acc = np.array((0.0, 0.0, 0.0))
+            ypr = R.from_quat(
+                [
+                    self.odom.pose.pose.orientation.x,
+                    self.odom.pose.pose.orientation.y,
+                    self.odom.pose.pose.orientation.z,
+                    self.odom.pose.pose.orientation.w,
+                ]
+            ).as_euler("ZYX", degrees=False)
+            self.last_yaw = ypr[0]
+        self.odom_init = True
+
+        pos, _vel, _yaw = self.get_odom_state()
+        self.last_goal_distance = float(np.linalg.norm(pos - self.goal))
+        if self.min_goal_distance is None:
+            self.min_goal_distance = self.last_goal_distance
+        else:
+            self.min_goal_distance = min(self.min_goal_distance, self.last_goal_distance)
+        self.publish_navigation_visuals(pos)
+        if self.goal_received and self.last_goal_distance < self.arrival_distance and not self.arrive:
+            print("Arrive!")
+            self.arrive = True
+            self.first_arrival_time = float(time.time())
+        self.write_exec_log(pos)
+
+    def process_odom(self):
+        rotation_wb = R.from_quat(
+            [
+                self.odom.pose.pose.orientation.x,
+                self.odom.pose.pose.orientation.y,
+                self.odom.pose.pose.orientation.z,
+                self.odom.pose.pose.orientation.w,
+            ]
+        ).as_matrix()
+        self.Rotation_wc = np.dot(rotation_wb, self.Rotation_bc)
+        rotation_cw = self.Rotation_wc.T
+
+        vel_w = (
+            self.desire_vel
+            if self.plan_from_reference
+            else np.array(
+                [self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z]
+            )
+        )
+        vel_c = np.dot(rotation_cw, vel_w)
+        acc_w = self.desire_acc
+        acc_c = np.dot(rotation_cw, acc_w)
+
+        goal_w = self.goal - self.desire_pos
+        goal_c = np.dot(rotation_cw, goal_w)
+
+        obs = np.concatenate((vel_c, acc_c, goal_c), axis=0).astype(np.float32)
+        return torch.from_numpy(obs[None, :])
+
+    @torch.inference_mode()
+    def callback_depth(self, data):
+        if not self.odom_init:
+            return
+        if not self.goal_received:
+            return
+        if self.arrive:
+            if self.hover_on_arrival:
+                self.publish_arrival_hover()
+            return
+
+        time0 = time.time()
+        depth_m = self.decode_depth_m(data)
+        depth = self.prepare_depth_input(depth_m)
+        depth_input = torch.from_numpy(depth).to(self.device, non_blocking=True)
+
+        time1 = time.time()
+        obs = self.process_odom().to(self.device, non_blocking=True)
+
+        time2 = time.time()
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+        forward_start = time.time()
+        candidate = self.policy.inference(depth_input, obs)
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+        forward_end = time.time()
+        flat = candidate.flatten()
+        endstate = flat["end_state_b"].detach().cpu().numpy()
+        utility = flat["utility_score"].detach().cpu().numpy()
+        traj_time = flat["traj_time"].detach().cpu().numpy()
+        candidate_type = flat.get("candidate_type")
+        candidate_type = None if candidate_type is None else candidate_type.detach().cpu().numpy()
+        margin_pred = flat["margin_pred"].detach().cpu().numpy()
+        risk_prob = torch.sigmoid(flat["risk_logit"]).detach().cpu().numpy()
+        yield_logit = flat["yield_logit"] if "yield_logit" in flat else flat["backup_logit"]
+        yield_prob = torch.sigmoid(yield_logit).detach().cpu().numpy()
+        yaw_terminal = flat["yaw_terminal"].detach().cpu().numpy()
+        time3 = time.time()
+
+        endstate_c = endstate.reshape(-1, 3, 3).transpose(0, 2, 1)
+        endstate_w = np.matmul(self.Rotation_wc, endstate_c)
+        depth_clearance = self.compute_candidate_depth_clearance(depth_m, endstate_w, traj_time)
+        altitude_violation = self.compute_candidate_altitude_violation(endstate_w, traj_time)
+        action_id, selection_score = self.select_action(
+            utility,
+            endstate_w,
+            traj_time,
+            candidate_type,
+            margin_pred=margin_pred,
+            risk_prob=risk_prob,
+            depth_clearance=depth_clearance,
+            altitude_violation=altitude_violation,
+        )
+        selected_time = float(np.clip(traj_time[action_id], 0.1, 10.0))
+        emergency_stop = self.should_depth_emergency_stop(depth_clearance, action_id)
+
+        with self.lock:
+            start_pos = self.get_start_pos()
+            start_vel = self.get_start_vel()
+            start_acc = self.desire_acc
+            if emergency_stop:
+                selected_time = float(np.clip(self.depth_emergency_traj_time, 0.1, 2.0))
+                emergency_target = start_pos + start_vel * selected_time * self.depth_emergency_distance_scale
+                goal_vec = self.goal - start_pos
+                goal_vec[2] = 0.0
+                goal_norm = float(np.linalg.norm(goal_vec))
+                if self.depth_emergency_retreat_distance > 0.0 and goal_norm > 1e-3:
+                    emergency_target -= (goal_vec / goal_norm) * self.depth_emergency_retreat_distance
+                target_z = self.goal[2] if self.depth_emergency_target_z is None else float(self.depth_emergency_target_z)
+                max_z_step = max(0.0, self.depth_emergency_z_rate) * selected_time
+                z_delta = float(np.clip(target_z - start_pos[2], -max_z_step, max_z_step))
+                emergency_target[2] = float(np.clip(start_pos[2] + z_delta, self.min_command_z, self.max_command_z))
+                self.last_depth_emergency_target = emergency_target.astype(float).tolist()
+                end_pos = emergency_target
+                end_vel = np.zeros(3, dtype=np.float32)
+                end_acc = np.zeros(3, dtype=np.float32)
+            else:
+                self.last_depth_emergency_target = None
+                end_pos = start_pos + endstate_w[action_id, :, 0]
+                end_pos[2] = float(np.clip(end_pos[2], self.min_command_z, self.max_command_z))
+                end_vel = endstate_w[action_id, :, 1]
+                end_acc = endstate_w[action_id, :, 2]
+            self.optimal_poly_x = Poly5Solver(
+                start_pos[0],
+                start_vel[0],
+                start_acc[0],
+                end_pos[0],
+                end_vel[0],
+                end_acc[0],
+                selected_time,
+            )
+            self.optimal_poly_y = Poly5Solver(
+                start_pos[1],
+                start_vel[1],
+                start_acc[1],
+                end_pos[1],
+                end_vel[1],
+                end_acc[1],
+                selected_time,
+            )
+            self.optimal_poly_z = Poly5Solver(
+                start_pos[2],
+                start_vel[2],
+                start_acc[2],
+                end_pos[2],
+                end_vel[2],
+                end_acc[2],
+                selected_time,
+            )
+            self.selected_traj_time = selected_time
+            self.ctrl_time = 0.0
+
+        time4 = time.time()
+        self.depth_count += 1
+        self.print_selection_status(action_id, utility, selection_score, endstate_w, traj_time, candidate_type)
+        self.visualize_trajectory(utility, endstate_w, traj_time, action_id, candidate_type)
+        time5 = time.time()
+        self.write_benchmark_log(
+            action_id,
+            utility,
+            selection_score,
+            endstate_w,
+            traj_time,
+            candidate_type,
+            margin_pred,
+            risk_prob,
+            yield_prob,
+            yaw_terminal,
+            depth_clearance,
+            altitude_violation,
+            inference_latency_ms=(forward_end - forward_start) * 1000.0,
+            candidate_decode_ms=(time3 - forward_end) * 1000.0,
+            selection_ms=(time4 - time3) * 1000.0,
+            total_latency_ms=(time5 - time0) * 1000.0,
+        )
+        self.print_time(time0, time1, time2, time3, time4, time5)
+
+    def decode_depth_m(self, data):
+        if data.encoding == "32FC1":
+            depth = np.frombuffer(data.data, dtype=np.float32).reshape(data.height, data.width).copy()
+        elif data.encoding == "16UC1":
+            depth = np.frombuffer(data.data, dtype=np.uint16).reshape(data.height, data.width).astype(np.float32) / 1000.0
+        else:
+            raise ValueError(f"Unsupported depth encoding: {data.encoding}. Expected '32FC1' or '16UC1'.")
+
+        if depth.shape[0] != self.height or depth.shape[1] != self.width:
+            depth = cv2.resize(depth, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
+        invalid = np.isnan(depth) | (depth < self.min_dis) | (depth > self.max_dis)
+        depth = np.clip(depth, self.min_dis, self.max_dis)
+        depth[invalid] = self.max_dis
+        return depth.astype(np.float32)
+
+    def prepare_depth_input(self, depth_m):
+        depth = np.minimum(depth_m, self.max_dis) / self.max_dis
+        nan_mask = np.isnan(depth) | (depth < self.min_dis / self.max_dis)
+        interpolated_image = cv2.inpaint(np.uint8(depth * 255), np.uint8(nan_mask), 1, cv2.INPAINT_NS)
+        interpolated_image = interpolated_image.astype(np.float32) / 255.0
+        return interpolated_image.reshape([1, 1, self.height, self.width])
+
+    def decode_depth(self, data):
+        return self.prepare_depth_input(self.decode_depth_m(data))
+
+    def control_pub(self, _timer):
+        if not self.goal_received:
+            return
+        if self.arrive and self.hover_on_arrival:
+            self.publish_arrival_hover()
+            return
+        if self.ctrl_time is None or self.ctrl_time > self.selected_traj_time:
+            return
+        if self.ctrl_pub.get_num_connections() == 0:
+            if not rospy.is_shutdown() and not self.warned_no_ctrl_subscriber:
+                rospy.logwarn(
+                    "No subscriber on %s. Start the controller launch before expecting the drone to move.",
+                    self.config["ctrl_topic"],
+                )
+                self.warned_no_ctrl_subscriber = True
+            return
+        with self.lock:
+            self.ctrl_time += self.ctrl_dt
+            control_msg = PositionCommand()
+            control_msg.header.stamp = rospy.Time.now()
+            if self.position_control_mode:
+                control_msg.trajectory_flag = control_msg.TRAJECTORY_STATUS_EMPTY
+            else:
+                control_msg.trajectory_flag = control_msg.TRAJECTORY_STATUS_READY
+            control_msg.position.x = self.optimal_poly_x.get_position(self.ctrl_time)
+            control_msg.position.y = self.optimal_poly_y.get_position(self.ctrl_time)
+            control_msg.position.z = float(
+                np.clip(self.optimal_poly_z.get_position(self.ctrl_time), self.min_command_z, self.max_command_z)
+            )
+            control_msg.velocity.x = self.optimal_poly_x.get_velocity(self.ctrl_time)
+            control_msg.velocity.y = self.optimal_poly_y.get_velocity(self.ctrl_time)
+            control_msg.velocity.z = self.optimal_poly_z.get_velocity(self.ctrl_time)
+            control_msg.acceleration.x = self.optimal_poly_x.get_acceleration(self.ctrl_time)
+            control_msg.acceleration.y = self.optimal_poly_y.get_acceleration(self.ctrl_time)
+            control_msg.acceleration.z = self.optimal_poly_z.get_acceleration(self.ctrl_time)
+            self.desire_pos = np.array([control_msg.position.x, control_msg.position.y, control_msg.position.z])
+            self.desire_vel = np.array([control_msg.velocity.x, control_msg.velocity.y, control_msg.velocity.z])
+            self.desire_acc = np.array([control_msg.acceleration.x, control_msg.acceleration.y, control_msg.acceleration.z])
+
+            goal_dir = self.goal - self.desire_pos
+            yaw, yaw_dot = calculate_yaw(self.desire_vel, goal_dir, self.last_yaw, self.ctrl_dt)
+            self.last_yaw = yaw
+            control_msg.yaw = yaw
+            control_msg.yaw_dot = yaw_dot
+            self.desire_init = True
+            self.last_control_msg = control_msg
+            self.ctrl_pub.publish(control_msg)
+            self.control_count += 1
+            if self.debug and self.control_count % 50 == 1:
+                acc_norm = float(np.linalg.norm(self.desire_acc))
+                vel_norm = float(np.linalg.norm(self.desire_vel))
+                rospy.loginfo(
+                    "OARM command flag=%d pos=(%.2f, %.2f, %.2f) vel_norm=%.2f acc_norm=%.2f",
+                    control_msg.trajectory_flag,
+                    control_msg.position.x,
+                    control_msg.position.y,
+                    control_msg.position.z,
+                    vel_norm,
+                    acc_norm,
+                )
+
+    def publish_arrival_hover(self):
+        control_msg = PositionCommand()
+        control_msg.header.stamp = rospy.Time.now()
+        control_msg.trajectory_flag = control_msg.TRAJECTORY_STATUS_EMPTY
+        control_msg.position.x = float(self.goal[0])
+        control_msg.position.y = float(self.goal[1])
+        control_msg.position.z = float(np.clip(self.goal[2], self.min_command_z, self.max_command_z))
+        control_msg.velocity.x = 0.0
+        control_msg.velocity.y = 0.0
+        control_msg.velocity.z = 0.0
+        control_msg.acceleration.x = 0.0
+        control_msg.acceleration.y = 0.0
+        control_msg.acceleration.z = 0.0
+        control_msg.yaw = self.last_yaw
+        control_msg.yaw_dot = 0.0
+        self.desire_pos = np.array([control_msg.position.x, control_msg.position.y, control_msg.position.z])
+        self.desire_vel = np.array([0.0, 0.0, 0.0])
+        self.desire_acc = np.array([0.0, 0.0, 0.0])
+        self.desire_init = True
+        self.last_control_msg = control_msg
+        self.ctrl_pub.publish(control_msg)
+        self.control_count += 1
+
+    def compute_candidate_altitude_violation(self, endstate_w, traj_time):
+        if self.selector_min_traj_z is None and self.selector_max_traj_z is None and self.altitude_band_weight <= 0.0:
+            self.last_altitude_valid_count = None
+            self.last_altitude_total_count = None
+            self.last_candidate_min_z = None
+            self.last_candidate_max_z = None
+            return None
+
+        start_pos = self.get_start_pos()
+        start_vel = self.get_start_vel()
+        start_acc = self.desire_acc if self.desire_acc is not None else np.zeros(3, dtype=np.float32)
+        samples = max(3, int(self.altitude_band_samples))
+        min_z = np.full((endstate_w.shape[0],), np.inf, dtype=np.float32)
+        max_z = np.full((endstate_w.shape[0],), -np.inf, dtype=np.float32)
+        violation = np.zeros((endstate_w.shape[0],), dtype=np.float32)
+
+        for i in range(endstate_w.shape[0]):
+            tf = float(np.clip(traj_time[i], 0.1, 10.0))
+            t_values = np.linspace(0.0, tf, samples)
+            pz = Poly5Solver(
+                start_pos[2],
+                start_vel[2],
+                start_acc[2],
+                endstate_w[i, 2, 0] + start_pos[2],
+                endstate_w[i, 2, 1],
+                endstate_w[i, 2, 2],
+                tf,
+            )
+            z_values = np.asarray(pz.get_position(t_values), dtype=np.float32)
+            min_z[i] = float(np.min(z_values))
+            max_z[i] = float(np.max(z_values))
+            if self.selector_min_traj_z is not None:
+                violation[i] += max(0.0, float(self.selector_min_traj_z) - float(min_z[i]))
+            if self.selector_max_traj_z is not None:
+                violation[i] += max(0.0, float(max_z[i]) - float(self.selector_max_traj_z))
+
+        altitude_valid = violation <= 1e-6
+        self.last_altitude_valid_count = int(np.count_nonzero(altitude_valid))
+        self.last_altitude_total_count = int(altitude_valid.size)
+        self.last_candidate_min_z = min_z
+        self.last_candidate_max_z = max_z
+        return violation
+
+    def compute_candidate_depth_clearance(self, depth_m, endstate_w, traj_time):
+        if not (self.depth_clearance_gate or self.depth_clearance_weight > 0.0):
+            self.last_depth_clearance_selected = None
+            self.last_depth_clearance_min = None
+            self.last_depth_clearance_valid_count = None
+            self.last_depth_clearance_total_count = None
+            return None
+        if depth_m is None or depth_m.size == 0:
+            return None
+
+        start_pos = self.get_start_pos()
+        start_vel = self.get_start_vel()
+        start_acc = self.desire_acc if self.desire_acc is not None else np.zeros(3, dtype=np.float32)
+        rotation_cw = self.Rotation_wc.T
+        samples = max(3, int(self.depth_clearance_samples))
+        radius = max(0, int(self.depth_clearance_pixel_radius))
+        clearances = np.full((endstate_w.shape[0],), np.inf, dtype=np.float32)
+        projection_counts = np.zeros((endstate_w.shape[0],), dtype=np.int32)
+
+        for i in range(endstate_w.shape[0]):
+            tf = float(np.clip(traj_time[i], 0.1, 10.0))
+            # Skip t=0 so the current vehicle body does not self-trigger the depth gate.
+            t_values = np.linspace(0.15 * tf, tf, samples)
+            px = Poly5Solver(start_pos[0], start_vel[0], start_acc[0], endstate_w[i, 0, 0] + start_pos[0], endstate_w[i, 0, 1], endstate_w[i, 0, 2], tf)
+            py = Poly5Solver(start_pos[1], start_vel[1], start_acc[1], endstate_w[i, 1, 0] + start_pos[1], endstate_w[i, 1, 1], endstate_w[i, 1, 2], tf)
+            pz = Poly5Solver(start_pos[2], start_vel[2], start_acc[2], endstate_w[i, 2, 0] + start_pos[2], endstate_w[i, 2, 1], endstate_w[i, 2, 2], tf)
+            pts_w = np.stack((px.get_position(t_values), py.get_position(t_values), pz.get_position(t_values)), axis=-1)
+            pts_c = (rotation_cw @ (pts_w - start_pos[None, :]).T).T
+            forward = self.depth_forward_sign * pts_c[:, self.depth_forward_index]
+            valid_forward = (forward > self.min_dis) & (forward < self.max_dis)
+            if not np.any(valid_forward):
+                continue
+            pts_c = pts_c[valid_forward]
+            forward = forward[valid_forward]
+            horizontal = self.depth_horizontal_sign * pts_c[:, self.depth_horizontal_index]
+            vertical = self.depth_vertical_sign * pts_c[:, self.depth_vertical_index]
+            u = self.camera_cx + self.camera_fx * (horizontal / forward)
+            v = self.camera_cy + self.camera_fy * (vertical / forward)
+            ui = np.rint(u).astype(np.int32)
+            vi = np.rint(v).astype(np.int32)
+            inside = (ui >= 0) & (ui < self.width) & (vi >= 0) & (vi < self.height)
+            if not np.any(inside):
+                continue
+            ui = ui[inside]
+            vi = vi[inside]
+            forward = forward[inside]
+            local_clearance = []
+            for uu, vv, xx in zip(ui, vi, forward):
+                u0 = max(0, int(uu) - radius)
+                u1 = min(self.width, int(uu) + radius + 1)
+                v0 = max(0, int(vv) - radius)
+                v1 = min(self.height, int(vv) + radius + 1)
+                observed = float(np.min(depth_m[v0:v1, u0:u1]))
+                local_clearance.append(observed - float(xx))
+            if local_clearance:
+                projection_counts[i] = len(local_clearance)
+                clearances[i] = float(np.min(local_clearance))
+
+        finite = np.isfinite(clearances)
+        self.last_depth_clearance_min = float(np.min(clearances[finite])) if np.any(finite) else None
+        self.last_depth_clearance_valid_count = int(np.count_nonzero(finite & (clearances >= self.depth_clearance_min)))
+        self.last_depth_clearance_total_count = int(clearances.size)
+        return clearances
+
+    def should_depth_emergency_stop(self, depth_clearance, action_id):
+        self.last_depth_emergency_stop = False
+        self.last_depth_emergency_reason = None
+        if not self.depth_emergency_stop:
+            return False
+        if self.last_selector_force_emergency_stop:
+            self.last_depth_emergency_stop = True
+            self.last_depth_emergency_reason = self.last_selector_force_emergency_reason
+            return True
+        if depth_clearance is None:
+            return False
+        speed = float(np.linalg.norm(self.get_start_vel()))
+        finite = np.isfinite(depth_clearance)
+        if not np.any(finite):
+            return False
+        selected_clearance = None
+        if 0 <= int(action_id) < depth_clearance.shape[0] and finite[action_id]:
+            selected_clearance = float(depth_clearance[action_id])
+        no_safe_candidate = bool(
+            self.depth_clearance_gate
+            and self.last_depth_clearance_valid_count is not None
+            and self.last_depth_clearance_valid_count == 0
+        )
+        # Do not trigger on the worst unselected candidate. In cluttered scenes some
+        # candidates are intentionally bad; emergency should only override the chosen
+        # command or a true no-safe-candidate condition.
+        selected_too_close = selected_clearance is not None and selected_clearance < self.depth_emergency_clearance
+        critical_hazard = selected_clearance is not None and selected_clearance < self.depth_emergency_critical_clearance
+        speed_hazard = speed >= self.depth_emergency_speed_threshold
+        if critical_hazard or ((no_safe_candidate or selected_too_close) and speed_hazard):
+            self.last_depth_emergency_stop = True
+            if critical_hazard:
+                self.last_depth_emergency_reason = "critical_depth_clearance"
+            elif no_safe_candidate:
+                self.last_depth_emergency_reason = "no_safe_depth_candidate"
+            else:
+                self.last_depth_emergency_reason = "selected_depth_clearance"
+            return True
+        return False
+
+    def select_action(
+        self,
+        utility,
+        endstate_w,
+        traj_time,
+        candidate_type=None,
+        margin_pred=None,
+        risk_prob=None,
+        depth_clearance=None,
+        altitude_violation=None,
+    ):
+        score = utility.copy()
+        self.last_selector_force_emergency_stop = False
+        self.last_selector_force_emergency_reason = None
+        self.last_stop_fallback_count = None
+        self.last_stop_fallback_altitude_valid_count = None
+        if self.fast_sim_mode and candidate_type is not None:
+            score = score - 0.25 * (candidate_type == 2) - 0.6 * (candidate_type == 3)
+
+        selector_valid = None
+        if (
+            self.progress_bonus_weight > 0.0
+            or self.agile_progress_weight > 0.0
+            or self.agile_goal_distance_weight > 0.0
+            or self.agile_lateral_penalty > 0.0
+            or self.selector_min_goal_drop_rate is not None
+            or self.selector_max_lateral_rate is not None
+        ):
+            start_pos = self.get_start_pos()
+            goal_dir = self.goal - start_pos
+            goal_norm = np.linalg.norm(goal_dir)
+            if goal_norm > 1e-3:
+                goal_dir = goal_dir / goal_norm
+                endpoint_offset = endstate_w[:, :, 0]
+                progress = np.dot(endpoint_offset, goal_dir)
+                time_safe = np.clip(traj_time, 0.1, 10.0)
+                progress_rate = progress / time_safe
+                score = score + (self.progress_bonus_weight + self.agile_progress_weight) * progress_rate
+                endpoint_pos = start_pos[None, :] + endpoint_offset
+                endpoint_goal_distance = np.linalg.norm(endpoint_pos - self.goal[None, :], axis=1)
+                goal_distance_drop = goal_norm - endpoint_goal_distance
+                goal_distance_drop_rate = goal_distance_drop / time_safe
+                lateral_offset = endpoint_offset - progress[:, None] * goal_dir[None, :]
+                lateral_distance = np.linalg.norm(lateral_offset, axis=1)
+                lateral_rate = lateral_distance / time_safe
+                if self.agile_goal_distance_weight > 0.0:
+                    score = score + self.agile_goal_distance_weight * goal_distance_drop_rate
+                if self.agile_lateral_penalty > 0.0:
+                    score = score - self.agile_lateral_penalty * lateral_rate
+                selector_valid = np.ones_like(score, dtype=bool)
+                if self.selector_min_goal_drop_rate is not None:
+                    selector_valid &= goal_distance_drop_rate >= float(self.selector_min_goal_drop_rate)
+                if self.selector_max_lateral_rate is not None:
+                    selector_valid &= lateral_rate <= float(self.selector_max_lateral_rate)
+                self.last_selector_total_count = int(selector_valid.size)
+                self.last_selector_valid_count = int(np.count_nonzero(selector_valid))
+
+        depth_valid = None
+        if depth_clearance is not None:
+            finite_clearance = np.isfinite(depth_clearance)
+            clearance_violation = np.where(
+                finite_clearance,
+                np.maximum(0.0, self.depth_clearance_min - depth_clearance),
+                0.0,
+            )
+            if self.depth_clearance_weight > 0.0:
+                score = score - self.depth_clearance_weight * clearance_violation
+            if self.depth_clearance_gate:
+                depth_valid = finite_clearance & (depth_clearance >= self.depth_clearance_min)
+                self.last_depth_clearance_valid_count = int(np.count_nonzero(depth_valid))
+                self.last_depth_clearance_total_count = int(depth_valid.size)
+
+        altitude_valid = None
+        if altitude_violation is not None:
+            if self.altitude_band_weight > 0.0:
+                score = score - self.altitude_band_weight * altitude_violation
+            if self.selector_min_traj_z is not None or self.selector_max_traj_z is not None:
+                altitude_valid = altitude_violation <= 1e-6
+                self.last_altitude_valid_count = int(np.count_nonzero(altitude_valid))
+                self.last_altitude_total_count = int(altitude_valid.size)
+
+        valid_mask = selector_valid
+        safety_masks = []
+        if depth_valid is not None:
+            safety_masks.append(depth_valid)
+        if altitude_valid is not None:
+            safety_masks.append(altitude_valid)
+        if safety_masks:
+            safety_valid = safety_masks[0].copy()
+            for mask in safety_masks[1:]:
+                safety_valid &= mask
+            if np.any(safety_valid):
+                if valid_mask is None:
+                    valid_mask = safety_valid
+                else:
+                    combined = valid_mask & safety_valid
+                    # If goal-shaping conflicts with safety, keep safety.
+                    valid_mask = combined if np.any(combined) else safety_valid
+            else:
+                # At least one enabled safety gate found no safe candidate. Do not let
+                # another gate resurrect unsafe candidates; fall through to brake/yield.
+                valid_mask = np.zeros_like(score, dtype=bool)
+
+        if valid_mask is not None:
+            if np.any(valid_mask):
+                score = np.where(valid_mask, score, -1.0e9)
+            elif candidate_type is not None:
+                stop_mask = (candidate_type == 2) | (candidate_type == 3)
+                if np.any(stop_mask):
+                    fallback_mask = stop_mask.copy()
+                    self.last_stop_fallback_count = int(np.count_nonzero(fallback_mask))
+                    if altitude_valid is not None:
+                        altitude_stop_mask = fallback_mask & altitude_valid
+                        self.last_stop_fallback_altitude_valid_count = int(np.count_nonzero(altitude_stop_mask))
+                        if np.any(altitude_stop_mask):
+                            fallback_mask = altitude_stop_mask
+                        else:
+                            self.last_selector_force_emergency_stop = True
+                            self.last_selector_force_emergency_reason = "no_altitude_safe_stop"
+                    score = np.where(fallback_mask, score, -1.0e9)
+
+        if self.agile_time_penalty > 0.0:
+            score = score - self.agile_time_penalty * traj_time
+        if self.agile_stop_penalty > 0.0 and candidate_type is not None:
+            stop_mask = (candidate_type == 2) | (candidate_type == 3)
+            hazard = np.zeros_like(score, dtype=bool)
+            if margin_pred is not None:
+                hazard = hazard | (margin_pred < self.config.get("agile_stop_margin_threshold", -0.35))
+            if risk_prob is not None:
+                hazard = hazard | (risk_prob > self.config.get("agile_stop_risk_threshold", 0.45))
+            score = score - self.agile_stop_penalty * stop_mask * (~hazard)
+        return int(np.argmax(score)), score
+
+    def visualize_trajectory(self, utility, pred_endstate, traj_time, action_id, candidate_type=None):
+        start_pos = self.get_start_pos()
+        start_vel = self.get_start_vel()
+        if self.best_traj_pub.get_num_connections() > 0:
+            t_values = np.linspace(0.0, self.selected_traj_time, 20)
+            points_array = np.stack(
+                (
+                    self.optimal_poly_x.get_position(t_values),
+                    self.optimal_poly_y.get_position(t_values),
+                    self.optimal_poly_z.get_position(t_values),
+                ),
+                axis=-1,
+            )
+            self.publish_xyz_cloud(self.best_traj_pub, points_array)
+
+        if self.visualize and self.lattice_traj_pub.get_num_connections() > 0:
+            lattice_endstate = self.lattice_primitive.lattice_pos_node.cpu().numpy()
+            lattice_endstate = np.dot(lattice_endstate, self.Rotation_wc.T)
+            points_array = self.sample_many_polys(
+                start_pos,
+                start_vel,
+                lattice_endstate,
+                np.zeros_like(lattice_endstate),
+                np.zeros_like(lattice_endstate),
+                np.full(lattice_endstate.shape[0], cfg["sgm_time"]),
+            )
+            self.publish_xyz_cloud(self.lattice_traj_pub, points_array)
+
+        if self.visualize and self.all_trajs_pub.get_num_connections() > 0:
+            points_array = self.sample_many_polys(
+                start_pos,
+                start_vel,
+                pred_endstate[:, :, 0],
+                pred_endstate[:, :, 1],
+                pred_endstate[:, :, 2],
+                traj_time,
+                utility=utility,
+                candidate_type=candidate_type,
+                selected_id=action_id,
+            )
+            self.publish_intensity_cloud(self.all_trajs_pub, points_array)
+
+    def sample_many_polys(
+        self,
+        start_pos,
+        start_vel,
+        end_pos_offset,
+        end_vel,
+        end_acc,
+        traj_time,
+        utility=None,
+        candidate_type=None,
+        selected_id=None,
+    ):
+        chunks = []
+        for i in range(end_pos_offset.shape[0]):
+            tf = float(np.clip(traj_time[i], 0.1, 10.0))
+            t_values = np.linspace(0.0, tf, 20)
+            px = Poly5Solver(
+                start_pos[0],
+                start_vel[0],
+                self.desire_acc[0],
+                end_pos_offset[i, 0] + start_pos[0],
+                end_vel[i, 0],
+                end_acc[i, 0],
+                tf,
+            )
+            py = Poly5Solver(
+                start_pos[1],
+                start_vel[1],
+                self.desire_acc[1],
+                end_pos_offset[i, 1] + start_pos[1],
+                end_vel[i, 1],
+                end_acc[i, 1],
+                tf,
+            )
+            pz = Poly5Solver(
+                start_pos[2],
+                start_vel[2],
+                self.desire_acc[2],
+                end_pos_offset[i, 2] + start_pos[2],
+                end_vel[i, 2],
+                end_acc[i, 2],
+                tf,
+            )
+            pts = np.stack((px.get_position(t_values), py.get_position(t_values), pz.get_position(t_values)), axis=-1)
+            if utility is not None:
+                intensity = np.full((pts.shape[0], 1), utility[i], dtype=np.float32)
+                if selected_id is not None and i == selected_id:
+                    intensity[:] = np.nanmax(utility) + 1.0
+                if candidate_type is not None:
+                    intensity += 0.05 * candidate_type[i]
+                pts = np.column_stack((pts, intensity))
+            chunks.append(pts)
+        return np.concatenate(chunks, axis=0)
+
+    @staticmethod
+    def publish_xyz_cloud(publisher, points_array):
+        header = std_msgs.msg.Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = "world"
+        point_cloud_msg = point_cloud2.create_cloud_xyz32(header, points_array)
+        publisher.publish(point_cloud_msg)
+
+    @staticmethod
+    def publish_intensity_cloud(publisher, points_array):
+        header = std_msgs.msg.Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = "world"
+        fields = [
+            PointField("x", 0, PointField.FLOAT32, 1),
+            PointField("y", 4, PointField.FLOAT32, 1),
+            PointField("z", 8, PointField.FLOAT32, 1),
+            PointField("intensity", 12, PointField.FLOAT32, 1),
+        ]
+        point_cloud_msg = point_cloud2.create_cloud(header, fields, points_array.astype(np.float32))
+        publisher.publish(point_cloud_msg)
+
+    def reset_executed_path(self):
+        self.executed_path = Path()
+        self.executed_path.header.frame_id = "world"
+
+    def publish_navigation_visuals(self, pos):
+        if not self.goal_received:
+            return
+
+        now = rospy.Time.now()
+        wall_now = time.time()
+        if wall_now - self.last_nav_viz_time < 0.1:
+            return
+        self.last_nav_viz_time = wall_now
+
+        pose = PoseStamped()
+        pose.header.stamp = now
+        pose.header.frame_id = "world"
+        pose.pose = self.odom.pose.pose
+        self.executed_path.header.stamp = now
+        self.executed_path.poses.append(pose)
+        if len(self.executed_path.poses) > self.path_max_points:
+            self.executed_path.poses = self.executed_path.poses[-self.path_max_points :]
+        self.executed_path_pub.publish(self.executed_path)
+
+        self.publish_goal_marker(now)
+        self.publish_goal_line(now, pos)
+        self.publish_status_text(now, pos)
+
+    def publish_goal_marker(self, stamp):
+        marker = Marker()
+        marker.header.stamp = stamp
+        marker.header.frame_id = "world"
+        marker.ns = "oarm_goal"
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(self.goal[0])
+        marker.pose.position.y = float(self.goal[1])
+        marker.pose.position.z = float(self.goal[2])
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.8
+        marker.scale.y = 0.8
+        marker.scale.z = 0.8
+        marker.color.r = 0.0
+        marker.color.g = 0.95
+        marker.color.b = 0.25
+        marker.color.a = 0.9
+        self.goal_marker_pub.publish(marker)
+
+    def publish_goal_line(self, stamp, pos):
+        marker = Marker()
+        marker.header.stamp = stamp
+        marker.header.frame_id = "world"
+        marker.ns = "oarm_goal_line"
+        marker.id = 0
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.08
+        marker.color.r = 0.1
+        marker.color.g = 0.75
+        marker.color.b = 1.0
+        marker.color.a = 0.9
+        marker.points = [
+            Point(float(pos[0]), float(pos[1]), float(pos[2])),
+            Point(float(self.goal[0]), float(self.goal[1]), float(self.goal[2])),
+        ]
+        self.goal_line_pub.publish(marker)
+
+    def publish_status_text(self, stamp, pos):
+        marker = Marker()
+        marker.header.stamp = stamp
+        marker.header.frame_id = "world"
+        marker.ns = "oarm_status"
+        marker.id = 0
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(pos[0])
+        marker.pose.position.y = float(pos[1])
+        marker.pose.position.z = float(pos[2] + 1.2)
+        marker.pose.orientation.w = 1.0
+        marker.scale.z = 0.8
+        marker.color.r = 1.0
+        marker.color.g = 1.0
+        marker.color.b = 1.0
+        marker.color.a = 0.95
+
+        speed = float(
+            np.linalg.norm(
+                [
+                    self.odom.twist.twist.linear.x,
+                    self.odom.twist.twist.linear.y,
+                    self.odom.twist.twist.linear.z,
+                ]
+            )
+        )
+        selected = "NA"
+        if self.last_selected_type is not None and self.last_selected_time is not None:
+            selected = f"type={self.last_selected_type} T={self.last_selected_time:.2f}s"
+        distance = 0.0 if self.last_goal_distance is None else self.last_goal_distance
+        marker.text = f"dist {distance:.1f} m | speed {speed:.1f} m/s | {selected}"
+        self.status_text_pub.publish(marker)
+
+    def get_start_pos(self):
+        if self.plan_from_reference:
+            return self.desire_pos
+        return np.array((self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z))
+
+    def get_start_vel(self):
+        if self.plan_from_reference:
+            return self.desire_vel
+        return np.array((self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z))
+
+    def get_odom_state(self):
+        pos = np.array((self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z))
+        vel = np.array((self.odom.twist.twist.linear.x, self.odom.twist.twist.linear.y, self.odom.twist.twist.linear.z))
+        yaw = R.from_quat(
+            [
+                self.odom.pose.pose.orientation.x,
+                self.odom.pose.pose.orientation.y,
+                self.odom.pose.pose.orientation.z,
+                self.odom.pose.pose.orientation.w,
+            ]
+        ).as_euler("ZYX", degrees=False)[0]
+        return pos, vel, float(yaw)
+
+    def print_time(self, time0, time1, time2, time3, time4, time5):
+        self.time_interpolation += time1 - time0
+        self.time_prepare += time2 - time1
+        self.time_forward += time3 - time2
+        self.time_process += time4 - time3
+        self.time_visualize += time5 - time4
+        self.count += 1
+
+        total_time = (time5 - time0) * 1000.0
+        tolerance = 1000.0 / self.depth_fps
+        if total_time > tolerance:
+            rospy.logwarn(f"Warn: Processing time {total_time:.2f} ms exceeds {tolerance:.2f} ms.")
+        if self.verbose or total_time > tolerance:
+            print(
+                "\033[34mAverage Time Consuming:\033[0m "
+                f"depth-interpolation: \033[32m{1000 * self.time_interpolation / self.count:.2f} ms\033[0m; "
+                f"data-prepare: \033[32m{1000 * self.time_prepare / self.count:.2f} ms\033[0m; "
+                f"network-inference: \033[32m{1000 * self.time_forward / self.count:.2f} ms\033[0m; "
+                f"post-process: \033[32m{1000 * self.time_process / self.count:.2f} ms\033[0m; "
+                f"visualize-trajectory: \033[32m{1000 * self.time_visualize / self.count:.2f} ms\033[0m"
+            )
+
+    def print_topic_status(self):
+        rospy.loginfo(
+            "OARM topics: odom=%s depth=%s ctrl=%s ctrl_subscribers=%d main_experiment=%s fast_sim=%s progress_bonus=%.3f",
+            self.config["odom_topic"],
+            self.config["depth_topic"],
+            self.config["ctrl_topic"],
+            self.ctrl_pub.get_num_connections(),
+            str(self.main_experiment),
+            str(self.fast_sim_mode),
+            self.progress_bonus_weight,
+        )
+
+    def print_selection_status(self, action_id, utility, selection_score, endstate_w, traj_time, candidate_type):
+        now = time.time()
+        end_offset = endstate_w[action_id, :, 0]
+        end_norm = float(np.linalg.norm(end_offset))
+        type_text = self.candidate_type_name(candidate_type[action_id] if candidate_type is not None else None)
+        self.last_selected_type = type_text
+        self.last_selected_time = float(traj_time[action_id])
+        self.last_selected_end_norm = end_norm
+        if not self.debug and now - self.last_status_time < 1.0:
+            return
+        self.last_status_time = now
+        rospy.loginfo(
+            "OARM selected id=%d type=%s T=%.2f end_norm=%.2f utility=%.3f ctrl_subscribers=%d published=%d",
+            action_id,
+            type_text,
+            float(traj_time[action_id]),
+            end_norm,
+            float(utility[action_id]),
+            self.ctrl_pub.get_num_connections(),
+            self.control_count,
+        )
+        if end_norm < 0.15:
+            rospy.logwarn(
+                "Selected OARM endpoint is very close to current position. "
+                "This checkpoint may be choosing brake/yield candidates."
+            )
+        if self.debug and self.progress_bonus_weight > 0.0:
+            rospy.loginfo(
+                "OARM selection score=%.3f progress_bonus_weight=%.2f fast_sim=%s",
+                float(selection_score[action_id]),
+                self.progress_bonus_weight,
+                str(self.fast_sim_mode),
+            )
+
+    @staticmethod
+    def candidate_type_name(type_id):
+        if type_id is None:
+            return "NA"
+        names = {
+            0: "progress",
+            1: "probe",
+            2: "brake",
+            3: "yield",
+        }
+        return names.get(int(type_id), str(int(type_id)))
+
+    def write_benchmark_log(
+        self,
+        action_id,
+        utility,
+        selection_score,
+        endstate_w,
+        traj_time,
+        candidate_type,
+        margin_pred,
+        risk_prob,
+        yield_prob,
+        yaw_terminal,
+        depth_clearance,
+        altitude_violation,
+        inference_latency_ms,
+        candidate_decode_ms,
+        selection_ms,
+        total_latency_ms,
+    ):
+        if self.log_jsonl_file is None:
+            return
+        selected_type = self.candidate_type_name(candidate_type[action_id] if candidate_type is not None else None)
+        selected_depth_clearance = None
+        if depth_clearance is not None and np.isfinite(depth_clearance[action_id]):
+            selected_depth_clearance = float(depth_clearance[action_id])
+        self.last_depth_clearance_selected = selected_depth_clearance
+        selected_altitude_violation = None
+        selected_min_z = None
+        selected_max_z = None
+        if altitude_violation is not None:
+            selected_altitude_violation = float(altitude_violation[action_id])
+        if self.last_candidate_min_z is not None:
+            selected_min_z = float(self.last_candidate_min_z[action_id])
+        if self.last_candidate_max_z is not None:
+            selected_max_z = float(self.last_candidate_max_z[action_id])
+        speed = float(
+            np.linalg.norm(
+                [
+                    self.odom.twist.twist.linear.x,
+                    self.odom.twist.twist.linear.y,
+                    self.odom.twist.twist.linear.z,
+                ]
+            )
+        )
+        end_offset = endstate_w[action_id, :, 0]
+        start_pos = self.get_start_pos()
+        start_vel = self.get_start_vel()
+        odom_pos, odom_vel, odom_yaw = self.get_odom_state()
+        start_acc = self.desire_acc
+        selected_end_pos = start_pos + endstate_w[action_id, :, 0]
+        selected_end_vel = endstate_w[action_id, :, 1]
+        selected_end_acc = endstate_w[action_id, :, 2]
+        selected_goal_distance_drop = None
+        selected_goal_distance_drop_rate = None
+        selected_lateral_distance = None
+        selected_lateral_rate = None
+        selected_progress_rate = None
+        goal_vec = self.goal - start_pos
+        goal_norm = float(np.linalg.norm(goal_vec))
+        if goal_norm > 1e-3:
+            goal_dir = goal_vec / goal_norm
+            progress = float(np.dot(end_offset, goal_dir))
+            selected_progress_rate = progress / max(float(traj_time[action_id]), 0.1)
+            endpoint_goal_distance = float(np.linalg.norm(selected_end_pos - self.goal))
+            selected_goal_distance_drop = goal_norm - endpoint_goal_distance
+            selected_goal_distance_drop_rate = selected_goal_distance_drop / max(float(traj_time[action_id]), 0.1)
+            lateral_offset = end_offset - progress * goal_dir
+            selected_lateral_distance = float(np.linalg.norm(lateral_offset))
+            selected_lateral_rate = selected_lateral_distance / max(float(traj_time[action_id]), 0.1)
+        now = float(time.time())
+        row = {
+            "run_id": self.run_id,
+            "goal_segment_id": int(self.goal_segment_id),
+            "method": self.method,
+            "scenario": self.scenario,
+            "seed": self.seed,
+            "checkpoint": self.checkpoint_path,
+            "candidate_mode": self.config.get("candidate_mode", "typed_frontier"),
+            "backbone_mode": self.config.get("backbone_mode", "yopo_original"),
+            "enable_yield_candidates": bool(self.config.get("enable_yield_candidates", False)),
+            "deployed_yaw_mode": self.config.get("deployed_yaw_mode", "goal"),
+            "selector_experiment": bool(self.selector_experiment),
+            "agile_progress_weight": float(self.agile_progress_weight),
+            "agile_goal_distance_weight": float(self.agile_goal_distance_weight),
+            "agile_lateral_penalty": float(self.agile_lateral_penalty),
+            "depth_clearance_weight": float(self.depth_clearance_weight),
+            "depth_clearance_min": float(self.depth_clearance_min),
+            "depth_clearance_gate": bool(self.depth_clearance_gate),
+            "depth_emergency_stop_enabled": bool(self.depth_emergency_stop),
+            "depth_emergency_clearance": float(self.depth_emergency_clearance),
+            "depth_emergency_critical_clearance": float(self.depth_emergency_critical_clearance),
+            "depth_emergency_speed_threshold": float(self.depth_emergency_speed_threshold),
+            "depth_emergency_traj_time": float(self.depth_emergency_traj_time),
+            "depth_emergency_distance_scale": float(self.depth_emergency_distance_scale),
+            "depth_emergency_retreat_distance": float(self.depth_emergency_retreat_distance),
+            "depth_emergency_target_z": self.depth_emergency_target_z,
+            "depth_emergency_z_rate": float(self.depth_emergency_z_rate),
+            "depth_emergency_stop": bool(self.last_depth_emergency_stop),
+            "depth_emergency_reason": self.last_depth_emergency_reason,
+            "depth_emergency_target_w": self.last_depth_emergency_target,
+            "selector_force_emergency_stop": bool(self.last_selector_force_emergency_stop),
+            "selector_force_emergency_reason": self.last_selector_force_emergency_reason,
+            "stop_fallback_count": self.last_stop_fallback_count,
+            "stop_fallback_altitude_valid_count": self.last_stop_fallback_altitude_valid_count,
+            "depth_forward_axis": self.depth_forward_axis,
+            "depth_horizontal_axis": self.depth_horizontal_axis,
+            "depth_vertical_axis": self.depth_vertical_axis,
+            "depth_forward_sign": float(self.depth_forward_sign),
+            "depth_horizontal_sign": float(self.depth_horizontal_sign),
+            "depth_vertical_sign": float(self.depth_vertical_sign),
+            "depth_clearance_selected": selected_depth_clearance,
+            "depth_clearance_min_observed": self.last_depth_clearance_min,
+            "depth_clearance_valid_count": self.last_depth_clearance_valid_count,
+            "depth_clearance_total_count": self.last_depth_clearance_total_count,
+            "selector_min_traj_z": self.selector_min_traj_z,
+            "selector_max_traj_z": self.selector_max_traj_z,
+            "altitude_band_weight": float(self.altitude_band_weight),
+            "altitude_valid_count": self.last_altitude_valid_count,
+            "altitude_total_count": self.last_altitude_total_count,
+            "selected_altitude_violation": selected_altitude_violation,
+            "selected_min_z": selected_min_z,
+            "selected_max_z": selected_max_z,
+            "selector_min_goal_drop_rate": self.selector_min_goal_drop_rate,
+            "selector_max_lateral_rate": self.selector_max_lateral_rate,
+            "selector_valid_count": self.last_selector_valid_count,
+            "selector_total_count": self.last_selector_total_count,
+            "agile_time_penalty": float(self.agile_time_penalty),
+            "agile_stop_penalty": float(self.agile_stop_penalty),
+            "timestamp": now,
+            "time": now,
+            "depth_count": int(self.depth_count),
+            "map_id": int(self.config.get("map_id", 0)),
+            "selected_id": int(action_id),
+            "selected_type": selected_type,
+            "candidate_type": selected_type,
+            "selected_time": float(traj_time[action_id]),
+            "selected_utility": float(utility[action_id]),
+            "selected_selection_score": float(selection_score[action_id]),
+            "selected_margin_pred": float(margin_pred[action_id]),
+            "reaction_margin": float(margin_pred[action_id]),
+            "selected_risk_prob": float(risk_prob[action_id]),
+            "selected_yield_prob": float(yield_prob[action_id]),
+            "yaw0": float(self.last_yaw),
+            "selected_yaw_terminal": float(yaw_terminal[action_id]),
+            "start_pos_w": start_pos.astype(float).tolist(),
+            "start_vel_w": start_vel.astype(float).tolist(),
+            "start_acc_w": start_acc.astype(float).tolist(),
+            "planner_start_source": "reference" if self.plan_from_reference else "odom",
+            "odom_pos_w": odom_pos.astype(float).tolist(),
+            "odom_vel_w": odom_vel.astype(float).tolist(),
+            "odom_yaw": float(odom_yaw),
+            "goal_w": self.goal.astype(float).tolist(),
+            "selected_end_offset_w": end_offset.astype(float).tolist(),
+            "selected_end_pos_w": selected_end_pos.astype(float).tolist(),
+            "selected_end_vel_w": selected_end_vel.astype(float).tolist(),
+            "selected_end_acc_w": selected_end_acc.astype(float).tolist(),
+            "selected_goal_distance_drop": selected_goal_distance_drop,
+            "selected_goal_distance_drop_rate": selected_goal_distance_drop_rate,
+            "selected_lateral_distance": selected_lateral_distance,
+            "selected_lateral_rate": selected_lateral_rate,
+            "selected_progress_rate": selected_progress_rate,
+            "speed": speed,
+            "inference_latency_ms": float(inference_latency_ms),
+            "network_forward_ms": float(inference_latency_ms),
+            "candidate_decode_ms": float(candidate_decode_ms),
+            "selection_ms": float(selection_ms),
+            "total_latency_ms": float(total_latency_ms),
+            "goal_distance": None if self.last_goal_distance is None else float(self.last_goal_distance),
+            "min_goal_distance": None if self.min_goal_distance is None else float(self.min_goal_distance),
+            "arrival_distance": float(self.arrival_distance),
+            "arrive": bool(self.arrive),
+            "first_arrival_time": self.first_arrival_time,
+            "end_norm": float(np.linalg.norm(end_offset)),
+            "emergency_brake": bool(selected_type in {"brake", "yield"}),
+            "collision": False,
+            "collision_flag": False,
+            "success": bool(self.arrive),
+            "success_flag": bool(self.arrive),
+            "goal_received": bool(self.goal_received),
+            "run_active": bool(self.goal_received),
+            "online_inputs": ["depth", "state", "goal"],
+            "uses_privileged_online": False,
+            "mapless_online_inference": True,
+        }
+        self.log_jsonl_file.write(json.dumps(row, sort_keys=True) + "\n")
+        self.log_jsonl_file.flush()
+
+    def write_exec_log(self, pos=None):
+        if self.exec_log_jsonl_file is None:
+            return
+        if not self.goal_received:
+            return
+        odom_pos, odom_vel, odom_yaw = self.get_odom_state()
+        if pos is not None:
+            odom_pos = pos
+        now = float(time.time())
+        speed = float(np.linalg.norm(odom_vel))
+        row = {
+            "run_id": self.run_id,
+            "goal_segment_id": int(self.goal_segment_id),
+            "method": self.method,
+            "scenario": self.scenario,
+            "seed": self.seed,
+            "checkpoint": self.checkpoint_path,
+            "candidate_mode": self.config.get("candidate_mode", "typed_frontier"),
+            "backbone_mode": self.config.get("backbone_mode", "yopo_original"),
+            "enable_yield_candidates": bool(self.config.get("enable_yield_candidates", False)),
+            "deployed_yaw_mode": self.config.get("deployed_yaw_mode", "goal"),
+            "selector_experiment": bool(self.selector_experiment),
+            "timestamp": now,
+            "time": now,
+            "map_id": int(self.config.get("map_id", 0)),
+            "odom_pos_w": odom_pos.astype(float).tolist(),
+            "odom_vel_w": odom_vel.astype(float).tolist(),
+            "odom_yaw": float(odom_yaw),
+            "speed": speed,
+            "goal_w": self.goal.astype(float).tolist(),
+            "goal_distance": None if self.last_goal_distance is None else float(self.last_goal_distance),
+            "min_goal_distance": None if self.min_goal_distance is None else float(self.min_goal_distance),
+            "arrival_distance": float(self.arrival_distance),
+            "first_arrival_time": self.first_arrival_time,
+            "success": bool(self.arrive),
+            "success_flag": bool(self.arrive),
+            "arrive": bool(self.arrive),
+            "goal_received": bool(self.goal_received),
+            "run_active": bool(self.goal_received),
+            "selected_type": self.last_selected_type,
+            "selected_time": self.last_selected_time,
+            "plan_from_reference": bool(self.plan_from_reference),
+            "exec_log_source": "odom_callback",
+            "online_inputs": ["odom", "goal"],
+            "uses_privileged_online": False,
+        }
+        self.exec_log_jsonl_file.write(json.dumps(row, sort_keys=True) + "\n")
+        self.exec_log_jsonl_file.flush()
+
+    def close_log_jsonl(self):
+        if self.log_jsonl_file is not None:
+            self.log_jsonl_file.close()
+            self.log_jsonl_file = None
+        if self.exec_log_jsonl_file is not None:
+            self.exec_log_jsonl_file.close()
+            self.exec_log_jsonl_file = None
+
+    def warm_up(self):
+        depth = torch.zeros((1, 1, self.height, self.width), dtype=torch.float32, device=self.device)
+        obs = torch.zeros((1, 9), dtype=torch.float32, device=self.device)
+        obs[:, 6] = cfg["goal_length"]
+        _ = self.policy.inference(depth, obs)
+
+
+def parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=str, default="", help="explicit OARM checkpoint path")
+    parser.add_argument("--trial", type=int, default=0, help="OARM trial number under OARM/saved/OARM_<trial>")
+    parser.add_argument("--epoch", type=int, default=50, help="checkpoint epoch number")
+    parser.add_argument("--ctrl-topic", type=str, default="/so3_control/pos_cmd")
+    parser.add_argument("--odom-topic", type=str, default="/sim/odom")
+    parser.add_argument("--depth-topic", type=str, default="/depth_image")
+    parser.add_argument("--plan-from-reference", action="store_true")
+    parser.add_argument("--no-visualize", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--position-control-mode",
+        action="store_true",
+        help="publish a non-READY trajectory flag so network_controller_node uses position feedback",
+    )
+    parser.add_argument(
+        "--start-immediately",
+        action="store_true",
+        help="use the built-in default goal immediately instead of waiting for an RViz goal",
+    )
+    parser.add_argument(
+        "--fast-sim-mode",
+        action="store_true",
+        help="prefer progress candidates online for early simulation debugging",
+    )
+    parser.add_argument(
+        "--main-experiment",
+        action="store_true",
+        help="reject debug-only selection bonuses so paper runs use learned utility only",
+    )
+    parser.add_argument(
+        "--selector-experiment",
+        action="store_true",
+        help="allow online agile selector bonuses as an ablation, separate from --main-experiment",
+    )
+    parser.add_argument("--progress-bonus-weight", type=float, default=0.0)
+    parser.add_argument("--agile-progress-weight", type=float, default=0.0)
+    parser.add_argument("--agile-goal-distance-weight", type=float, default=0.0)
+    parser.add_argument("--agile-lateral-penalty", type=float, default=0.0)
+    parser.add_argument("--selector-min-goal-drop-rate", type=float, default=None)
+    parser.add_argument("--selector-max-lateral-rate", type=float, default=None)
+    parser.add_argument("--depth-clearance-weight", type=float, default=0.0)
+    parser.add_argument("--depth-clearance-min", type=float, default=0.35)
+    parser.add_argument("--depth-clearance-gate", action="store_true")
+    parser.add_argument("--depth-clearance-samples", type=int, default=9)
+    parser.add_argument("--depth-clearance-pixel-radius", type=int, default=1)
+    parser.add_argument("--depth-emergency-stop", action="store_true")
+    parser.add_argument("--depth-emergency-clearance", type=float, default=0.35)
+    parser.add_argument("--depth-emergency-critical-clearance", type=float, default=0.15)
+    parser.add_argument("--depth-emergency-speed-threshold", type=float, default=1.0)
+    parser.add_argument("--depth-emergency-traj-time", type=float, default=0.45)
+    parser.add_argument("--depth-emergency-distance-scale", type=float, default=0.0)
+    parser.add_argument("--depth-emergency-retreat-distance", type=float, default=0.0)
+    parser.add_argument("--depth-emergency-target-z", type=float, default=None)
+    parser.add_argument("--depth-emergency-z-rate", type=float, default=0.8)
+    parser.add_argument("--selector-min-traj-z", type=float, default=None)
+    parser.add_argument("--selector-max-traj-z", type=float, default=None)
+    parser.add_argument("--altitude-band-weight", type=float, default=0.0)
+    parser.add_argument("--altitude-band-samples", type=int, default=13)
+    parser.add_argument("--camera-hfov-deg", type=float, default=90.0)
+    parser.add_argument("--camera-vfov-deg", type=float, default=60.0)
+    parser.add_argument("--camera-fx", type=float, default=None)
+    parser.add_argument("--camera-fy", type=float, default=None)
+    parser.add_argument("--camera-cx", type=float, default=None)
+    parser.add_argument("--camera-cy", type=float, default=None)
+    parser.add_argument("--depth-forward-axis", choices=["x", "y", "z"], default="x")
+    parser.add_argument("--depth-horizontal-axis", choices=["x", "y", "z"], default="y")
+    parser.add_argument("--depth-vertical-axis", choices=["x", "y", "z"], default="z")
+    parser.add_argument("--depth-forward-sign", type=float, choices=[-1.0, 1.0], default=1.0)
+    parser.add_argument("--depth-horizontal-sign", type=float, choices=[-1.0, 1.0], default=1.0)
+    parser.add_argument("--depth-vertical-sign", type=float, choices=[-1.0, 1.0], default=-1.0)
+    parser.add_argument("--agile-time-penalty", type=float, default=0.0)
+    parser.add_argument("--agile-stop-penalty", type=float, default=0.0)
+    parser.add_argument("--agile-stop-risk-threshold", type=float, default=0.45)
+    parser.add_argument("--agile-stop-margin-threshold", type=float, default=-0.35)
+    parser.add_argument("--min-command-z", type=float, default=1.0)
+    parser.add_argument("--max-command-z", type=float, default=3.0)
+    parser.add_argument("--arrival-distance", type=float, default=1.0)
+    parser.add_argument("--no-hover-on-arrival", action="store_true")
+    parser.add_argument("--goal-x", type=float, default=50.0)
+    parser.add_argument("--goal-y", type=float, default=0.0)
+    parser.add_argument("--goal-z", type=float, default=2.0)
+    parser.add_argument("--disable-rviz-goal", action="store_true")
+    parser.add_argument("--path-max-points", type=int, default=2000)
+    parser.add_argument("--log-jsonl", type=str, default="", help="write per-planning-step benchmark rows")
+    parser.add_argument("--exec-log-jsonl", type=str, default="", help="write high-rate odometry execution rows")
+    parser.add_argument("--append-logs", action="store_true", help="append to existing JSONL logs instead of overwriting")
+    parser.add_argument("--run-id", type=str, default="", help="stable id shared by planner and execution logs")
+    parser.add_argument("--method", type=str, default="oarm", help="method label for benchmark grouping")
+    parser.add_argument("--scenario", type=str, default="unknown", help="scenario label written into logs")
+    parser.add_argument("--seed", type=int, default=0, help="run seed or map variant id written into logs")
+    parser.add_argument("--map-id", type=int, default=0, help="GT ESDF/pointcloud map id for offline annotation")
+    parser.add_argument("--candidate-mode", choices=["yopo", "typed_frontier"], default="typed_frontier")
+    parser.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="yopo_original")
+    parser.add_argument("--enable-yield-candidates", action="store_true")
+    parser.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="goal")
+    parser.add_argument("--allow-checkpoint-mismatch", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    args = parser().parse_args()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    weight = args.checkpoint or os.path.join(base_dir, "saved", f"OARM_{args.trial}", f"epoch{args.epoch}.pth")
+    print("load OARM weight from:", weight)
+
+    settings = {
+        "goal": [args.goal_x, args.goal_y, args.goal_z],
+        "pitch_angle_deg": 0,
+        "odom_topic": args.odom_topic,
+        "depth_topic": args.depth_topic,
+        "ctrl_topic": args.ctrl_topic,
+        "plan_from_reference": args.plan_from_reference or args.position_control_mode,
+        "verbose": args.verbose,
+        "visualize": not args.no_visualize,
+        "debug": args.debug,
+        "main_experiment": args.main_experiment,
+        "selector_experiment": args.selector_experiment,
+        "position_control_mode": args.position_control_mode,
+        "start_immediately": args.start_immediately,
+        "fast_sim_mode": args.fast_sim_mode,
+        "progress_bonus_weight": args.progress_bonus_weight,
+        "agile_progress_weight": args.agile_progress_weight,
+        "agile_goal_distance_weight": args.agile_goal_distance_weight,
+        "agile_lateral_penalty": args.agile_lateral_penalty,
+        "selector_min_goal_drop_rate": args.selector_min_goal_drop_rate,
+        "selector_max_lateral_rate": args.selector_max_lateral_rate,
+        "depth_clearance_weight": args.depth_clearance_weight,
+        "depth_clearance_min": args.depth_clearance_min,
+        "depth_clearance_gate": args.depth_clearance_gate,
+        "depth_clearance_samples": args.depth_clearance_samples,
+        "depth_clearance_pixel_radius": args.depth_clearance_pixel_radius,
+        "depth_emergency_stop": args.depth_emergency_stop,
+        "depth_emergency_clearance": args.depth_emergency_clearance,
+        "depth_emergency_critical_clearance": args.depth_emergency_critical_clearance,
+        "depth_emergency_speed_threshold": args.depth_emergency_speed_threshold,
+        "depth_emergency_traj_time": args.depth_emergency_traj_time,
+        "depth_emergency_distance_scale": args.depth_emergency_distance_scale,
+        "depth_emergency_retreat_distance": args.depth_emergency_retreat_distance,
+        "depth_emergency_target_z": args.depth_emergency_target_z,
+        "depth_emergency_z_rate": args.depth_emergency_z_rate,
+        "selector_min_traj_z": args.selector_min_traj_z,
+        "selector_max_traj_z": args.selector_max_traj_z,
+        "altitude_band_weight": args.altitude_band_weight,
+        "altitude_band_samples": args.altitude_band_samples,
+        "camera_hfov_deg": args.camera_hfov_deg,
+        "camera_vfov_deg": args.camera_vfov_deg,
+        "camera_fx": args.camera_fx,
+        "camera_fy": args.camera_fy,
+        "camera_cx": args.camera_cx,
+        "camera_cy": args.camera_cy,
+        "depth_forward_axis": args.depth_forward_axis,
+        "depth_horizontal_axis": args.depth_horizontal_axis,
+        "depth_vertical_axis": args.depth_vertical_axis,
+        "depth_forward_sign": args.depth_forward_sign,
+        "depth_horizontal_sign": args.depth_horizontal_sign,
+        "depth_vertical_sign": args.depth_vertical_sign,
+        "agile_time_penalty": args.agile_time_penalty,
+        "agile_stop_penalty": args.agile_stop_penalty,
+        "agile_stop_risk_threshold": args.agile_stop_risk_threshold,
+        "agile_stop_margin_threshold": args.agile_stop_margin_threshold,
+        "arrival_distance": args.arrival_distance,
+        "hover_on_arrival": not args.no_hover_on_arrival,
+        "accept_rviz_goal": not args.disable_rviz_goal,
+        "min_command_z": args.min_command_z,
+        "max_command_z": args.max_command_z,
+        "path_max_points": args.path_max_points,
+        "log_jsonl": args.log_jsonl,
+        "exec_log_jsonl": args.exec_log_jsonl,
+        "append_logs": args.append_logs,
+        "run_id": args.run_id,
+        "method": args.method,
+        "scenario": args.scenario,
+        "seed": args.seed,
+        "checkpoint": weight,
+        "map_id": args.map_id,
+        "candidate_mode": args.candidate_mode,
+        "backbone_mode": args.backbone_mode,
+        "enable_yield_candidates": args.enable_yield_candidates,
+        "deployed_yaw_mode": args.deployed_yaw_mode,
+        "allow_checkpoint_mismatch": args.allow_checkpoint_mismatch,
+    }
+    if args.position_control_mode and not args.plan_from_reference:
+        print("position-control-mode enabled: using plan_from_reference=True")
+    OARMNet(settings, weight)

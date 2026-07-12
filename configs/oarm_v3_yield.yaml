@@ -1,0 +1,16 @@
+# OARM-V3: reaction margin plus stopping/yield feasibility prior.
+candidate_mode: typed_frontier
+backbone_mode: yopo_original
+enable_yield_candidates: true
+train_occlusion_risk: true
+train_risk_point_guidance: true
+train_reaction_margin: true
+train_margin_ranking: true
+train_yaw_visibility: false
+deployed_yaw_mode: goal
+risk_label_source: gt_pointcloud
+train_backup_feasibility: true
+train_yield_feasibility: true
+use_esdf_collision: false
+use_occlusion_aware_visibility: true
+use_privileged_risk_filter: true
