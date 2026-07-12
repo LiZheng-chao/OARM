@@ -450,22 +450,27 @@ def evaluate(args):
                     flat["utility_score"],
                     flat_labels["reaction_margin"],
                     cfg["traj_num"],
+                    margin_delta=oarm_cfg.ranking_margin_delta,
                     valid_mask=margin_valid,
                 )
                 for key, value in ranking_metrics.items():
                     add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
 
-                ranking_progress = -OARMLoss.goal_progress_cost(start_state_w, end_state_w, goal_w, flat["traj_time"]).detach()
-                ranking_base_cost = (
-                    OARMLoss.goal_distance_cost(start_state_w, end_state_w, goal_w, flat["traj_time"])
-                    + OARMLoss.lateral_goal_cost(start_state_w, end_state_w, goal_w, flat["traj_time"])
-                    + OARMLoss.altitude_tracking_cost(start_state_w, end_state_w, goal_w)
+                ranking_progress = -OARMLoss.goal_progress_cost(start_state_w, end_state_w, goal_w, flat['traj_time']).detach()
+                ranking_base_cost = OARMLoss.ranking_base_cost_proxy(
+                    start_state_w,
+                    end_state_w,
+                    goal_w,
+                    flat['traj_time'],
                 ).detach()
-                ranking_speed = end_state_w[:, 1].norm(dim=-1).detach()
+                ranking_coeff = quintic_coefficients(start_state_w, end_state_w, flat['traj_time'])
+                _, ranking_vel, _, _ = sample_polynomial(ranking_coeff, flat['traj_time'], 30, include_zero=True)
+                ranking_speed = ranking_vel.norm(dim=-1).mean(dim=-1).detach()
                 matched_ranking_metrics = matched_pairwise_ranking_accuracy(
                     flat["utility_score"],
                     flat_labels["reaction_margin"],
                     cfg["traj_num"],
+                    margin_delta=oarm_cfg.ranking_margin_delta,
                     valid_mask=margin_valid,
                     progress=ranking_progress,
                     base_cost=ranking_base_cost,
@@ -484,7 +489,7 @@ def evaluate(args):
                     flat["utility_score"],
                     valid_mask=margin_valid,
                     frontier_score=frontier_score,
-                    traj_time=flat["traj_time"],
+                    duration=flat['traj_time'],
                     progress=ranking_progress,
                 )
                 for key, value in disentanglement.items():

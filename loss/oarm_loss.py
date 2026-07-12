@@ -273,7 +273,7 @@ class OARMLoss(nn.Module):
         else:
             losses["yaw_visibility_cost"] = torch.zeros((), device=total_cost.device)
 
-        ranking_base_cost = total_cost.detach()
+        ranking_base_cost = self.ranking_base_cost_proxy(start_state_w, end_state_w, goal_w, traj_time).detach()
 
         margin_valid_mask = None
         if self.enable_reaction_margin and labels is not None and "reaction_margin" in labels:
@@ -357,7 +357,7 @@ class OARMLoss(nn.Module):
                 margin_label.detach(),
                 progress=(-goal_cost).detach(),
                 base_cost=ranking_base_cost,
-                mean_speed=end_state_w[:, 1].norm(dim=-1).detach(),
+                mean_speed=margin_vel.norm(dim=-1).mean(dim=-1).detach(),
                 traj_time=traj_time.detach(),
                 margin_valid=margin_valid_mask.detach() if margin_valid_mask is not None else None,
             )
@@ -492,6 +492,19 @@ class OARMLoss(nn.Module):
         if traj_time is not None:
             lateral_norm = lateral_norm / traj_time.clamp(min=1e-3)
         return lateral_norm
+
+    @staticmethod
+    def ranking_base_cost_proxy(
+        start_state_w: torch.Tensor,
+        end_state_w: torch.Tensor,
+        goal_w: torch.Tensor,
+        traj_time: torch.Tensor,
+    ) -> torch.Tensor:
+        goal_distance = OARMLoss.goal_distance_cost(start_state_w, end_state_w, goal_w, traj_time)
+        lateral = OARMLoss.lateral_goal_cost(start_state_w, end_state_w, goal_w, traj_time)
+        altitude = OARMLoss.altitude_tracking_cost(start_state_w, end_state_w, goal_w)
+        time_cost = traj_time / max(float(cfg['sgm_time']), 1e-3)
+        return goal_distance + lateral + altitude + time_cost
 
     @staticmethod
     def terminal_speed_cost(

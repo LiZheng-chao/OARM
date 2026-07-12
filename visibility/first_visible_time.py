@@ -35,53 +35,41 @@ def first_visible_time(
     return torch.where(never_visible, inf_time.expand_as(first), first)
 
 
-def arrival_time_to_points(
-    sampled_pos: torch.Tensor,
-    sampled_time: torch.Tensor,
-    risk_points: torch.Tensor,
-    max_arrival_distance_m: float = None,
-):
-    """Approximate arrival time by the closest sampled trajectory point."""
-
+def first_entry_time_to_points(sampled_pos, sampled_time, risk_points, radius_m):
     dist = (sampled_pos[:, :, None, :] - risk_points[:, None, :, :]).norm(dim=-1)
-    min_distance, closest_id = dist.min(dim=1)
-    arrival_time = torch.gather(sampled_time, 1, closest_id)
+    inside = dist <= radius_m
+    entry_valid = inside.any(dim=1)
+    first_idx = inside.float().argmax(dim=1)
+    idx1 = first_idx.clamp(min=1)
+    idx0 = idx1 - 1
+    time_grid = sampled_time[:, :, None].expand_as(dist)
+    d0 = torch.gather(dist, 1, idx0[:, None, :]).squeeze(1)
+    d1 = torch.gather(dist, 1, idx1[:, None, :]).squeeze(1)
+    t0 = torch.gather(time_grid, 1, idx0[:, None, :]).squeeze(1)
+    t1 = torch.gather(time_grid, 1, idx1[:, None, :]).squeeze(1)
+    alpha = ((d0 - radius_m) / (d0 - d1).clamp(min=1e-6)).clamp(0.0, 1.0)
+    entry_time = t0 + alpha * (t1 - t0)
+    entry_time = torch.where(first_idx == 0, sampled_time[:, :1].expand_as(entry_time), entry_time)
+    entry_time = torch.where(entry_valid, entry_time, torch.full_like(entry_time, torch.inf))
+    return entry_time, entry_valid
+
+def arrival_time_to_points(sampled_pos, sampled_time, risk_points, max_arrival_distance_m=None):
     if max_arrival_distance_m is None:
-        return arrival_time
-    return torch.where(
-        min_distance <= max_arrival_distance_m,
-        arrival_time,
-        torch.full_like(arrival_time, torch.inf),
-    )
+        max_arrival_distance_m = oarm_cfg.risk_arrival_radius_m
+    entry_time, _ = first_entry_time_to_points(sampled_pos, sampled_time, risk_points, max_arrival_distance_m)
+    return entry_time
 
+def reaction_margin_components(sampled_pos, sampled_time, yaw_ref, risk_points, horizon_fov_rad, vertical_fov_rad, reaction_time=oarm_cfg.reaction_time, visibility_mask=None, max_arrival_distance_m=oarm_cfg.risk_arrival_radius_m, camera_rot_w=None):
+    first_time = first_visible_time(sampled_pos, sampled_time, yaw_ref, risk_points, horizon_fov_rad, vertical_fov_rad, visibility_mask=visibility_mask, camera_rot_w=camera_rot_w)
+    entry_time, entry_valid = first_entry_time_to_points(sampled_pos, sampled_time, risk_points, max_arrival_distance_m)
+    visible_before_entry = torch.isfinite(first_time) & entry_valid & (first_time <= entry_time)
+    effective_first_time = torch.where(visible_before_entry, first_time, entry_time)
+    observation_lead_time = entry_time - effective_first_time
+    required_reaction_time = torch.full_like(entry_time, float(reaction_time))
+    margin = observation_lead_time - required_reaction_time
+    margin = torch.where(entry_valid, margin, torch.full_like(margin, torch.inf))
+    return dict(first_visible_time=first_time, first_entry_time=entry_time, arrival_time=entry_time, arrival_valid=entry_valid, visible_before_entry=visible_before_entry, never_visible_before_entry=entry_valid & ~visible_before_entry, observation_lead_time=torch.where(entry_valid, observation_lead_time, torch.full_like(observation_lead_time, torch.inf)), required_reaction_time=required_reaction_time, reaction_margin_points=margin, margin_exact_valid=entry_valid, margin_censored=~entry_valid)
 
-def reaction_margin(
-    sampled_pos: torch.Tensor,
-    sampled_time: torch.Tensor,
-    yaw_ref: torch.Tensor,
-    risk_points: torch.Tensor,
-    horizon_fov_rad: float,
-    vertical_fov_rad: float,
-    reaction_time: float = oarm_cfg.reaction_time,
-    visibility_mask: torch.Tensor = None,
-    max_arrival_distance_m: float = oarm_cfg.risk_arrival_radius_m,
-    no_arrival_margin: float = oarm_cfg.no_arrival_margin_m,
-) -> torch.Tensor:
-    first_time = first_visible_time(
-        sampled_pos,
-        sampled_time,
-        yaw_ref,
-        risk_points,
-        horizon_fov_rad,
-        vertical_fov_rad,
-        visibility_mask=visibility_mask,
-    )
-    arrival_time = arrival_time_to_points(
-        sampled_pos,
-        sampled_time,
-        risk_points,
-        max_arrival_distance_m=max_arrival_distance_m,
-    )
-    margin = arrival_time - first_time - reaction_time
-    margin = torch.where(torch.isinf(arrival_time), no_arrival_margin * torch.ones_like(margin), margin)
-    return torch.where(torch.isinf(first_time) & torch.isfinite(arrival_time), -reaction_time * torch.ones_like(margin), margin)
+def reaction_margin(sampled_pos, sampled_time, yaw_ref, risk_points, horizon_fov_rad, vertical_fov_rad, reaction_time=oarm_cfg.reaction_time, visibility_mask=None, max_arrival_distance_m=oarm_cfg.risk_arrival_radius_m, no_arrival_margin=None, camera_rot_w=None):
+    components = reaction_margin_components(sampled_pos, sampled_time, yaw_ref, risk_points, horizon_fov_rad, vertical_fov_rad, reaction_time=reaction_time, visibility_mask=visibility_mask, max_arrival_distance_m=max_arrival_distance_m, camera_rot_w=camera_rot_w)
+    return components['reaction_margin_points']

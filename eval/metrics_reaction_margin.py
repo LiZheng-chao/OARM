@@ -116,7 +116,7 @@ def pairwise_ranking_accuracy(
     utility_score: torch.Tensor,
     margin_label: torch.Tensor,
     traj_num: int,
-    margin_delta: float = 0.15,
+    margin_delta: float = 0.10,
     valid_mask: torch.Tensor = None,
 ) -> Dict[str, torch.Tensor]:
     if traj_num <= 1 or utility_score.numel() % traj_num != 0:
@@ -145,7 +145,7 @@ def matched_pairwise_ranking_accuracy(
     utility_score: torch.Tensor,
     margin_label: torch.Tensor,
     traj_num: int,
-    margin_delta: float = 0.15,
+    margin_delta: float = 0.10,
     valid_mask: torch.Tensor = None,
     progress: torch.Tensor = None,
     base_cost: torch.Tensor = None,
@@ -208,7 +208,7 @@ def _pearson_corr(a: torch.Tensor, b: torch.Tensor, valid: torch.Tensor):
         return torch.zeros((), device=a.device)
     return (a * b).mean() / denom.clamp(min=1e-8)
 
-def margin_disentanglement_metrics(margin: torch.Tensor, utility: torch.Tensor, valid_mask: torch.Tensor = None, frontier_score: torch.Tensor = None, traj_time: torch.Tensor = None, progress: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+def margin_disentanglement_metrics(margin: torch.Tensor, utility: torch.Tensor, valid_mask: torch.Tensor = None, frontier_score: torch.Tensor = None, duration: torch.Tensor = None, traj_time: torch.Tensor = None, progress: torch.Tensor = None) -> Dict[str, torch.Tensor]:
     margin = margin.float().reshape(-1)
     utility = utility.reshape_as(margin).float()
     valid = torch.isfinite(margin) & torch.isfinite(utility)
@@ -222,10 +222,12 @@ def margin_disentanglement_metrics(margin: torch.Tensor, utility: torch.Tensor, 
         frontier_score = frontier_score.reshape_as(margin).float()
         out['margin_frontier_corr'] = _pearson_corr(margin, frontier_score, valid)
         out['utility_frontier_corr'] = _pearson_corr(utility, frontier_score, valid)
-    if traj_time is not None:
-        traj_time = traj_time.reshape_as(margin).float()
-        out['margin_ttc_corr'] = _pearson_corr(margin, traj_time, valid)
-        out['utility_ttc_corr'] = _pearson_corr(utility, traj_time, valid)
+    if duration is None:
+        duration = traj_time
+    if duration is not None:
+        duration = duration.reshape_as(margin).float()
+        out['margin_duration_corr'] = _pearson_corr(margin, duration, valid)
+        out['utility_duration_corr'] = _pearson_corr(utility, duration, valid)
     if progress is not None:
         progress = progress.reshape_as(margin).float()
         out['margin_progress_corr'] = _pearson_corr(margin, progress, valid)

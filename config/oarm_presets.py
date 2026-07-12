@@ -58,6 +58,7 @@ OARM_TRAINING_PRESETS: Dict[str, OARMTrainingPreset] = {
         train_margin_ranking=True,
         risk_label_source="gt_pointcloud",
         use_privileged_risk_filter=True,
+        use_occlusion_aware_visibility=True,
     ),
     "v3_yield": OARMTrainingPreset(
         candidate_mode="typed_frontier",

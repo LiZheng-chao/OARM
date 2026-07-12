@@ -4,7 +4,7 @@ from typing import Dict
 import torch
 
 from OARM.config import oarm_cfg
-from OARM.visibility.first_visible_time import arrival_time_to_points, reaction_margin
+from OARM.visibility.first_visible_time import reaction_margin_components
 from OARM.utils.yopo_compat import ensure_yopo_path
 
 ensure_yopo_path()
@@ -12,22 +12,20 @@ from config.config import cfg
 
 
 class ReactionMarginLabeler:
-    """Build per-candidate reaction-margin labels from sampled trajectories."""
-
     def __init__(
         self,
-        horizon_fov_rad: float = math.radians(cfg["horizon_camera_fov"]),
-        vertical_fov_rad: float = math.radians(cfg["vertical_camera_fov"]),
+        horizon_fov_rad: float = math.radians(cfg['horizon_camera_fov']),
+        vertical_fov_rad: float = math.radians(cfg['vertical_camera_fov']),
         reaction_time: float = oarm_cfg.reaction_time,
         risk_arrival_radius_m: float = oarm_cfg.risk_arrival_radius_m,
-        no_arrival_margin_m: float = oarm_cfg.no_arrival_margin_m,
+        no_arrival_margin_s: float = oarm_cfg.no_arrival_margin_s,
         softmin_tau: float = 0.15,
     ):
         self.horizon_fov_rad = horizon_fov_rad
         self.vertical_fov_rad = vertical_fov_rad
         self.reaction_time = reaction_time
         self.risk_arrival_radius_m = risk_arrival_radius_m
-        self.no_arrival_margin_m = no_arrival_margin_m
+        self.no_arrival_margin_s = no_arrival_margin_s
         self.softmin_tau = softmin_tau
 
     def __call__(
@@ -38,8 +36,9 @@ class ReactionMarginLabeler:
         risk_points_w: torch.Tensor,
         risk_weight: torch.Tensor = None,
         visibility_mask: torch.Tensor = None,
+        camera_rot_w: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
-        point_margin = reaction_margin(
+        components = reaction_margin_components(
             sampled_pos_w,
             sampled_time,
             yaw_ref,
@@ -49,46 +48,46 @@ class ReactionMarginLabeler:
             reaction_time=self.reaction_time,
             visibility_mask=visibility_mask,
             max_arrival_distance_m=self.risk_arrival_radius_m,
-            no_arrival_margin=self.no_arrival_margin_m,
+            camera_rot_w=camera_rot_w,
         )
-        arrival_time = arrival_time_to_points(
-            sampled_pos_w,
-            sampled_time,
-            risk_points_w,
-            max_arrival_distance_m=self.risk_arrival_radius_m,
-        )
+        point_margin = components['reaction_margin_points']
+        entry_valid = components['arrival_valid'].bool()
         if risk_weight is None:
             risk_weight = torch.ones_like(point_margin)
-        risk_weight = risk_weight.float()
-        weighted_margin = torch.where(risk_weight > 0.0, point_margin, torch.inf)
-        margin_min = weighted_margin.amin(dim=-1)
-        margin_min = torch.where(
-            torch.isinf(margin_min),
-            torch.full_like(margin_min, self.no_arrival_margin_m),
-            margin_min,
-        )
+        risk_weight = risk_weight.to(device=point_margin.device, dtype=point_margin.dtype)
+        weighted_valid = (risk_weight > 1e-6) & entry_valid & torch.isfinite(point_margin)
+        valid_weight = torch.where(weighted_valid, risk_weight, torch.zeros_like(risk_weight))
+        candidate_valid = valid_weight.sum(dim=-1) > 1e-6
 
-        no_weight = risk_weight.sum(dim=-1) <= 1e-6
-        margin_valid = ~no_weight
+        inf = torch.full_like(point_margin, torch.inf)
+        weighted_margin = torch.where(weighted_valid, point_margin, inf)
+        margin_min = weighted_margin.amin(dim=-1)
+        margin_min = torch.where(candidate_valid, margin_min, torch.full_like(margin_min, torch.inf))
+
         tau = max(self.softmin_tau, 1e-4)
         invalid_log_weight = torch.full_like(risk_weight, -torch.inf)
-        log_weight = torch.where(risk_weight > 1e-6, risk_weight.clamp(min=1e-6).log(), invalid_log_weight)
+        log_weight = torch.where(weighted_valid, valid_weight.clamp(min=1e-6).log(), invalid_log_weight)
         log_norm = torch.logsumexp(log_weight, dim=-1, keepdim=True)
-        log_weight = torch.where(no_weight[:, None], torch.zeros_like(log_weight), log_weight - log_norm)
-        margin_softmin = -tau * torch.logsumexp(log_weight - point_margin / tau, dim=-1)
-        margin_softmin = torch.where(
-            no_weight,
-            torch.full_like(margin_softmin, self.no_arrival_margin_m),
-            margin_softmin,
-        )
-        invalid_arrival = torch.full_like(arrival_time, torch.inf)
-        masked_arrival = torch.where(risk_weight > 1e-6, arrival_time, invalid_arrival)
-        arrival_time_min = masked_arrival.amin(dim=-1)
-        arrival_time_min = torch.where(torch.isinf(arrival_time_min), torch.zeros_like(arrival_time_min), arrival_time_min)
+        log_norm = torch.where(candidate_valid[:, None], log_norm, torch.zeros_like(log_norm))
+        normalized_log_weight = log_weight - log_norm
+        margin_softmin = -tau * torch.logsumexp(normalized_log_weight - point_margin / tau, dim=-1)
+        margin_softmin = torch.where(candidate_valid, margin_softmin, torch.full_like(margin_softmin, torch.inf))
+
+        masked_entry_time = torch.where(weighted_valid, components['first_entry_time'], inf)
+        arrival_time_min = masked_entry_time.amin(dim=-1)
+        arrival_time_min = torch.where(candidate_valid, arrival_time_min, torch.full_like(arrival_time_min, torch.inf))
+
+        point_censored = (risk_weight > 1e-6) & ~entry_valid
+        candidate_censored = point_censored.any(dim=-1) & ~candidate_valid
         return {
-            "reaction_margin_points": point_margin,
-            "reaction_margin_min": margin_min,
-            "reaction_margin_softmin": margin_softmin,
-            "reaction_margin_valid": margin_valid,
-            "arrival_time_min": arrival_time_min,
+            'reaction_margin_points': point_margin,
+            'reaction_margin_min': margin_min,
+            'reaction_margin_softmin': margin_softmin,
+            'reaction_margin_valid': candidate_valid,
+            'reaction_margin_censored': candidate_censored,
+            'reaction_margin_point_valid': weighted_valid,
+            'reaction_margin_point_censored': point_censored,
+            'first_visible_time': components['first_visible_time'],
+            'first_entry_time': components['first_entry_time'],
+            'arrival_time_min': arrival_time_min,
         }

@@ -59,6 +59,7 @@ class OARMConfig:
     train_risk_from_points: bool = True
     reaction_time: float = 0.35
     risk_arrival_radius_m: float = 1.0
+    no_arrival_margin_s: float = 0.50
     no_arrival_margin_m: float = 0.50
     margin_sigma: float = 0.25
     train_occlusion_risk: bool = False
@@ -74,6 +75,7 @@ class OARMConfig:
     collision_weight: float = 1.0
     use_occlusion_aware_visibility: bool = False
     visibility_ray_samples: int = 8
+    visibility_ray_step_m: float = 0.10
     visibility_clearance_m: float = 0.25
     occlusion_weight: float = 0.25
     margin_weight: float = 0.25
@@ -83,7 +85,9 @@ class OARMConfig:
     ranking_weight: float = 0.25
     ranking_progress_eps: float = 0.60
     ranking_base_cost_eps: float = 1.50
-    ranking_margin_delta: float = 0.05
+    ranking_margin_delta: float = 0.10
+    ranking_speed_eps: float = 0.75
+    ranking_time_eps: float = 0.35
     yaw_weight: float = 0.05
     yaw_early_time_tau: float = 0.6
     braking_weight: float = 0.05

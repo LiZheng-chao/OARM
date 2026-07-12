@@ -11,7 +11,7 @@ from scipy.spatial import cKDTree
 from OARM.config import oarm_cfg
 from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial, sample_yaw_cubic, yaw_cubic_coefficients
 from OARM.visibility.esdf_visibility import ESDFLineOfSight
-from OARM.visibility.first_visible_time import arrival_time_to_points, first_visible_time
+from OARM.visibility.first_visible_time import reaction_margin_components
 from OARM.utils.yopo_compat import ensure_yopo_path
 
 ensure_yopo_path()
@@ -197,36 +197,47 @@ def annotate_row(row, line_of_sight, args, device):
     risk_points_t = torch.tensor(risk_points, dtype=torch.float32, device=device).unsqueeze(0)
     map_tensor = torch.tensor([map_id], dtype=torch.long, device=device)
     visibility_mask = line_of_sight(sampled_pos, risk_points_t, map_tensor) if args.use_esdf_los else None
-    first_vis = first_visible_time(
+    components = reaction_margin_components(
         sampled_pos,
         sampled_time,
         yaw_ref,
         risk_points_t,
         horizon_fov_rad=math.radians(args.horizon_fov_deg),
         vertical_fov_rad=math.radians(args.vertical_fov_deg),
+        reaction_time=args.reaction_time,
         visibility_mask=visibility_mask,
-    )
-    arrival = arrival_time_to_points(
-        sampled_pos,
-        sampled_time,
-        risk_points_t,
         max_arrival_distance_m=args.arrival_radius,
     )
-    margin = arrival - first_vis - args.reaction_time
-    margin = torch.where(torch.isinf(arrival), args.no_arrival_margin * torch.ones_like(margin), margin)
-    margin = torch.where(torch.isinf(first_vis) & torch.isfinite(arrival), -args.reaction_time * torch.ones_like(margin), margin)
-    finite_first = torch.where(torch.isinf(first_vis), torch.full_like(first_vis, float("nan")), first_vis)
-    margin_flat = margin.reshape(-1)
-    first_flat = first_vis.reshape(-1)
-    arrival_flat = arrival.reshape(-1)
-    crit_idx = int(torch.argmin(margin_flat).detach().cpu())
-    crit_first = first_flat[crit_idx]
-    crit_arrival = arrival_flat[crit_idx]
-    reaction_margin_gt = float(margin_flat[crit_idx].detach().cpu())
+    first_vis = components['first_visible_time']
+    arrival = components['first_entry_time']
+    margin = components['reaction_margin_points']
+    valid_mask = components['arrival_valid'].bool() & torch.isfinite(margin)
+    finite_first = torch.where(torch.isinf(first_vis), torch.full_like(first_vis, float('nan')), first_vis)
     first_visible_time_gt = tensor_nanmin(finite_first)
-    critical_first_visible_time_gt = None if bool(torch.isinf(crit_first)) else float(crit_first.detach().cpu())
-    critical_arrival_time_gt = None if bool(torch.isinf(crit_arrival)) else float(crit_arrival.detach().cpu())
-    hidden_risk_gt = bool(torch.isinf(crit_first) or crit_first > args.hidden_risk_eps)
+
+    if bool(valid_mask.any()):
+        masked_margin = torch.where(valid_mask, margin, torch.full_like(margin, torch.inf))
+        margin_flat = masked_margin.reshape(-1)
+        first_flat = first_vis.reshape(-1)
+        arrival_flat = arrival.reshape(-1)
+        crit_idx = int(torch.argmin(margin_flat).detach().cpu())
+        crit_first = first_flat[crit_idx]
+        crit_arrival = arrival_flat[crit_idx]
+        reaction_margin_gt = float(margin_flat[crit_idx].detach().cpu())
+        critical_first_visible_time_gt = None if bool(torch.isinf(crit_first)) else float(crit_first.detach().cpu())
+        critical_arrival_time_gt = None if bool(torch.isinf(crit_arrival)) else float(crit_arrival.detach().cpu())
+        hidden_risk_gt = bool(torch.isinf(crit_first) or crit_first > args.hidden_risk_eps)
+        selected_rmvr_gt = float(reaction_margin_gt < 0.0)
+        valid_reaction_margin_gt = True
+        reaction_margin_censored_gt = False
+    else:
+        reaction_margin_gt = None
+        critical_first_visible_time_gt = None
+        critical_arrival_time_gt = None
+        hidden_risk_gt = None
+        selected_rmvr_gt = None
+        valid_reaction_margin_gt = False
+        reaction_margin_censored_gt = True
 
     row.update(
         {
@@ -237,8 +248,9 @@ def annotate_row(row, line_of_sight, args, device):
             "arrival_time_gt": critical_arrival_time_gt,
             "arrival_time_to_risk_gt": critical_arrival_time_gt,
             "reaction_margin_gt": reaction_margin_gt,
-            "selected_rmvr_gt": float(reaction_margin_gt < 0.0),
-            "valid_reaction_margin_gt": True,
+            "selected_rmvr_gt": selected_rmvr_gt,
+            "valid_reaction_margin_gt": valid_reaction_margin_gt,
+            "reaction_margin_censored_gt": reaction_margin_censored_gt,
             "hidden_risk_gt": hidden_risk_gt,
             "uses_privileged_gt_annotation": True,
             "uses_privileged_online": False,
@@ -290,7 +302,7 @@ def parser():
     p.add_argument("--max-risk-points", type=int, default=64)
     p.add_argument("--reaction-time", type=float, default=oarm_cfg.reaction_time)
     p.add_argument("--arrival-radius", type=float, default=oarm_cfg.risk_arrival_radius_m)
-    p.add_argument("--no-arrival-margin", type=float, default=oarm_cfg.no_arrival_margin_m)
+    p.add_argument("--collision-clearance", type=float, default=oarm_cfg.visibility_clearance_m)
     p.add_argument("--hidden-risk-eps", type=float, default=1e-3)
     p.add_argument("--horizon-fov-deg", type=float, default=cfg["horizon_camera_fov"])
     p.add_argument("--vertical-fov-deg", type=float, default=cfg["vertical_camera_fov"])
