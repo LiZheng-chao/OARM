@@ -12,5 +12,5 @@ risk_label_source: gt_pointcloud
 train_backup_feasibility: false
 train_yield_feasibility: false
 use_esdf_collision: false
-use_occlusion_aware_visibility: false
+use_occlusion_aware_visibility: true
 use_privileged_risk_filter: false

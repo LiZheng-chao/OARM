@@ -67,6 +67,8 @@ class OARMTrainer:
         gt_reachable_vertical_sigma_m=oarm_cfg.gt_reachable_vertical_sigma_m,
         gt_reachable_score_weight=oarm_cfg.gt_reachable_score_weight,
         gt_side_score_weight=oarm_cfg.gt_side_score_weight,
+        gt_risk_nms_radius_m=oarm_cfg.gt_risk_nms_radius_m,
+        gt_risk_voxel_size_m=oarm_cfg.gt_risk_voxel_size_m,
         risk_assoc_distance_m=oarm_cfg.risk_assoc_distance_m,
         risk_assoc_sigma_m=oarm_cfg.risk_assoc_sigma_m,
         risk_arrival_radius_m=oarm_cfg.risk_arrival_radius_m,
@@ -121,6 +123,8 @@ class OARMTrainer:
             "reachable_vertical_sigma_m": gt_reachable_vertical_sigma_m,
             "reachable_score_weight": gt_reachable_score_weight,
             "side_score_weight": gt_side_score_weight,
+            "nms_radius_m": gt_risk_nms_radius_m,
+            "voxel_size_m": gt_risk_voxel_size_m,
         }
         self.risk_assoc_distance_m = risk_assoc_distance_m
         self.risk_assoc_sigma_m = risk_assoc_sigma_m

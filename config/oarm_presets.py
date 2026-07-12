@@ -29,6 +29,8 @@ class OARMTrainingPreset:
     gt_reachable_vertical_sigma_m: float = oarm_cfg.gt_reachable_vertical_sigma_m
     gt_reachable_score_weight: float = oarm_cfg.gt_reachable_score_weight
     gt_side_score_weight: float = oarm_cfg.gt_side_score_weight
+    gt_risk_nms_radius_m: float = oarm_cfg.gt_risk_nms_radius_m
+    gt_risk_voxel_size_m: float = oarm_cfg.gt_risk_voxel_size_m
     risk_assoc_distance_m: float = oarm_cfg.risk_assoc_distance_m
     risk_assoc_sigma_m: float = oarm_cfg.risk_assoc_sigma_m
     risk_arrival_radius_m: float = oarm_cfg.risk_arrival_radius_m

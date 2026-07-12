@@ -41,6 +41,8 @@ TRAINING_OPTION_KEYS = (
     "gt_reachable_vertical_sigma_m",
     "gt_reachable_score_weight",
     "gt_side_score_weight",
+    "gt_risk_nms_radius_m",
+    "gt_risk_voxel_size_m",
     "risk_assoc_distance_m",
     "risk_assoc_sigma_m",
     "risk_arrival_radius_m",
@@ -110,6 +112,8 @@ def parser():
     p.add_argument("--gt-reachable-vertical-sigma-m", type=float, default=None)
     p.add_argument("--gt-reachable-score-weight", type=float, default=None)
     p.add_argument("--gt-side-score-weight", type=float, default=None)
+    p.add_argument("--gt-risk-nms-radius-m", type=float, default=None)
+    p.add_argument("--gt-risk-voxel-size-m", type=float, default=None)
     p.add_argument("--risk-assoc-distance-m", type=float, default=None)
     p.add_argument("--risk-assoc-sigma-m", type=float, default=None)
     p.add_argument("--risk-arrival-radius-m", type=float, default=None)
@@ -205,6 +209,8 @@ def resolve_training_options(args):
         "gt_reachable_vertical_sigma_m",
         "gt_reachable_score_weight",
         "gt_side_score_weight",
+        "gt_risk_nms_radius_m",
+        "gt_risk_voxel_size_m",
         "risk_assoc_distance_m",
         "risk_assoc_sigma_m",
         "risk_arrival_radius_m",
@@ -222,6 +228,12 @@ def resolve_training_options(args):
         raise ValueError("train_margin_ranking requires train_reaction_margin=True")
     if options["use_occlusion_aware_visibility"] and not options["train_risk_point_guidance"]:
         raise ValueError("use_occlusion_aware_visibility requires train_risk_point_guidance=True")
+    if (
+        options["train_reaction_margin"]
+        and options["risk_label_source"] == "gt_pointcloud"
+        and not options["use_occlusion_aware_visibility"]
+    ):
+        raise ValueError("GT reaction-margin training requires occlusion-aware visibility")
     return options
 
 

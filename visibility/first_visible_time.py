@@ -12,6 +12,7 @@ def first_visible_time(
     horizon_fov_rad: float,
     vertical_fov_rad: float,
     visibility_mask: torch.Tensor = None,
+    camera_rot_w: torch.Tensor = None,
 ) -> torch.Tensor:
     """Return first sampled time each risk point enters FOV.
 
@@ -24,7 +25,7 @@ def first_visible_time(
         first_time: [N, Q], inf if never visible.
     """
 
-    visible = hard_fov_mask(sampled_pos, yaw_ref, risk_points, horizon_fov_rad, vertical_fov_rad)
+    visible = hard_fov_mask(sampled_pos, yaw_ref, risk_points, horizon_fov_rad, vertical_fov_rad, camera_rot_w=camera_rot_w)
     if visibility_mask is not None:
         visible = visible & visibility_mask
     inf_time = torch.full_like(sampled_time[:, :1], torch.inf)

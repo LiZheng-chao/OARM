@@ -72,6 +72,8 @@ class GTRiskPointSampler:
         reachable_vertical_sigma_m: float = oarm_cfg.gt_reachable_vertical_sigma_m,
         reachable_score_weight: float = oarm_cfg.gt_reachable_score_weight,
         side_score_weight: float = oarm_cfg.gt_side_score_weight,
+        nms_radius_m: float = oarm_cfg.gt_risk_nms_radius_m,
+        voxel_size_m: float = oarm_cfg.gt_risk_voxel_size_m,
     ):
         self.dataset_dir = dataset_dir
         self.point_count = int(point_count)
@@ -92,6 +94,8 @@ class GTRiskPointSampler:
         self.reachable_vertical_sigma_m = max(float(reachable_vertical_sigma_m), 1e-3)
         self.reachable_score_weight = float(reachable_score_weight)
         self.side_score_weight = float(side_score_weight)
+        self.nms_radius_m = max(float(nms_radius_m), 0.0)
+        self.voxel_size_m = max(float(voxel_size_m), 0.0)
 
     def __call__(self, depth: torch.Tensor, pos_w: torch.Tensor, rot_wb: torch.Tensor, map_id: int):
         if depth.dim() != 3 or depth.shape[0] != 1:
@@ -164,15 +168,50 @@ class GTRiskPointSampler:
         score = score * torch.exp(-hidden_depth / max(self.max_forward_m, 1e-3))
 
         k = min(self.point_count, hidden_points_w.shape[0])
-        top_score, top_id = torch.topk(score, k=k, largest=True)
+        top_id = self.select_diverse_indices(hidden_points_w, score, k)
         risk_points_w = hidden_points_w[top_id]
-        risk_weight = top_score.clamp(0.0, 1.0)
+        risk_weight = score[top_id].clamp(0.0, 1.0)
         if k < self.point_count:
             pad_points = empty_points[: self.point_count - k]
             pad_weight = empty_weight[: self.point_count - k]
             risk_points_w = torch.cat([risk_points_w, pad_points], dim=0)
             risk_weight = torch.cat([risk_weight, pad_weight], dim=0)
         return risk_points_w.to(dtype), risk_weight.to(dtype)
+
+    def select_diverse_indices(self, points_w: torch.Tensor, score: torch.Tensor, max_count: int):
+        order = torch.argsort(score, descending=True)
+        if self.voxel_size_m > 1e-6 and order.numel() > 0:
+            seen = set()
+            voxel_keep = []
+            voxel = torch.floor(points_w[order] / self.voxel_size_m).long().detach().cpu()
+            for rank, key_tensor in enumerate(voxel):
+                key = tuple(int(v) for v in key_tensor.tolist())
+                if key in seen:
+                    continue
+                seen.add(key)
+                voxel_keep.append(int(order[rank]))
+                if len(voxel_keep) >= max(max_count * 8, max_count):
+                    break
+            order = torch.as_tensor(voxel_keep, device=points_w.device, dtype=torch.long)
+        selected = []
+        radius = float(self.nms_radius_m)
+        for idx in order.tolist():
+            if len(selected) >= max_count:
+                break
+            if radius > 1e-6 and selected:
+                prev = points_w[torch.as_tensor(selected, device=points_w.device, dtype=torch.long)]
+                if bool(((prev - points_w[idx]).norm(dim=-1) < radius).any()):
+                    continue
+            selected.append(int(idx))
+        if len(selected) < max_count:
+            selected_set = set(selected)
+            for idx in order.tolist():
+                if len(selected) >= max_count:
+                    break
+                if int(idx) not in selected_set:
+                    selected.append(int(idx))
+                    selected_set.add(int(idx))
+        return torch.as_tensor(selected, device=points_w.device, dtype=torch.long)
 
     def cache_metadata(self):
         return {
@@ -192,6 +231,8 @@ class GTRiskPointSampler:
             "reachable_vertical_sigma_m": self.reachable_vertical_sigma_m,
             "reachable_score_weight": self.reachable_score_weight,
             "side_score_weight": self.side_score_weight,
+            "nms_radius_m": self.nms_radius_m,
+            "voxel_size_m": self.voxel_size_m,
         }
 
     def cache_tag(self):

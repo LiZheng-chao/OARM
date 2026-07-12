@@ -357,6 +357,8 @@ class OARMLoss(nn.Module):
                 margin_label.detach(),
                 progress=(-goal_cost).detach(),
                 base_cost=ranking_base_cost,
+                mean_speed=end_state_w[:, 1].norm(dim=-1).detach(),
+                traj_time=traj_time.detach(),
                 margin_valid=margin_valid_mask.detach() if margin_valid_mask is not None else None,
             )
         else:
@@ -565,6 +567,8 @@ class OARMLoss(nn.Module):
         margin_label: torch.Tensor,
         progress: torch.Tensor,
         base_cost: torch.Tensor,
+        mean_speed: Optional[torch.Tensor] = None,
+        traj_time: Optional[torch.Tensor] = None,
         margin_valid: Optional[torch.Tensor] = None,
     ):
         traj_num = int(cfg["traj_num"])
@@ -590,6 +594,18 @@ class OARMLoss(nn.Module):
         comparable = (
             (progress[:, :, None] - progress[:, None, :]).abs() < oarm_cfg.ranking_progress_eps
         ) & ((base_cost[:, :, None] - base_cost[:, None, :]).abs() < oarm_cfg.ranking_base_cost_eps)
+        if mean_speed is not None:
+            mean_speed = mean_speed.reshape(batch_size, traj_num)
+            valid = valid & torch.isfinite(mean_speed)
+            comparable = comparable & (
+                (mean_speed[:, :, None] - mean_speed[:, None, :]).abs() < oarm_cfg.ranking_speed_eps
+            )
+        if traj_time is not None:
+            traj_time = traj_time.reshape(batch_size, traj_num)
+            valid = valid & torch.isfinite(traj_time)
+            comparable = comparable & (
+                (traj_time[:, :, None] - traj_time[:, None, :]).abs() < oarm_cfg.ranking_time_eps
+            )
         preference = margin_delta > oarm_cfg.ranking_margin_delta
         pair_mask = comparable & preference & valid[:, :, None] & valid[:, None, :]
 

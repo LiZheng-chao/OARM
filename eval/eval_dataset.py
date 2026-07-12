@@ -11,7 +11,9 @@ from OARM.dataset import OARMDataset
 from OARM.config import get_oarm_training_preset, oarm_cfg
 from OARM.eval.metrics_backup_feasibility import backup_feasibility_metrics
 from OARM.eval.metrics_reaction_margin import (
+    margin_disentanglement_metrics,
     margin_prediction_metrics,
+    matched_pairwise_ranking_accuracy,
     pairwise_ranking_accuracy,
     reaction_margin_metrics,
     risk_calibration_metrics,
@@ -68,6 +70,8 @@ GT_SAMPLER_ARG_KEYS = (
     "gt_reachable_vertical_sigma_m",
     "gt_reachable_score_weight",
     "gt_side_score_weight",
+    "gt_risk_nms_radius_m",
+    "gt_risk_voxel_size_m",
     "risk_assoc_distance_m",
     "risk_assoc_sigma_m",
     "risk_arrival_radius_m",
@@ -89,6 +93,8 @@ def gt_sampler_options_from_args(args):
         "reachable_vertical_sigma_m": args.gt_reachable_vertical_sigma_m,
         "reachable_score_weight": args.gt_reachable_score_weight,
         "side_score_weight": args.gt_side_score_weight,
+        "nms_radius_m": args.gt_risk_nms_radius_m,
+        "voxel_size_m": args.gt_risk_voxel_size_m,
     }
 
 
@@ -449,6 +455,41 @@ def evaluate(args):
                 for key, value in ranking_metrics.items():
                     add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
 
+                ranking_progress = -OARMLoss.goal_progress_cost(start_state_w, end_state_w, goal_w, flat["traj_time"]).detach()
+                ranking_base_cost = (
+                    OARMLoss.goal_distance_cost(start_state_w, end_state_w, goal_w, flat["traj_time"])
+                    + OARMLoss.lateral_goal_cost(start_state_w, end_state_w, goal_w, flat["traj_time"])
+                    + OARMLoss.altitude_tracking_cost(start_state_w, end_state_w, goal_w)
+                ).detach()
+                ranking_speed = end_state_w[:, 1].norm(dim=-1).detach()
+                matched_ranking_metrics = matched_pairwise_ranking_accuracy(
+                    flat["utility_score"],
+                    flat_labels["reaction_margin"],
+                    cfg["traj_num"],
+                    valid_mask=margin_valid,
+                    progress=ranking_progress,
+                    base_cost=ranking_base_cost,
+                    mean_speed=ranking_speed,
+                    traj_time=flat["traj_time"],
+                    progress_eps=oarm_cfg.ranking_progress_eps,
+                    base_cost_eps=oarm_cfg.ranking_base_cost_eps,
+                    speed_eps=oarm_cfg.ranking_speed_eps,
+                    time_eps=oarm_cfg.ranking_time_eps,
+                )
+                for key, value in matched_ranking_metrics.items():
+                    add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
+                frontier_score = flat.get("frontier_score")
+                disentanglement = margin_disentanglement_metrics(
+                    flat_labels["reaction_margin"],
+                    flat["utility_score"],
+                    valid_mask=margin_valid,
+                    frontier_score=frontier_score,
+                    traj_time=flat["traj_time"],
+                    progress=ranking_progress,
+                )
+                for key, value in disentanglement.items():
+                    add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
+
             if "occlusion_risk" in flat_labels:
                 risk_metrics = risk_calibration_metrics(flat["risk_logit"], flat_labels["occlusion_risk"])
                 for key, value in risk_metrics.items():
@@ -523,6 +564,8 @@ def parser():
     p.add_argument("--gt-reachable-vertical-sigma-m", type=float, default=None)
     p.add_argument("--gt-reachable-score-weight", type=float, default=None)
     p.add_argument("--gt-side-score-weight", type=float, default=None)
+    p.add_argument("--gt-risk-nms-radius-m", type=float, default=None)
+    p.add_argument("--gt-risk-voxel-size-m", type=float, default=None)
     p.add_argument("--risk-assoc-distance-m", type=float, default=None)
     p.add_argument("--risk-assoc-sigma-m", type=float, default=None)
     p.add_argument("--risk-arrival-radius-m", type=float, default=None)

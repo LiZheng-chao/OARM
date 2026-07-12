@@ -49,6 +49,8 @@ class OARMConfig:
     gt_reachable_vertical_sigma_m: float = 1.8
     gt_reachable_score_weight: float = 0.65
     gt_side_score_weight: float = 0.25
+    gt_risk_nms_radius_m: float = 0.75
+    gt_risk_voxel_size_m: float = 0.25
     use_privileged_risk_filter: bool = False
     cache_privileged_risk_labels: bool = True
     privileged_risk_cache_dir: str = "oarm_labels"

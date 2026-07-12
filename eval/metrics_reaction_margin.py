@@ -139,3 +139,95 @@ def pairwise_ranking_accuracy(
         "pairwise_ranking_pair_rate": preference.float().mean(),
         "pairwise_ranking_finite_rate": finite.float().mean(),
     }
+
+
+def matched_pairwise_ranking_accuracy(
+    utility_score: torch.Tensor,
+    margin_label: torch.Tensor,
+    traj_num: int,
+    margin_delta: float = 0.15,
+    valid_mask: torch.Tensor = None,
+    progress: torch.Tensor = None,
+    base_cost: torch.Tensor = None,
+    mean_speed: torch.Tensor = None,
+    traj_time: torch.Tensor = None,
+    progress_eps: float = 0.60,
+    base_cost_eps: float = 1.50,
+    speed_eps: float = 0.75,
+    time_eps: float = 0.35,
+) -> Dict[str, torch.Tensor]:
+    if traj_num <= 1 or utility_score.numel() % traj_num != 0:
+        zero = torch.zeros((), device=utility_score.device)
+        return {'matched_pairwise_ranking_accuracy': zero, 'matched_pairwise_ranking_pair_rate': zero, 'matched_pairwise_ranking_finite_rate': zero}
+    batch_size = utility_score.numel() // traj_num
+    utility = utility_score.reshape(batch_size, traj_num)
+    margin = margin_label.reshape(batch_size, traj_num)
+    finite = torch.isfinite(utility) & torch.isfinite(margin)
+    if valid_mask is not None:
+        finite = finite & valid_mask.reshape(batch_size, traj_num).bool()
+    comparable = torch.ones((batch_size, traj_num, traj_num), device=utility_score.device, dtype=torch.bool)
+    if progress is not None:
+        progress = progress.reshape(batch_size, traj_num)
+        finite = finite & torch.isfinite(progress)
+        comparable = comparable & ((progress[:, :, None] - progress[:, None, :]).abs() < progress_eps)
+    if base_cost is not None:
+        base_cost = base_cost.reshape(batch_size, traj_num)
+        finite = finite & torch.isfinite(base_cost)
+        comparable = comparable & ((base_cost[:, :, None] - base_cost[:, None, :]).abs() < base_cost_eps)
+    if mean_speed is not None:
+        mean_speed = mean_speed.reshape(batch_size, traj_num)
+        finite = finite & torch.isfinite(mean_speed)
+        comparable = comparable & ((mean_speed[:, :, None] - mean_speed[:, None, :]).abs() < speed_eps)
+    if traj_time is not None:
+        traj_time = traj_time.reshape(batch_size, traj_num)
+        finite = finite & torch.isfinite(traj_time)
+        comparable = comparable & ((traj_time[:, :, None] - traj_time[:, None, :]).abs() < time_eps)
+    preference = (margin[:, :, None] - margin[:, None, :]) > margin_delta
+    pair_mask = comparable & preference & finite[:, :, None] & finite[:, None, :]
+    if not bool(pair_mask.any()):
+        zero = torch.zeros((), device=utility_score.device)
+        return {'matched_pairwise_ranking_accuracy': zero, 'matched_pairwise_ranking_pair_rate': zero, 'matched_pairwise_ranking_finite_rate': finite.float().mean()}
+    utility_delta = utility[:, :, None] - utility[:, None, :]
+    return {
+        'matched_pairwise_ranking_accuracy': (utility_delta[pair_mask] > 0.0).float().mean(),
+        'matched_pairwise_ranking_pair_rate': pair_mask.float().mean(),
+        'matched_pairwise_ranking_finite_rate': finite.float().mean(),
+    }
+
+
+def _pearson_corr(a: torch.Tensor, b: torch.Tensor, valid: torch.Tensor):
+    mask = valid & torch.isfinite(a) & torch.isfinite(b)
+    if not bool(mask.any()) or int(mask.float().sum().item()) < 2:
+        return torch.zeros((), device=a.device)
+    a = a[mask].float()
+    b = b[mask].float()
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = a.square().mean().sqrt() * b.square().mean().sqrt()
+    if float(denom.detach().cpu()) <= 1e-8:
+        return torch.zeros((), device=a.device)
+    return (a * b).mean() / denom.clamp(min=1e-8)
+
+def margin_disentanglement_metrics(margin: torch.Tensor, utility: torch.Tensor, valid_mask: torch.Tensor = None, frontier_score: torch.Tensor = None, traj_time: torch.Tensor = None, progress: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+    margin = margin.float().reshape(-1)
+    utility = utility.reshape_as(margin).float()
+    valid = torch.isfinite(margin) & torch.isfinite(utility)
+    if valid_mask is not None:
+        valid = valid & valid_mask.reshape_as(margin).bool()
+    out = {
+        'utility_margin_corr': _pearson_corr(utility, margin, valid),
+        'disentanglement_valid_rate': valid.float().mean(),
+    }
+    if frontier_score is not None:
+        frontier_score = frontier_score.reshape_as(margin).float()
+        out['margin_frontier_corr'] = _pearson_corr(margin, frontier_score, valid)
+        out['utility_frontier_corr'] = _pearson_corr(utility, frontier_score, valid)
+    if traj_time is not None:
+        traj_time = traj_time.reshape_as(margin).float()
+        out['margin_ttc_corr'] = _pearson_corr(margin, traj_time, valid)
+        out['utility_ttc_corr'] = _pearson_corr(utility, traj_time, valid)
+    if progress is not None:
+        progress = progress.reshape_as(margin).float()
+        out['margin_progress_corr'] = _pearson_corr(margin, progress, valid)
+        out['utility_progress_corr'] = _pearson_corr(utility, progress, valid)
+    return out
