@@ -13,8 +13,10 @@ from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_state_transform import rotate_body2world, state_body2world
 from OARM.utils.occlusion import candidate_frontier_overlap
 from OARM.utils.visible_free_distance import visible_free_distance_from_depth
-from OARM.visibility.first_visible_time import first_visible_time
+from OARM.visibility.first_visible_time import first_entry_time_to_points, first_visible_time
 from OARM.visibility import soft_fov_score
+from OARM.visibility.esdf_visibility import ESDFLineOfSight
+from OARM.visibility.reaction_margin_labeler import ReactionMarginLabeler
 from OARM.utils.yopo_compat import ensure_yopo_path
 
 ensure_yopo_path()
@@ -59,6 +61,61 @@ def check_occlusion_masked_first_visible_time(device):
     assert torch.isclose(masked_first[0, 0], torch.tensor(1.0, device=device))
     print("occlusion_masked_first_visible_time ok")
 
+
+def check_first_entry_precedes_closest_approach(device):
+    sampled_time = torch.tensor([[0.0, 0.4, 0.8, 1.2, 1.6, 2.0]], device=device)
+    sampled_pos = torch.stack([sampled_time, torch.zeros_like(sampled_time), torch.zeros_like(sampled_time)], dim=-1)
+    risk_points = torch.tensor([[[1.8, 0.0, 0.0]]], device=device)
+    entry_time, entry_valid = first_entry_time_to_points(sampled_pos, sampled_time, risk_points, radius_m=1.0)
+    dist = (sampled_pos[:, :, None, :] - risk_points[:, None, :, :]).norm(dim=-1)
+    closest_idx = dist.argmin(dim=1)
+    closest_time = sampled_time.gather(1, closest_idx)
+    assert entry_valid[0, 0]
+    assert torch.isclose(entry_time[0, 0], torch.tensor(0.8, device=device), atol=1e-5), entry_time
+    assert entry_time[0, 0] < closest_time[0, 0], (entry_time, closest_time)
+    print('first_entry_precedes_closest_approach ok', float(entry_time.detach().cpu()))
+
+
+class _ToyLOSBackend:
+    def get_distance_cost(self, query_points, map_id):
+        x = query_points[..., 0]
+        y = query_points[..., 1]
+        blocked = (x > 0.85) & (x < 0.95) & (y > 0.85) & (y < 0.95)
+        dist = torch.where(blocked, torch.zeros_like(x), torch.ones_like(x))
+        return torch.zeros_like(dist), dist
+
+
+def check_los_short_ray_covers_full_ray(device):
+    los = ESDFLineOfSight.__new__(ESDFLineOfSight)
+    los.device = device
+    los.ray_samples = 0
+    los.ray_step_m = 0.1
+    los.clearance_m = 0.25
+    los.candidate_chunk = 0
+    los.query_backend = _ToyLOSBackend()
+    observer = torch.zeros(1, 1, 3, device=device)
+    risk_points = torch.tensor([[[10.0, 0.0, 0.0], [1.0, 1.0, 0.0]]], device=device)
+    map_id = torch.zeros(1, dtype=torch.long, device=device)
+    visible = los(observer, risk_points, map_id)
+    assert bool(visible[0, 0, 0])
+    assert not bool(visible[0, 0, 1]), visible
+    print('los_short_ray_covers_full_ray ok', visible.detach().cpu().tolist())
+
+
+def check_no_entry_censoring_excludes_margin_regression(device):
+    sampled_time = torch.tensor([[0.0, 0.5, 1.0, 1.5]], device=device)
+    sampled_pos = torch.stack([sampled_time, torch.zeros_like(sampled_time), torch.zeros_like(sampled_time)], dim=-1)
+    yaw_ref = torch.zeros_like(sampled_time)
+    labeler = ReactionMarginLabeler(risk_arrival_radius_m=0.2)
+    mixed_points = torch.tensor([[[1.0, 0.0, 0.0], [10.0, 0.0, 0.0]]], device=device)
+    mixed = labeler(sampled_pos, sampled_time, yaw_ref, mixed_points, torch.ones(1, 2, device=device))
+    assert mixed['reaction_margin_point_valid'].tolist() == [[True, False]], mixed
+    assert bool(mixed['reaction_margin_valid'][0])
+    far_points = torch.tensor([[[10.0, 0.0, 0.0]]], device=device)
+    far = labeler(sampled_pos, sampled_time, yaw_ref, far_points, torch.ones(1, 1, device=device))
+    assert not bool(far['reaction_margin_valid'][0])
+    assert bool(far['reaction_margin_censored'][0])
+    print('no_entry_censoring_excludes_margin_regression ok')
 
 def check_candidate_device(device):
     batch = 2
@@ -208,6 +265,7 @@ class CaptureYawLabeler:
             "reaction_margin_softmin": label,
             "reaction_margin_min": label,
             "reaction_margin_valid": torch.ones_like(label, dtype=torch.bool),
+            "reaction_margin_censored": torch.zeros_like(label, dtype=torch.bool),
             "arrival_time_min": torch.zeros_like(label),
         }
 
@@ -274,10 +332,10 @@ def check_dataset_sample(dataset_root=None):
     return True
 
 
-def check_one_batch_loss(device, batch_size, train_occlusion_risk, train_reaction_margin, train_backup_feasibility, dataset_root=None):
+def check_one_batch_loss(device, batch_size, train_occlusion_risk, train_reaction_margin, train_backup_feasibility, dataset_root=None, use_occlusion_aware_visibility=False):
     try:
         dataset = OARMDataset(mode="train", dataset_root=dataset_root)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         print("one_batch_loss skipped:", exc)
         return False
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -286,6 +344,7 @@ def check_one_batch_loss(device, batch_size, train_occlusion_risk, train_reactio
     pos = pos.to(device)
     rot = rot.to(device)
     obs_b = obs_b.to(device)
+    map_id = map_id.to(device)
 
     policy = OARMNetwork().to(device)
     candidate = policy.inference(depth, obs_b)
@@ -318,14 +377,17 @@ def check_one_batch_loss(device, batch_size, train_occlusion_risk, train_reactio
         flat_labels["yaw0"] = labels["yaw0"].to(device)
         flat_labels["yaw_rate0"] = labels["yaw_rate0"].to(device)
 
-    loss = OARMLoss(
+    loss_fn = OARMLoss(
         enable_occlusion_risk=train_occlusion_risk,
         enable_risk_point_guidance=True,
         enable_reaction_margin=train_reaction_margin,
         enable_yaw_visibility=False,
+        use_occlusion_aware_visibility=use_occlusion_aware_visibility,
         deployed_yaw_mode="goal",
         enable_yield_feasibility=train_backup_feasibility,
-    )(start_state_w, end_state_w, flat, goal_w, flat_labels)
+    )
+    map_id_expanded = map_id.repeat_interleave(cfg["traj_num"], dim=0) if use_occlusion_aware_visibility else None
+    loss = loss_fn(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
     assert torch.isfinite(loss["total_loss"])
     if train_backup_feasibility:
         assert "backup_feasible_rate" in loss
@@ -344,6 +406,7 @@ def parser():
     p.add_argument("--train-occlusion-risk", action="store_true")
     p.add_argument("--train-reaction-margin", action="store_true")
     p.add_argument("--train-backup-feasibility", action="store_true")
+    p.add_argument("--use-occlusion-aware-visibility", action="store_true")
     return p
 
 
@@ -354,6 +417,9 @@ def main():
     device = torch.device(args.device)
     check_soft_fov_shapes(device)
     check_occlusion_masked_first_visible_time(device)
+    check_first_entry_precedes_closest_approach(device)
+    check_los_short_ray_covers_full_ray(device)
+    check_no_entry_censoring_excludes_margin_regression(device)
     check_candidate_device(device)
     check_risk_point_guidance(device)
     check_goal_yaw_matches_yopo_calculate_yaw(device)
@@ -368,6 +434,7 @@ def main():
             args.train_reaction_margin,
             args.train_backup_feasibility,
             args.dataset_root or None,
+            args.use_occlusion_aware_visibility,
         )
 
 

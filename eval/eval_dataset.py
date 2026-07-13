@@ -130,6 +130,8 @@ def flatten_labels(labels, flat, device, args):
         flat_labels["reaction_margin"] = labels["reaction_margin"].to(device).reshape(-1)
         if "reaction_margin_valid" in labels:
             flat_labels["reaction_margin_valid"] = labels["reaction_margin_valid"].to(device).reshape(-1)
+        if "reaction_margin_censored" in labels:
+            flat_labels["reaction_margin_censored"] = labels["reaction_margin_censored"].to(device).reshape(-1)
     elif args.eval_reaction_margin and args.use_weak_margin_label and "occlusion_risk" in flat_labels:
         flat_labels["reaction_margin"] = weak_margin_label_from_risk(flat["traj_time"], flat_labels["occlusion_risk"])
     if args.eval_yield_feasibility and "yield_feasible" in labels:
@@ -260,6 +262,7 @@ def maybe_generate_reaction_margin_labels(
     )
     flat_labels["reaction_margin"] = margin_labels["reaction_margin_softmin"].detach()
     flat_labels["reaction_margin_valid"] = margin_labels["reaction_margin_valid"].detach()
+    flat_labels["reaction_margin_censored"] = margin_labels["reaction_margin_censored"].detach()
     return flat_labels
 
 
@@ -441,6 +444,10 @@ def evaluate(args):
             if "reaction_margin" in flat_labels:
                 margin_valid = flat_labels.get("reaction_margin_valid")
                 margin_metrics = reaction_margin_metrics(flat_labels["reaction_margin"], valid_mask=margin_valid)
+                margin_censored = flat_labels.get("reaction_margin_censored")
+                if margin_censored is not None:
+                    add_metric(accumulator, "reaction_margin_censored_rate", margin_censored.float().mean(), margin_censored.numel())
+                    add_metric(accumulator, "reaction_margin_valid_rate", margin_valid.float().mean() if margin_valid is not None else torch.ones_like(margin_censored, dtype=torch.float32).mean(), margin_censored.numel())
                 for key, value in margin_metrics.items():
                     add_metric(accumulator, key, value, flat_labels["reaction_margin"].numel())
                 pred_metrics = margin_prediction_metrics(flat["margin_pred"], flat_labels["reaction_margin"], valid_mask=margin_valid)

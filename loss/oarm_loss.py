@@ -220,6 +220,7 @@ class OARMLoss(nn.Module):
             losses["risk_assoc_weight_mean"] = risk_weight.mean()
             losses["risk_weight_sum_mean"] = risk_weight_sum.mean()
             losses["risk_weight_nonzero_rate"] = (risk_weight_sum > 1e-6).float().mean()
+            losses["no_associated_risk_rate"] = (risk_weight_sum <= 1e-6).float().mean()
             losses["candidate_hidden_risk_gt_rate"] = (risk_weight_sum > 1e-6).float().mean()
             losses['candidate_risk_assoc_valid_rate'] = association.valid_mask.float().mean()
             losses['candidate_risk_assoc_weight_mean'] = association.association_weight.mean()
@@ -256,9 +257,11 @@ class OARMLoss(nn.Module):
                 labels = dict(labels or {})
                 labels["reaction_margin"] = margin_labels["reaction_margin_softmin"].detach()
                 labels["reaction_margin_valid"] = margin_labels["reaction_margin_valid"].detach()
+                labels["reaction_margin_censored"] = margin_labels["reaction_margin_censored"].detach()
                 valid = margin_labels["reaction_margin_valid"].bool()
                 zero = torch.zeros((), device=total_cost.device)
                 losses["generated_margin_valid_rate"] = valid.float().mean()
+                losses["generated_margin_censored_rate"] = margin_labels["reaction_margin_censored"].float().mean()
                 if bool(valid.any()):
                     valid_margin = margin_labels["reaction_margin_softmin"][valid]
                     losses["generated_margin_mean"] = valid_margin.mean()
@@ -304,6 +307,9 @@ class OARMLoss(nn.Module):
             losses["margin_loss"] = margin_loss
             losses["margin_violation"] = margin_violation.mean()
             losses["margin_valid_rate"] = margin_valid_mask.float().mean()
+            label_censored = labels.get("reaction_margin_censored")
+            if label_censored is not None:
+                losses["margin_censored_rate"] = label_censored.to(device=margin_label.device).reshape_as(margin_label).float().mean()
         else:
             margin_label = None
             losses["margin_loss"] = torch.zeros((), device=total_cost.device)

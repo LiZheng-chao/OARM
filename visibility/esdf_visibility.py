@@ -13,17 +13,42 @@ class ESDFLineOfSight:
         ray_samples: int = oarm_cfg.visibility_ray_samples,
         ray_step_m: float = oarm_cfg.visibility_ray_step_m,
         clearance_m: float = oarm_cfg.visibility_clearance_m,
+        candidate_chunk: int = oarm_cfg.visibility_candidate_chunk,
     ):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.ray_samples = ray_samples
         self.ray_step_m = ray_step_m
         self.clearance_m = clearance_m
+        self.candidate_chunk = candidate_chunk
         from loss.safety_loss import SafetyLoss
 
         self.query_backend = SafetyLoss(torch.eye(6, device=self.device))
 
     @torch.no_grad()
     def __call__(
+        self,
+        observer_pos_w: torch.Tensor,
+        risk_points_w: torch.Tensor,
+        map_id: torch.Tensor,
+    ) -> torch.Tensor:
+        n = observer_pos_w.shape[0]
+        chunk = int(self.candidate_chunk) if self.candidate_chunk is not None else 0
+        if chunk <= 0 or n <= chunk:
+            return self._query_chunk(observer_pos_w, risk_points_w, map_id)
+
+        parts = []
+        for start_id in range(0, n, chunk):
+            end_id = min(start_id + chunk, n)
+            parts.append(
+                self._query_chunk(
+                    observer_pos_w[start_id:end_id],
+                    risk_points_w[start_id:end_id],
+                    map_id[start_id:end_id],
+                )
+            )
+        return torch.cat(parts, dim=0)
+
+    def _query_chunk(
         self,
         observer_pos_w: torch.Tensor,
         risk_points_w: torch.Tensor,
@@ -45,29 +70,26 @@ class ESDFLineOfSight:
             per_ray_samples = torch.ceil(ray_length / max(float(self.ray_step_m), 1e-3)).to(torch.long) - 1
             per_ray_samples = per_ray_samples.clamp(min=0)
             if self.ray_samples > 0:
-                per_ray_samples = torch.maximum(per_ray_samples, torch.full_like(per_ray_samples, int(self.ray_samples)))
-            adaptive_samples = int(per_ray_samples.max().detach().cpu().item()) if per_ray_samples.numel() > 0 else 0
+                min_samples = torch.full_like(per_ray_samples, int(self.ray_samples))
+                per_ray_samples = torch.maximum(per_ray_samples, min_samples)
+            sample_count = int(per_ray_samples.max().detach().cpu().item()) if per_ray_samples.numel() > 0 else 0
         else:
-            per_ray_samples = torch.full((n, t, q), int(self.ray_samples), device=device, dtype=torch.long)
-            adaptive_samples = int(self.ray_samples)
-        sample_count = max(int(self.ray_samples), adaptive_samples)
+            sample_count = int(self.ray_samples)
+            per_ray_samples = torch.full((n, t, q), sample_count, device=device, dtype=torch.long)
         if sample_count <= 0:
             return torch.ones((n, t, q), device=device, dtype=torch.bool)
 
-        alpha = torch.linspace(
-            1.0 / (sample_count + 1),
-            sample_count / (sample_count + 1),
-            sample_count,
-            device=device,
-            dtype=dtype,
-        )
-        ray_points = start + alpha[None, None, None, :, None] * ray_vec
+        sample_id = torch.arange(sample_count, device=device)
+        valid_sample = sample_id[None, None, None, :] < per_ray_samples[..., None].to(device)
+        denom = (per_ray_samples.clamp(min=0).to(device=device, dtype=dtype) + 1.0)[..., None]
+        alpha = (sample_id.to(dtype=dtype)[None, None, None, :] + 1.0) / denom.clamp(min=1.0)
+        alpha = torch.where(valid_sample, alpha, torch.zeros_like(alpha))
+
+        ray_points = start + alpha[..., None] * ray_vec
         query_points = ray_points.reshape(n, t * q * sample_count, 3).to(self.device)
         query_map_id = map_id.to(self.device).long()
         _, dist = self.query_backend.get_distance_cost(query_points, query_map_id)
         dist = dist.to(device=device, dtype=dtype).reshape(n, t, q, sample_count)
 
-        sample_id = torch.arange(sample_count, device=device)
-        valid_sample = sample_id[None, None, None, :] < per_ray_samples[..., None].to(device)
         clear_or_unused = (dist > self.clearance_m) | ~valid_sample
         return clear_or_unused.all(dim=-1)

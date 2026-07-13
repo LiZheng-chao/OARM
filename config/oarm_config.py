@@ -60,6 +60,7 @@ class OARMConfig:
     reaction_time: float = 0.35
     risk_arrival_radius_m: float = 1.0
     no_arrival_margin_s: float = 0.50
+    # Deprecated compatibility alias for older scripts; value is seconds, not meters.
     no_arrival_margin_m: float = 0.50
     margin_sigma: float = 0.25
     train_occlusion_risk: bool = False
@@ -76,6 +77,7 @@ class OARMConfig:
     use_occlusion_aware_visibility: bool = False
     visibility_ray_samples: int = 8
     visibility_ray_step_m: float = 0.10
+    visibility_candidate_chunk: int = 16
     visibility_clearance_m: float = 0.25
     occlusion_weight: float = 0.25
     margin_weight: float = 0.25
