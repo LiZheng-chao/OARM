@@ -78,6 +78,9 @@ class OARMConfig:
     visibility_ray_samples: int = 8
     visibility_ray_step_m: float = 0.10
     visibility_candidate_chunk: int = 16
+    visibility_risk_point_chunk: int = 8
+    visibility_endpoint_guard_m: float = 0.30
+    visibility_occupancy_margin_m: float = 0.05
     visibility_clearance_m: float = 0.25
     occlusion_weight: float = 0.25
     margin_weight: float = 0.25

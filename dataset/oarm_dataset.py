@@ -106,6 +106,7 @@ class OARMDataset(Dataset):
             elif self.ensure_risk_filter():
                 risk_weight, risk_esdf = self.risk_filter(risk_points_w, risk_weight, map_id)
                 self.save_cached_privileged_labels(item, risk_weight, risk_esdf)
+        risk_points_w, risk_weight, risk_esdf = self.normalize_risk_labels(risk_points_w, risk_weight, risk_esdf, pos_t)
         yaw0 = torch.atan2(rot_t[1, 0], rot_t[0, 0])
         risk_lattice = candidate_frontier_overlap(
             frontier_map.unsqueeze(0), self.vertical_num, self.horizon_num
@@ -131,6 +132,37 @@ class OARMDataset(Dataset):
             "yaw_rate0": torch.zeros((), dtype=torch.float32),
         }
         return depth, pos, rot_wb, obs_b, map_id, labels
+
+    def target_risk_point_count(self):
+        if self.gt_risk_sampler is not None:
+            return int(self.gt_risk_sampler.point_count)
+        return int(oarm_cfg.risk_point_count)
+
+    def normalize_risk_labels(self, risk_points_w, risk_weight, risk_esdf, pos_w):
+        target = self.target_risk_point_count()
+        risk_points_w = torch.as_tensor(risk_points_w, dtype=torch.float32)
+        risk_weight = torch.as_tensor(risk_weight, dtype=torch.float32).reshape(-1)
+        risk_esdf = torch.as_tensor(risk_esdf, dtype=torch.float32).reshape(-1)
+        if risk_points_w.dim() != 2 or risk_points_w.shape[-1] != 3:
+            risk_points_w = risk_points_w.reshape(-1, 3)
+        count = int(risk_points_w.shape[0])
+        if count > target:
+            risk_points_w = risk_points_w[:target]
+        elif count < target:
+            pad_count = target - count
+            pad_points = torch.zeros((pad_count, 3), dtype=risk_points_w.dtype, device=risk_points_w.device)
+            pad_points[:, 0] = oarm_cfg.risk_depth_max_m
+            pad_points = pad_points + torch.as_tensor(pos_w, dtype=risk_points_w.dtype, device=risk_points_w.device)[None, :]
+            risk_points_w = torch.cat([risk_points_w, pad_points], dim=0)
+        if risk_weight.numel() > target:
+            risk_weight = risk_weight[:target]
+        elif risk_weight.numel() < target:
+            risk_weight = torch.cat([risk_weight, torch.zeros((target - risk_weight.numel(),), dtype=risk_weight.dtype, device=risk_weight.device)], dim=0)
+        if risk_esdf.numel() > target:
+            risk_esdf = risk_esdf[:target]
+        elif risk_esdf.numel() < target:
+            risk_esdf = torch.cat([risk_esdf, torch.full((target - risk_esdf.numel(),), float('nan'), dtype=risk_esdf.dtype, device=risk_esdf.device)], dim=0)
+        return risk_points_w, risk_weight, risk_esdf
 
     def ensure_risk_filter(self):
         if self.risk_filter is not None:

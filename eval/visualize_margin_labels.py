@@ -8,10 +8,11 @@ import torch
 from OARM.dataset import OARMDataset
 from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
 from OARM.policy.oarm_network import OARMNetwork
-from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial, sample_yaw_cubic, yaw_cubic_coefficients
+from OARM.loss import OARMLoss
+from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial
 from OARM.policy.oarm_state_transform import rotate_body2world, state_body2world
 from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
-from OARM.visibility.first_visible_time import arrival_time_to_points, first_visible_time
+from OARM.visibility.esdf_visibility import ESDFLineOfSight
 from OARM.visibility.reaction_margin_labeler import ReactionMarginLabeler
 from OARM.utils.yopo_compat import ensure_yopo_path
 
@@ -62,21 +63,24 @@ def sampled_time_grid(traj_time, eval_points, include_zero=True):
     return traj_time[:, None] * tau[None, :]
 
 
-def build_margin_labels(policy, dataset, sample_id, device, eval_points):
-    depth, pos, rot, obs_b, _map_id, labels = dataset[sample_id]
+def build_margin_labels(policy, dataset, sample_id, device, args):
+    depth, pos, rot, obs_b, map_id, labels = dataset[sample_id]
     depth = depth.to(device).unsqueeze(0)
     pos = torch.as_tensor(pos, dtype=torch.float32, device=device).unsqueeze(0)
     rot = torch.as_tensor(rot, dtype=torch.float32, device=device).unsqueeze(0)
     obs_b = torch.as_tensor(obs_b, dtype=torch.float32, device=device).unsqueeze(0)
+    map_id = torch.as_tensor(map_id, dtype=torch.long, device=device).reshape(1)
 
     with torch.inference_mode():
         candidate = policy.inference(depth, obs_b)
         flat = candidate.flatten()
 
         traj_num = cfg["traj_num"]
+        goal_w_single = rotate_body2world(rot, obs_b[:, 6:9])
         start_vel_w = rotate_body2world(rot, obs_b[:, 0:3])
         start_acc_w = rotate_body2world(rot, obs_b[:, 3:6])
         start_state_w = torch.stack([pos, start_vel_w, start_acc_w], dim=1).repeat_interleave(traj_num, dim=0)
+        goal_w = goal_w_single.repeat_interleave(traj_num, dim=0)
 
         pos_expanded = pos.repeat_interleave(traj_num, dim=0)
         rot_expanded = rot.repeat_interleave(traj_num, dim=0)
@@ -90,27 +94,34 @@ def build_margin_labels(policy, dataset, sample_id, device, eval_points):
         end_state_w = torch.stack([end_pos_w, end_vel_w, end_acc_w], dim=1)
 
         coeff = quintic_coefficients(start_state_w, end_state_w, flat["traj_time"])
-        sampled_pos_w, _, _, _ = sample_polynomial(coeff, flat["traj_time"], eval_points, include_zero=True)
-        sampled_time = sampled_time_grid(flat["traj_time"], eval_points, include_zero=True)
+        sampled_pos_w, sampled_vel_w, _, _ = sample_polynomial(coeff, flat["traj_time"], args.eval_points, include_zero=True)
+        sampled_time = sampled_time_grid(flat["traj_time"], args.eval_points, include_zero=True)
 
         risk_points_w = labels["risk_points_w"].to(device).unsqueeze(0).repeat_interleave(traj_num, dim=0)
         risk_weight = labels["risk_weight"].to(device).unsqueeze(0).repeat_interleave(traj_num, dim=0)
         yaw0 = labels.get("yaw0", torch.zeros((), dtype=torch.float32)).to(device).reshape(1).repeat_interleave(traj_num)
         yaw_rate0 = labels.get("yaw_rate0", torch.zeros((), dtype=torch.float32)).to(device).reshape(1).repeat_interleave(traj_num)
-        yaw_coeff = yaw_cubic_coefficients(yaw0, yaw_rate0, flat["yaw_terminal"], flat["traj_time"])
-        yaw_ref, _ = sample_yaw_cubic(yaw_coeff, flat["traj_time"], eval_points, include_zero=True)
+        yaw_helper = OARMLoss(deployed_yaw_mode=args.deployed_yaw_mode)
+        yaw_ref, _ = yaw_helper.deployed_yaw_reference(
+            yaw0,
+            yaw_rate0,
+            flat["yaw_terminal"],
+            flat["traj_time"],
+            sampled_pos_w,
+            sampled_vel_w,
+            sampled_time,
+            goal_w,
+        )
+
+        visibility_mask = None
+        if args.use_occlusion_aware_visibility:
+            line_of_sight = ESDFLineOfSight(device=device)
+            visibility_mask = line_of_sight(sampled_pos_w, risk_points_w, map_id.repeat_interleave(traj_num))
 
         labeler = ReactionMarginLabeler()
-        margin_labels = labeler(sampled_pos_w, sampled_time, yaw_ref, risk_points_w, risk_weight)
-        first_vis = first_visible_time(
-            sampled_pos_w,
-            sampled_time,
-            yaw_ref,
-            risk_points_w,
-            horizon_fov_rad=math.radians(cfg["horizon_camera_fov"]),
-            vertical_fov_rad=math.radians(cfg["vertical_camera_fov"]),
-        )
-        arrival = arrival_time_to_points(sampled_pos_w, sampled_time, risk_points_w)
+        margin_labels = labeler(sampled_pos_w, sampled_time, yaw_ref, risk_points_w, risk_weight, visibility_mask=visibility_mask)
+        first_vis = margin_labels["first_visible_time"]
+        arrival = margin_labels["first_entry_time"]
 
     return {
         "depth": depth.squeeze(0).detach().cpu(),
@@ -125,11 +136,14 @@ def build_margin_labels(policy, dataset, sample_id, device, eval_points):
         "margin_pred": flat["margin_pred"].detach().cpu(),
         "margin_label": margin_labels["reaction_margin_softmin"].detach().cpu(),
         "margin_min": margin_labels["reaction_margin_min"].detach().cpu(),
+        "margin_valid": margin_labels["reaction_margin_valid"].detach().cpu(),
+        "margin_censored": margin_labels["reaction_margin_censored"].detach().cpu(),
         "first_visible_time_min": first_vis.detach().cpu().amin(dim=-1),
         "arrival_time_min": arrival.detach().cpu().amin(dim=-1),
+        "use_occlusion_aware_visibility": bool(args.use_occlusion_aware_visibility),
+        "risk_label_source": args.risk_label_source,
+        "deployed_yaw_mode": args.deployed_yaw_mode,
     }
-
-
 def render_sample(data, output_png, output_json, top_k):
     import matplotlib
 
@@ -198,12 +212,20 @@ def render_sample(data, output_png, output_json, top_k):
                 "margin_pred": float(data["margin_pred"][idx]),
                 "reaction_margin": float(data["margin_label"][idx]),
                 "reaction_margin_min": float(data["margin_min"][idx]),
+                "reaction_margin_valid": bool(data["margin_valid"][idx]),
+                "reaction_margin_censored": bool(data["margin_censored"][idx]),
                 "first_visible_time_min": float(data["first_visible_time_min"][idx]),
                 "arrival_time_min": float(data["arrival_time_min"][idx]),
             }
         )
     with open(output_json, "w", encoding="utf-8") as f:
-        json.dump({"selected_id": selected, "candidates": rows}, f, indent=2, sort_keys=True)
+        json.dump({
+            "selected_id": selected,
+            "risk_label_source": data["risk_label_source"],
+            "deployed_yaw_mode": data["deployed_yaw_mode"],
+            "use_occlusion_aware_visibility": data["use_occlusion_aware_visibility"],
+            "candidates": rows,
+        }, f, indent=2, sort_keys=True)
 
 
 def parser():
@@ -215,6 +237,9 @@ def parser():
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="goal")
     p.add_argument("--allow-checkpoint-mismatch", action="store_true")
     p.add_argument("--mode", choices=["train", "valid"], default="valid")
+    p.add_argument("--dataset-root", type=str, default="")
+    p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="gt_pointcloud")
+    p.add_argument("--use-occlusion-aware-visibility", action="store_true")
     p.add_argument("--sample", type=int, default=0)
     p.add_argument("--count", type=int, default=8)
     p.add_argument("--top-k", type=int, default=6)
@@ -230,7 +255,12 @@ def main(args):
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
     device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
-    dataset = OARMDataset(mode=args.mode, use_privileged_risk_filter=args.use_privileged_risk_filter)
+    dataset = OARMDataset(
+        mode=args.mode,
+        dataset_root=args.dataset_root or None,
+        use_privileged_risk_filter=args.use_privileged_risk_filter,
+        risk_label_source=args.risk_label_source,
+    )
     policy = load_policy(
         args.checkpoint,
         device,
@@ -242,7 +272,7 @@ def main(args):
     )
     end = min(args.sample + args.count, len(dataset))
     for sample_id in range(args.sample, end):
-        data = build_margin_labels(policy, dataset, sample_id, device, args.eval_points)
+        data = build_margin_labels(policy, dataset, sample_id, device, args)
         stem = f"sample_{sample_id:06d}"
         render_sample(
             data,

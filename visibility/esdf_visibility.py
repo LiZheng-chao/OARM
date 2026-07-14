@@ -12,14 +12,19 @@ class ESDFLineOfSight:
         device=None,
         ray_samples: int = oarm_cfg.visibility_ray_samples,
         ray_step_m: float = oarm_cfg.visibility_ray_step_m,
-        clearance_m: float = oarm_cfg.visibility_clearance_m,
+        clearance_m: float = None,
         candidate_chunk: int = oarm_cfg.visibility_candidate_chunk,
+        endpoint_guard_m: float = oarm_cfg.visibility_endpoint_guard_m,
+        occupancy_margin_m: float = oarm_cfg.visibility_occupancy_margin_m,
+        risk_point_chunk: int = oarm_cfg.visibility_risk_point_chunk,
     ):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.ray_samples = ray_samples
         self.ray_step_m = ray_step_m
-        self.clearance_m = clearance_m
+        self.clearance_m = occupancy_margin_m if clearance_m is None else clearance_m
         self.candidate_chunk = candidate_chunk
+        self.endpoint_guard_m = endpoint_guard_m
+        self.risk_point_chunk = risk_point_chunk
         from loss.safety_loss import SafetyLoss
 
         self.query_backend = SafetyLoss(torch.eye(6, device=self.device))
@@ -33,20 +38,38 @@ class ESDFLineOfSight:
     ) -> torch.Tensor:
         n = observer_pos_w.shape[0]
         chunk = int(self.candidate_chunk) if self.candidate_chunk is not None else 0
-        if chunk <= 0 or n <= chunk:
-            return self._query_chunk(observer_pos_w, risk_points_w, map_id)
+        if chunk <= 0:
+            chunk = n
 
         parts = []
         for start_id in range(0, n, chunk):
             end_id = min(start_id + chunk, n)
             parts.append(
-                self._query_chunk(
+                self._query_candidate_chunk(
                     observer_pos_w[start_id:end_id],
                     risk_points_w[start_id:end_id],
                     map_id[start_id:end_id],
                 )
             )
         return torch.cat(parts, dim=0)
+
+    def _query_candidate_chunk(
+        self,
+        observer_pos_w: torch.Tensor,
+        risk_points_w: torch.Tensor,
+        map_id: torch.Tensor,
+    ) -> torch.Tensor:
+        q = risk_points_w.shape[1]
+        risk_point_chunk = getattr(self, "risk_point_chunk", 0)
+        risk_chunk = int(risk_point_chunk) if risk_point_chunk is not None else 0
+        if risk_chunk <= 0 or q <= risk_chunk:
+            return self._query_chunk(observer_pos_w, risk_points_w, map_id)
+
+        parts = []
+        for start_q in range(0, q, risk_chunk):
+            end_q = min(start_q + risk_chunk, q)
+            parts.append(self._query_chunk(observer_pos_w, risk_points_w[:, start_q:end_q], map_id))
+        return torch.cat(parts, dim=2)
 
     def _query_chunk(
         self,
@@ -83,6 +106,10 @@ class ESDFLineOfSight:
         valid_sample = sample_id[None, None, None, :] < per_ray_samples[..., None].to(device)
         denom = (per_ray_samples.clamp(min=0).to(device=device, dtype=dtype) + 1.0)[..., None]
         alpha = (sample_id.to(dtype=dtype)[None, None, None, :] + 1.0) / denom.clamp(min=1.0)
+        ray_distance = alpha * ray_length[..., None]
+        distance_to_endpoint = ray_length[..., None] - ray_distance
+        if self.endpoint_guard_m > 0.0:
+            valid_sample = valid_sample & (distance_to_endpoint > float(self.endpoint_guard_m))
         alpha = torch.where(valid_sample, alpha, torch.zeros_like(alpha))
 
         ray_points = start + alpha[..., None] * ray_vec

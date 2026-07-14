@@ -80,7 +80,9 @@ class _ToyLOSBackend:
     def get_distance_cost(self, query_points, map_id):
         x = query_points[..., 0]
         y = query_points[..., 1]
-        blocked = (x > 0.85) & (x < 0.95) & (y > 0.85) & (y < 0.95)
+        mid_block = (x > 0.45) & (x < 0.55) & (y > 0.45) & (y < 0.55)
+        endpoint_surface = (x > 0.85) & (x < 1.05) & (y > -0.05) & (y < 0.05)
+        blocked = mid_block | endpoint_surface
         dist = torch.where(blocked, torch.zeros_like(x), torch.ones_like(x))
         return torch.zeros_like(dist), dist
 
@@ -92,15 +94,33 @@ def check_los_short_ray_covers_full_ray(device):
     los.ray_step_m = 0.1
     los.clearance_m = 0.25
     los.candidate_chunk = 0
+    los.endpoint_guard_m = 0.0
     los.query_backend = _ToyLOSBackend()
     observer = torch.zeros(1, 1, 3, device=device)
-    risk_points = torch.tensor([[[10.0, 0.0, 0.0], [1.0, 1.0, 0.0]]], device=device)
+    risk_points = torch.tensor([[[10.0, 2.0, 0.0], [1.0, 1.0, 0.0]]], device=device)
     map_id = torch.zeros(1, dtype=torch.long, device=device)
     visible = los(observer, risk_points, map_id)
     assert bool(visible[0, 0, 0])
     assert not bool(visible[0, 0, 1]), visible
     print('los_short_ray_covers_full_ray ok', visible.detach().cpu().tolist())
 
+
+def check_los_endpoint_guard_avoids_surface_self_occlusion(device):
+    los = ESDFLineOfSight.__new__(ESDFLineOfSight)
+    los.device = device
+    los.ray_samples = 0
+    los.ray_step_m = 0.1
+    los.clearance_m = 0.25
+    los.candidate_chunk = 0
+    los.endpoint_guard_m = 0.3
+    los.query_backend = _ToyLOSBackend()
+    observer = torch.zeros(1, 1, 3, device=device)
+    risk_points = torch.tensor([[[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]]], device=device)
+    map_id = torch.zeros(1, dtype=torch.long, device=device)
+    visible = los(observer, risk_points, map_id)
+    assert bool(visible[0, 0, 0]), visible
+    assert not bool(visible[0, 0, 1]), visible
+    print('los_endpoint_guard_avoids_surface_self_occlusion ok', visible.detach().cpu().tolist())
 
 def check_no_entry_censoring_excludes_margin_regression(device):
     sampled_time = torch.tensor([[0.0, 0.5, 1.0, 1.5]], device=device)
@@ -332,9 +352,9 @@ def check_dataset_sample(dataset_root=None):
     return True
 
 
-def check_one_batch_loss(device, batch_size, train_occlusion_risk, train_reaction_margin, train_backup_feasibility, dataset_root=None, use_occlusion_aware_visibility=False):
+def check_one_batch_loss(device, batch_size, train_occlusion_risk, train_reaction_margin, train_backup_feasibility, dataset_root=None, use_occlusion_aware_visibility=False, risk_label_source="proxy"):
     try:
-        dataset = OARMDataset(mode="train", dataset_root=dataset_root)
+        dataset = OARMDataset(mode="train", dataset_root=dataset_root, risk_label_source=risk_label_source)
     except (FileNotFoundError, ValueError) as exc:
         print("one_batch_loss skipped:", exc)
         return False
@@ -407,6 +427,7 @@ def parser():
     p.add_argument("--train-reaction-margin", action="store_true")
     p.add_argument("--train-backup-feasibility", action="store_true")
     p.add_argument("--use-occlusion-aware-visibility", action="store_true")
+    p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="proxy")
     return p
 
 
@@ -419,6 +440,7 @@ def main():
     check_occlusion_masked_first_visible_time(device)
     check_first_entry_precedes_closest_approach(device)
     check_los_short_ray_covers_full_ray(device)
+    check_los_endpoint_guard_avoids_surface_self_occlusion(device)
     check_no_entry_censoring_excludes_margin_regression(device)
     check_candidate_device(device)
     check_risk_point_guidance(device)
@@ -435,6 +457,7 @@ def main():
             args.train_backup_feasibility,
             args.dataset_root or None,
             args.use_occlusion_aware_visibility,
+            args.risk_label_source,
         )
 
 

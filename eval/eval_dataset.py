@@ -389,11 +389,7 @@ def evaluate(args):
             risk_assoc_sigma_m=args.risk_assoc_sigma_m,
             risk_arrival_radius_m=args.risk_arrival_radius_m,
         )
-        line_of_sight = None
-        if args.use_occlusion_aware_visibility:
-            from OARM.visibility.esdf_visibility import ESDFLineOfSight
-
-            line_of_sight = ESDFLineOfSight(device=device)
+        line_of_sight = loss_fn.line_of_sight if args.use_occlusion_aware_visibility else None
     margin_labeler = ReactionMarginLabeler(risk_arrival_radius_m=args.risk_arrival_radius_m)
     accumulator = defaultdict(list)
     seen_batches = 0
