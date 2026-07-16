@@ -54,6 +54,20 @@ OPTIONAL_GT_FIELDS = (
     "first_collision_goal_distance",
     "first_collision_clearance",
     "time_to_collision_exec",
+    "motion_start_time_exec",
+    "motion_start_delay_exec",
+    "motion_start_goal_distance",
+    "motion_start_speed_exec",
+    "mean_speed_motion_exec",
+    "first_collision_speed_exec",
+    "first_arrival_speed_exec",
+    "time_to_collision_from_motion_exec",
+    "time_to_arrival_from_motion_exec",
+    "time_to_terminal_from_motion_exec",
+    "progress_at_collision_exec",
+    "progress_at_terminal_exec",
+    "distance_travelled_before_collision_exec",
+    "distance_travelled_before_terminal_exec",
     "monitor_terminal_event",
     "monitor_terminal_time",
     "monitor_trimmed_at_terminal",
@@ -162,6 +176,14 @@ def source_value(rows, key, fallback):
     return str(value)
 
 
+def group_key_for_rows(rows, path, args):
+    scenario = args.scenario or first_present(rows, "scenario") or scenario_from_path(path, args.default_scenario)
+    method = args.method or first_present(rows, "method")
+    if args.group_by_method and method:
+        return f"{method}__{scenario}"
+    return str(scenario)
+
+
 def summarize_run(rows: List[Dict]) -> Dict:
     if not rows:
         return {}
@@ -202,6 +224,20 @@ def summarize_run(rows: List[Dict]) -> Dict:
     first_collision_goal_distance = parse_float(first_present(rows, "first_collision_goal_distance"))
     first_collision_clearance = parse_float(first_present(rows, "first_collision_clearance"))
     time_to_collision_exec = parse_float(first_present(rows, "time_to_collision_exec"))
+    motion_start_time_exec = parse_float(first_present(rows, "motion_start_time_exec"))
+    motion_start_delay_exec = parse_float(first_present(rows, "motion_start_delay_exec"))
+    motion_start_goal_distance = parse_float(first_present(rows, "motion_start_goal_distance"))
+    motion_start_speed_exec = parse_float(first_present(rows, "motion_start_speed_exec"))
+    mean_speed_motion_exec = parse_float(first_present(rows, "mean_speed_motion_exec"))
+    first_collision_speed_exec = parse_float(first_present(rows, "first_collision_speed_exec"))
+    first_arrival_speed_exec = parse_float(first_present(rows, "first_arrival_speed_exec"))
+    time_to_collision_from_motion_exec = parse_float(first_present(rows, "time_to_collision_from_motion_exec"))
+    time_to_arrival_from_motion_exec = parse_float(first_present(rows, "time_to_arrival_from_motion_exec"))
+    time_to_terminal_from_motion_exec = parse_float(first_present(rows, "time_to_terminal_from_motion_exec"))
+    progress_at_collision_exec = parse_float(first_present(rows, "progress_at_collision_exec"))
+    progress_at_terminal_exec = parse_float(first_present(rows, "progress_at_terminal_exec"))
+    distance_travelled_before_collision_exec = parse_float(first_present(rows, "distance_travelled_before_collision_exec"))
+    distance_travelled_before_terminal_exec = parse_float(first_present(rows, "distance_travelled_before_terminal_exec"))
     monitor_terminal_time = parse_float(first_present(rows, "monitor_terminal_time"))
     exec_rows_active = parse_float(first_present(rows, "exec_rows_active"))
     exec_rows_untrimmed = parse_float(first_present(rows, "exec_rows_untrimmed"))
@@ -271,6 +307,20 @@ def summarize_run(rows: List[Dict]) -> Dict:
         "first_collision_goal_distance": first_collision_goal_distance,
         "first_collision_clearance": first_collision_clearance,
         "time_to_collision_exec": time_to_collision_exec,
+        "motion_start_time_exec": motion_start_time_exec,
+        "motion_start_delay_exec": motion_start_delay_exec,
+        "motion_start_goal_distance": motion_start_goal_distance,
+        "motion_start_speed_exec": motion_start_speed_exec,
+        "mean_speed_motion_exec": mean_speed_motion_exec,
+        "first_collision_speed_exec": first_collision_speed_exec,
+        "first_arrival_speed_exec": first_arrival_speed_exec,
+        "time_to_collision_from_motion_exec": time_to_collision_from_motion_exec,
+        "time_to_arrival_from_motion_exec": time_to_arrival_from_motion_exec,
+        "time_to_terminal_from_motion_exec": time_to_terminal_from_motion_exec,
+        "progress_at_collision_exec": progress_at_collision_exec,
+        "progress_at_terminal_exec": progress_at_terminal_exec,
+        "distance_travelled_before_collision_exec": distance_travelled_before_collision_exec,
+        "distance_travelled_before_terminal_exec": distance_travelled_before_terminal_exec,
         "monitor_terminal_time": monitor_terminal_time,
         "monitor_terminal_event": source_value(rows, "monitor_terminal_event", ""),
         "monitor_trimmed_at_terminal": float(any(bool_values(rows, "monitor_trimmed_at_terminal"))) if bool_values(rows, "monitor_trimmed_at_terminal") else None,
@@ -341,8 +391,9 @@ def benchmark(args):
     logs = discover_logs(args.logs)
     grouped = defaultdict(list)
     for path in logs:
-        scenario = args.scenario or scenario_from_path(path, args.default_scenario)
-        grouped[scenario].append(summarize_run(parse_rows(path)))
+        rows = parse_rows(path)
+        group_key = group_key_for_rows(rows, path, args)
+        grouped[group_key].append(summarize_run(rows))
     invalid = [
         f"{scenario}[run={idx}]: {summary.get('benchmark_warnings')}"
         for scenario, summaries in grouped.items()
@@ -374,6 +425,9 @@ def parser():
     p = argparse.ArgumentParser()
     p.add_argument("logs", nargs="*", help="scenario CSV/JSON/JSONL logs or directories containing them")
     p.add_argument("--scenario", type=str, default="", help="force all logs to one scenario name")
+    p.add_argument("--method", type=str, default="", help="force all logs to one method name")
+    p.add_argument("--group-by-method", action="store_true", default=True, help="group benchmark rows by method and scenario")
+    p.add_argument("--no-group-by-method", dest="group_by_method", action="store_false")
     p.add_argument("--default-scenario", type=str, default="unknown")
     p.add_argument("--output", type=str, default="")
     p.add_argument("--csv-output", type=str, default="")
