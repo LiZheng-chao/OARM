@@ -47,6 +47,18 @@ OPTIONAL_GT_FIELDS = (
     "path_time_exec",
     "mean_speed_exec",
     "goal_distance_final",
+    "goal_distance_min",
+    "reached_goal_exec",
+    "first_arrival_time_exec",
+    "first_collision_time_exec",
+    "first_collision_goal_distance",
+    "first_collision_clearance",
+    "time_to_collision_exec",
+    "monitor_terminal_event",
+    "monitor_terminal_time",
+    "monitor_trimmed_at_terminal",
+    "exec_rows_active",
+    "exec_rows_untrimmed",
     "collision_exec_source",
     "success_exec_source",
 )
@@ -184,6 +196,15 @@ def summarize_run(rows: List[Dict]) -> Dict:
     path_time_exec = parse_float(first_present(rows, "path_time_exec"))
     mean_speed_exec = parse_float(first_present(rows, "mean_speed_exec"))
     goal_distance_final = parse_float(first_present(rows, "goal_distance_final"))
+    goal_distance_min = parse_float(first_present(rows, "goal_distance_min"))
+    first_arrival_time_exec = parse_float(first_present(rows, "first_arrival_time_exec"))
+    first_collision_time_exec = parse_float(first_present(rows, "first_collision_time_exec"))
+    first_collision_goal_distance = parse_float(first_present(rows, "first_collision_goal_distance"))
+    first_collision_clearance = parse_float(first_present(rows, "first_collision_clearance"))
+    time_to_collision_exec = parse_float(first_present(rows, "time_to_collision_exec"))
+    monitor_terminal_time = parse_float(first_present(rows, "monitor_terminal_time"))
+    exec_rows_active = parse_float(first_present(rows, "exec_rows_active"))
+    exec_rows_untrimmed = parse_float(first_present(rows, "exec_rows_untrimmed"))
     candidate_types = [candidate_type_name(row.get("candidate_type")) for row in rows]
     collision_exec_values = bool_values(rows, "collision_exec")
     success_exec_values = bool_values(rows, "success_exec")
@@ -243,6 +264,18 @@ def summarize_run(rows: List[Dict]) -> Dict:
         "min_clearance_exec": exec_min_clearance,
         "mean_clearance_exec": exec_mean_clearance,
         "goal_distance_final": goal_distance_final,
+        "goal_distance_min": goal_distance_min,
+        "reached_goal_exec": float(any(bool_values(rows, "reached_goal_exec"))) if bool_values(rows, "reached_goal_exec") else None,
+        "first_arrival_time_exec": first_arrival_time_exec,
+        "first_collision_time_exec": first_collision_time_exec,
+        "first_collision_goal_distance": first_collision_goal_distance,
+        "first_collision_clearance": first_collision_clearance,
+        "time_to_collision_exec": time_to_collision_exec,
+        "monitor_terminal_time": monitor_terminal_time,
+        "monitor_terminal_event": source_value(rows, "monitor_terminal_event", ""),
+        "monitor_trimmed_at_terminal": float(any(bool_values(rows, "monitor_trimmed_at_terminal"))) if bool_values(rows, "monitor_trimmed_at_terminal") else None,
+        "exec_rows_active": exec_rows_active,
+        "exec_rows_untrimmed": exec_rows_untrimmed,
         "selected_traj_collision_gt": mean([float(value) for value in selected_collision_values]),
         "selected_traj_min_clearance_gt": min(selected_clearances) if selected_clearances else None,
         "selected_traj_mean_clearance_gt": mean(selected_clearances),
