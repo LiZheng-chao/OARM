@@ -85,8 +85,9 @@ def parser():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=1.5e-4)
     p.add_argument("--checkpoint", type=str, default="")
+    p.add_argument("--yopo-checkpoint", type=str, default="", help="official YOPO checkpoint used to initialize candidate_mode=yopo_preserve")
     p.add_argument("--allow-checkpoint-mismatch", action="store_true")
-    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier"], default="")
+    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve"], default="")
     p.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="")
     p.add_argument("--enable-yield-candidates", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)
@@ -249,6 +250,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         tensorboard_path=args.log_dir or None,
         checkpoint_path=args.checkpoint,
+        yopo_checkpoint_path=args.yopo_checkpoint,
         save_on_exit=True,
         num_workers=args.num_workers,
         max_train_batches=args.max_train_batches,
@@ -258,6 +260,7 @@ if __name__ == "__main__":
         experiment_options={
             "stage": args.stage,
             "config": args.config,
+            "source_yopo_checkpoint": args.yopo_checkpoint,
             "seed": args.seed,
             "argv": sys.argv,
             "epoch": args.epoch,

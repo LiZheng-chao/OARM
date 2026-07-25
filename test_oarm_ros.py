@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import json
 import os
 import sys
@@ -68,6 +68,7 @@ class OARMNet:
         self.width = cfg["image_width"]
         self.min_dis, self.max_dis = 0.04, 20.0
         self.goal = np.array(self.config["goal"], dtype=np.float32)
+        self.yopo_preserve_mode = self.config.get("candidate_mode") == "yopo_preserve"
         self.goal_received = self.config["start_immediately"]
         self.plan_from_reference = self.config["plan_from_reference"]
         self.verbose = self.config["verbose"]
@@ -384,7 +385,7 @@ class OARMNet:
         if not self.goal_received:
             return
         if self.arrive:
-            if self.hover_on_arrival:
+            if self.hover_on_arrival and not self.yopo_preserve_mode:
                 self.publish_arrival_hover()
             return
 
@@ -457,7 +458,8 @@ class OARMNet:
             else:
                 self.last_depth_emergency_target = None
                 end_pos = start_pos + endstate_w[action_id, :, 0]
-                end_pos[2] = float(np.clip(end_pos[2], self.min_command_z, self.max_command_z))
+                if not self.yopo_preserve_mode:
+                    end_pos[2] = float(np.clip(end_pos[2], self.min_command_z, self.max_command_z))
                 end_vel = endstate_w[action_id, :, 1]
                 end_acc = endstate_w[action_id, :, 2]
             self.optimal_poly_x = Poly5Solver(
@@ -543,6 +545,11 @@ class OARMNet:
     def control_pub(self, _timer):
         if not self.goal_received:
             return
+        if self.arrive and self.yopo_preserve_mode and self.last_control_msg is not None:
+            self.desire_init = False
+            self.last_control_msg.trajectory_flag = self.last_control_msg.TRAJECTORY_STATUS_EMPTY
+            self.ctrl_pub.publish(self.last_control_msg)
+            return
         if self.arrive and self.hover_on_arrival:
             self.publish_arrival_hover()
             return
@@ -566,9 +573,10 @@ class OARMNet:
                 control_msg.trajectory_flag = control_msg.TRAJECTORY_STATUS_READY
             control_msg.position.x = self.optimal_poly_x.get_position(self.ctrl_time)
             control_msg.position.y = self.optimal_poly_y.get_position(self.ctrl_time)
-            control_msg.position.z = float(
-                np.clip(self.optimal_poly_z.get_position(self.ctrl_time), self.min_command_z, self.max_command_z)
-            )
+            position_z = self.optimal_poly_z.get_position(self.ctrl_time)
+            if not self.yopo_preserve_mode:
+                position_z = float(np.clip(position_z, self.min_command_z, self.max_command_z))
+            control_msg.position.z = position_z
             control_msg.velocity.x = self.optimal_poly_x.get_velocity(self.ctrl_time)
             control_msg.velocity.y = self.optimal_poly_y.get_velocity(self.ctrl_time)
             control_msg.velocity.z = self.optimal_poly_z.get_velocity(self.ctrl_time)
@@ -1573,7 +1581,7 @@ def parser():
     parser.add_argument("--scenario", type=str, default="unknown", help="scenario label written into logs")
     parser.add_argument("--seed", type=int, default=0, help="run seed or map variant id written into logs")
     parser.add_argument("--map-id", type=int, default=0, help="GT ESDF/pointcloud map id for offline annotation")
-    parser.add_argument("--candidate-mode", choices=["yopo", "typed_frontier"], default="typed_frontier")
+    parser.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve"], default="typed_frontier")
     parser.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="yopo_original")
     parser.add_argument("--enable-yield-candidates", action="store_true")
     parser.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="goal")

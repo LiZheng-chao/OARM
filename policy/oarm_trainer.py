@@ -39,6 +39,7 @@ class OARMTrainer:
         batch_size=16,
         tensorboard_path=None,
         checkpoint_path=None,
+        yopo_checkpoint_path=None,
         save_on_exit=False,
         num_workers=4,
         max_train_batches=None,
@@ -160,6 +161,11 @@ class OARMTrainer:
                 risk_label_source=self.risk_label_source,
             )
             self.policy.load_state_dict(state_dict)
+        elif self.candidate_mode == "yopo_preserve":
+            if not yopo_checkpoint_path:
+                raise ValueError("candidate_mode=yopo_preserve requires --yopo-checkpoint for YOPO base initialization")
+            state_dict = torch.load(yopo_checkpoint_path, map_location=self.device, weights_only=True)
+            self.policy.preserve_network.load_yopo_state_dict(state_dict, strict=True)
         self.configure_trainable_parameters()
 
         with yopo_dataset_cfg(self.dataset_root):

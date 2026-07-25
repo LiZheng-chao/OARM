@@ -7,6 +7,7 @@ from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
 from OARM.policy.oarm_head import OARMHead
 from OARM.policy.oarm_state_transform import OARMStateTransform
 from OARM.policy.oarm_types import OARMRawPrediction
+from OARM.policy.yopo_preserve_network import YOPOPreserveOARMNetwork
 from OARM.utils.occlusion import DepthFrontierExtractor, candidate_frontier_overlap
 from OARM.utils.yopo_compat import ensure_yopo_path
 
@@ -17,7 +18,7 @@ from config.config import cfg
 class OARMNetwork(nn.Module):
     """Occlusion-aware reaction-margin planner head.
 
-    Per primitive output layout:
+    Per primitive output layout for legacy OARM modes:
     [dtheta, dphi, dr, vT(3), aT(3), T, yaw_T, margin, risk_logit, backup_logit, utility]
     """
 
@@ -31,6 +32,18 @@ class OARMNetwork(nn.Module):
         enable_yield_candidates=oarm_cfg.enable_yield_candidates,
     ):
         super().__init__()
+        self.preserve_network = None
+        if candidate_mode == "yopo_preserve":
+            if backbone_mode != "yopo_original":
+                raise ValueError("candidate_mode=yopo_preserve requires backbone_mode=yopo_original")
+            self.candidate_mode = candidate_mode
+            self.backbone_mode = backbone_mode
+            self.preserve_network = YOPOPreserveOARMNetwork(
+                observation_dim=observation_dim,
+                hidden_state=hidden_state,
+                freeze_yopo_base=True,
+            )
+            return
         if output_dim != 15:
             raise ValueError("OARMNetwork currently expects output_dim=15")
         if candidate_mode not in {"yopo", "typed_frontier"}:
@@ -55,7 +68,9 @@ class OARMNetwork(nn.Module):
         self.state_backbone = nn.Sequential()
         self.oarm_head = OARMHead(hidden_state + observation_dim + self.anchor_feature_dim, output_dim)
 
-    def forward(self, depth: torch.Tensor, obs: torch.Tensor, anchors=None) -> OARMRawPrediction:
+    def forward(self, depth: torch.Tensor, obs: torch.Tensor, anchors=None):
+        if self.preserve_network is not None:
+            return self.preserve_network(depth, obs)
         if anchors is None:
             anchors = self.candidate_generator.yopo_anchors(depth.shape[0], device=depth.device)
         depth_feature = self.image_backbone(depth)
@@ -115,6 +130,8 @@ class OARMNetwork(nn.Module):
         )
 
     def inference(self, depth: torch.Tensor, obs: torch.Tensor):
+        if self.preserve_network is not None:
+            return self.preserve_network.inference(depth, obs)
         if self.candidate_mode == "yopo":
             anchors = self.candidate_generator.yopo_anchors(depth.shape[0], device=depth.device)
         else:
