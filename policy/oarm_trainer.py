@@ -520,14 +520,38 @@ class OARMTrainer:
             raise RuntimeError("Some preserve auxiliary head parameters are frozen: " + ", ".join(missing))
 
     def write_trainable_parameter_artifact(self):
+        trainable = self.trainable_parameter_names()
+        frozen = [name for name, param in self.policy.named_parameters() if not param.requires_grad]
         path = os.path.join(self.tensorboard_path, "trainable_parameters.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write("# Trainable parameters\n")
-            for name in self.trainable_parameter_names():
+            for name in trainable:
                 f.write(f"{name}\n")
             f.write("\n# All parameters\n")
             for name, param in self.policy.named_parameters():
                 f.write(f"{name}\trequires_grad={bool(param.requires_grad)}\tshape={tuple(param.shape)}\n")
+        json_path = os.path.join(self.tensorboard_path, "trainable_parameters.json")
+        preserve = getattr(self.policy, "preserve_network", None)
+        yopo_base_modules = {}
+        if preserve is not None:
+            yopo_base_modules = {
+                "image_backbone_training": bool(preserve.image_backbone.training),
+                "state_backbone_training": bool(preserve.state_backbone.training),
+                "yopo_head_training": bool(preserve.yopo_head.training),
+                "aux_head_training": bool(preserve.aux_head.training),
+            }
+        artifact = {
+            "candidate_mode": self.candidate_mode,
+            "backbone_mode": self.backbone_mode,
+            "trainable": trainable,
+            "frozen": frozen,
+            "trainable_count": len(trainable),
+            "frozen_count": len(frozen),
+            "yopo_base_modules": yopo_base_modules,
+            "a1_auxiliary_only": bool(self.candidate_mode == "yopo_preserve"),
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(artifact, f, indent=2, sort_keys=True)
 
     def write_experiment_artifacts(self, experiment_options, config_path=""):
         metadata = {

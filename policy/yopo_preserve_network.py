@@ -66,6 +66,17 @@ class YOPOPreserveOARMNetwork(nn.Module):
         for module in (self.image_backbone, self.state_backbone, self.yopo_head):
             for param in module.parameters():
                 param.requires_grad_(False)
+        self.freeze_yopo_base_state()
+
+    def freeze_yopo_base_state(self):
+        for module in (self.image_backbone, self.state_backbone, self.yopo_head):
+            module.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.freeze_yopo_base_state()
+        self.aux_head.train(mode)
+        return self
 
     def load_yopo_state_dict(self, state_dict, strict=True):
         own_state = self.state_dict()
