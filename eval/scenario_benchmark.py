@@ -75,6 +75,10 @@ OPTIONAL_GT_FIELDS = (
     "exec_rows_untrimmed",
     "collision_exec_source",
     "success_exec_source",
+    "evaluation_success_distance",
+    "evaluation_collision_clearance",
+    "planner_success_distance",
+    "planner_arrival_distance",
 )
 
 TYPE_NAMES = ("progress", "probe", "brake", "yield")
@@ -179,9 +183,18 @@ def source_value(rows, key, fallback):
 def group_key_for_rows(rows, path, args):
     scenario = args.scenario or first_present(rows, "scenario") or scenario_from_path(path, args.default_scenario)
     method = args.method or first_present(rows, "method")
+    parts = []
     if args.group_by_method and method:
-        return f"{method}__{scenario}"
-    return str(scenario)
+        parts.append(str(method))
+    parts.append(str(scenario))
+    if args.group_by_success_distance:
+        success_distance = parse_float(
+            first_present(rows, "evaluation_success_distance"),
+            parse_float(first_present(rows, "monitor_success_distance")),
+        )
+        if success_distance is not None:
+            parts.append(f"eval_success_{success_distance:g}m")
+    return "__".join(parts)
 
 
 def summarize_run(rows: List[Dict]) -> Dict:
@@ -267,6 +280,25 @@ def summarize_run(rows: List[Dict]) -> Dict:
         warnings.append(f"non_odom_collision_source:{collision_source}")
 
     summary = {
+        "method": source_value(rows, "method", ""),
+        "run_id": source_value(rows, "run_id", ""),
+        "goal_segment_id": source_value(rows, "goal_segment_id", ""),
+        "evaluation_success_distance": parse_float(
+            first_present(rows, "evaluation_success_distance"),
+            parse_float(first_present(rows, "monitor_success_distance")),
+        ),
+        "evaluation_collision_clearance": parse_float(
+            first_present(rows, "evaluation_collision_clearance"),
+            parse_float(first_present(rows, "monitor_collision_clearance")),
+        ),
+        "planner_success_distance": parse_float(
+            first_present(rows, "planner_success_distance"),
+            parse_float(first_present(rows, "success_distance")),
+        ),
+        "planner_arrival_distance": parse_float(
+            first_present(rows, "planner_arrival_distance"),
+            parse_float(first_present(rows, "arrival_distance")),
+        ),
         "success_exec": float(success_exec),
         "collision_exec": float(collision_exec),
         "success": float(success_exec),
@@ -346,11 +378,28 @@ def mean(values):
     return sum(values) / len(values) if values else None
 
 
+def dedupe_run_summaries(run_summaries: List[Dict]) -> List[Dict]:
+    deduped = []
+    seen = set()
+    for idx, summary in enumerate(run_summaries):
+        method = summary.get("method") or ""
+        run_id = summary.get("run_id") or f"__file_index_{idx}"
+        goal_segment_id = summary.get("goal_segment_id") or ""
+        key = (str(method), str(run_id), str(goal_segment_id))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(summary)
+    return deduped
+
+
 def aggregate(run_summaries: List[Dict]) -> Dict:
     if not run_summaries:
         return {"run_count": 0}
+    input_count = len(run_summaries)
+    run_summaries = dedupe_run_summaries(run_summaries)
     keys = sorted(set().union(*(summary.keys() for summary in run_summaries)))
-    out = {"run_count": len(run_summaries)}
+    out = {"run_count": len(run_summaries), "input_log_count": input_count, "duplicate_run_count": input_count - len(run_summaries)}
     for key in keys:
         if key == "sample_count":
             out[key] = int(sum(summary.get(key, 0) for summary in run_summaries))
@@ -428,6 +477,8 @@ def parser():
     p.add_argument("--method", type=str, default="", help="force all logs to one method name")
     p.add_argument("--group-by-method", action="store_true", default=True, help="group benchmark rows by method and scenario")
     p.add_argument("--no-group-by-method", dest="group_by_method", action="store_false")
+    p.add_argument("--group-by-success-distance", action="store_true", default=True, help="keep 1m/2m evaluator thresholds as separate benchmark groups")
+    p.add_argument("--no-group-by-success-distance", dest="group_by_success_distance", action="store_false")
     p.add_argument("--default-scenario", type=str, default="unknown")
     p.add_argument("--output", type=str, default="")
     p.add_argument("--csv-output", type=str, default="")

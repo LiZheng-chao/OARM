@@ -51,7 +51,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
         self.aux_head = nn.Sequential(
             nn.Conv2d(hidden_state + observation_dim, 128, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 3, kernel_size=1),
+            nn.Conv2d(128, 2, kernel_size=1),
         )
         self.reset_aux_head()
         if freeze_yopo_base:
@@ -85,13 +85,16 @@ class YOPOPreserveOARMNetwork(nn.Module):
         return missing, unexpected
 
     def forward(self, depth: torch.Tensor, obs_prepared: torch.Tensor):
-        depth_feature = self.image_backbone(depth)
-        obs_feature = self.state_backbone(obs_prepared)
-        features = torch.cat((obs_feature, depth_feature), dim=1)
-        output = self.yopo_head(features)
-        endstate_pred = torch.tanh(output[:, :9])
-        score_pred = torch.nn.functional.softplus(output[:, 9])
-        aux = self.aux_head(features)
+        # Keep the official YOPO planning path mathematically isolated during A1.
+        # Only aux_head receives gradients; YOPO features, endpoint, and score are frozen references.
+        with torch.no_grad():
+            depth_feature = self.image_backbone(depth)
+            obs_feature = self.state_backbone(obs_prepared)
+            features = torch.cat((obs_feature, depth_feature), dim=1)
+            output = self.yopo_head(features)
+            endstate_pred = torch.tanh(output[:, :9])
+            score_pred = torch.nn.functional.softplus(output[:, 9])
+        aux = self.aux_head(features.detach())
         return endstate_pred, score_pred, aux
 
     def inference(self, depth: torch.Tensor, obs: torch.Tensor) -> OARMCandidate:
@@ -110,7 +113,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
         yaw_terminal = torch.zeros((b, 1, v, h), device=depth.device, dtype=depth.dtype)
         margin_pred = self.margin_scale * torch.tanh(aux[:, 0:1])
         risk_logit = aux[:, 1:2]
-        backup_logit = aux[:, 2:3]
+        backup_logit = torch.zeros_like(risk_logit)
         utility_score = -score_pred
         anchors = self.candidate_generator.yopo_anchors(b, device=depth.device)
         candidate_type = torch.full((b, v, h), self.candidate_generator.PROGRESS, device=depth.device, dtype=torch.long)

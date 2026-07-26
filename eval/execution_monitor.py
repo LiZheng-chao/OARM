@@ -553,6 +553,10 @@ def monitor(args):
     exec_rows = list(read_jsonl(args.exec_input)) if args.exec_input else rows
     summary = execution_summary(exec_rows, args)
     summary["execution_monitor_input"] = args.exec_input or args.input
+    summary["evaluation_success_distance"] = float(args.success_distance)
+    summary["evaluation_collision_clearance"] = float(args.collision_clearance)
+    summary["planner_success_distance"] = parse_float(first_present(rows, "success_distance"))
+    summary["planner_arrival_distance"] = parse_float(first_present(rows, "arrival_distance"))
     output_rows = rows
     if not args.keep_output_after_terminal:
         output_rows = trim_at_time(output_rows, summary.get("monitor_terminal_time"))

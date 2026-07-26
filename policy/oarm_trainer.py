@@ -134,6 +134,13 @@ class OARMTrainer:
         self.train_yield_feasibility = bool(train_backup_feasibility or train_yield_feasibility)
         self.train_backup_feasibility = self.train_yield_feasibility
         self.use_privileged_risk_filter = use_privileged_risk_filter
+        if self.candidate_mode == "yopo_preserve":
+            if self.train_backup_feasibility or self.train_yield_feasibility:
+                raise ValueError("A1 yopo_preserve only supports margin/risk auxiliary training; disable backup/yield feasibility")
+            if self.train_margin_ranking:
+                raise ValueError("A1 yopo_preserve keeps YOPO selection fixed; disable margin ranking until A2")
+            if self.train_yaw_visibility:
+                raise ValueError("A1 yopo_preserve keeps yaw policy fixed; disable yaw visibility training")
         self.experiment_options = dict(experiment_options or {})
         self.best_val_loss = float("inf")
         if save_on_exit:
@@ -167,6 +174,8 @@ class OARMTrainer:
             state_dict = torch.load(yopo_checkpoint_path, map_location=self.device, weights_only=True)
             self.policy.preserve_network.load_yopo_state_dict(state_dict, strict=True)
         self.configure_trainable_parameters()
+        self.assert_trainable_parameter_contract()
+        self.write_trainable_parameter_artifact()
 
         with yopo_dataset_cfg(self.dataset_root):
             self.oarm_loss = OARMLoss(
@@ -377,7 +386,18 @@ class OARMTrainer:
             )
 
         map_id_expanded = map_id.to(self.device).repeat_interleave(self.traj_num, dim=0)
-        return self.oarm_loss(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
+        loss_dict = self.oarm_loss(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
+        if self.candidate_mode == "yopo_preserve":
+            aux_loss = torch.zeros((), device=self.device)
+            if self.train_occlusion_risk:
+                aux_loss = aux_loss + oarm_cfg.risk_bce_weight * loss_dict["risk_loss"]
+            if self.train_reaction_margin:
+                aux_loss = aux_loss + oarm_cfg.margin_reg_weight * loss_dict["margin_loss"]
+
+            loss_dict["aux_only_loss"] = aux_loss
+            loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
+            loss_dict["total_loss"] = aux_loss
+        return loss_dict
 
     def log_losses(self, prefix, loss_dict, epoch, step):
         global_step = epoch * max(1, len(self.train_dataloader)) + step
@@ -442,7 +462,16 @@ class OARMTrainer:
     def trainable_parameters(self):
         return [p for p in self.policy.parameters() if p.requires_grad]
 
+    def trainable_parameter_names(self):
+        return [name for name, param in self.policy.named_parameters() if param.requires_grad]
+
     def configure_trainable_parameters(self):
+        if self.candidate_mode == "yopo_preserve":
+            if self.train_yield_head_only:
+                raise ValueError("--train-yield-head-only is not compatible with candidate_mode=yopo_preserve")
+            for name, param in self.policy.named_parameters():
+                param.requires_grad_(name.startswith("preserve_network.aux_head."))
+            return
         if not self.train_yield_head_only:
             return
         for param in self.policy.parameters():
@@ -472,6 +501,33 @@ class OARMTrainer:
         with torch.no_grad():
             final_layer.weight[~row_mask].copy_(self._frozen_output_rows['weight'][~row_mask])
             final_layer.bias[~row_mask].copy_(self._frozen_output_rows['bias'][~row_mask])
+
+    def assert_trainable_parameter_contract(self):
+        trainable = self.trainable_parameter_names()
+        if not trainable:
+            raise RuntimeError("No trainable OARM parameters were configured")
+        if self.candidate_mode != "yopo_preserve":
+            return
+        bad = [name for name in trainable if not name.startswith("preserve_network.aux_head.")]
+        if bad:
+            raise RuntimeError(
+                "A1 yopo_preserve must train only auxiliary heads; unexpected trainable parameters: "
+                + ", ".join(bad)
+            )
+        aux_names = [name for name, _param in self.policy.named_parameters() if name.startswith("preserve_network.aux_head.")]
+        missing = sorted(set(aux_names) - set(trainable))
+        if missing:
+            raise RuntimeError("Some preserve auxiliary head parameters are frozen: " + ", ".join(missing))
+
+    def write_trainable_parameter_artifact(self):
+        path = os.path.join(self.tensorboard_path, "trainable_parameters.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# Trainable parameters\n")
+            for name in self.trainable_parameter_names():
+                f.write(f"{name}\n")
+            f.write("\n# All parameters\n")
+            for name, param in self.policy.named_parameters():
+                f.write(f"{name}\trequires_grad={bool(param.requires_grad)}\tshape={tuple(param.shape)}\n")
 
     def write_experiment_artifacts(self, experiment_options, config_path=""):
         metadata = {
