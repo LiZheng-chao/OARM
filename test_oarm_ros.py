@@ -279,10 +279,29 @@ class OARMNet:
         if not os.path.isfile(weight):
             raise FileNotFoundError(f"OARM checkpoint not found: {weight}")
         state_dict, checkpoint_metadata = load_oarm_checkpoint(weight, map_location=self.device)
+        candidate_mode = self.config.get("candidate_mode", "typed_frontier")
+        backbone_mode = self.config.get("backbone_mode", "yopo_original")
+        if candidate_mode == "yopo_preserve":
+            is_oarm_preserve_checkpoint = any(key.startswith("preserve_network.") for key in state_dict)
+            if is_oarm_preserve_checkpoint:
+                validate_checkpoint_metadata(
+                    checkpoint_metadata,
+                    candidate_mode,
+                    backbone_mode,
+                    allow_mismatch=self.config.get("allow_checkpoint_mismatch", False),
+                    enable_yield_candidates=self.config.get("enable_yield_candidates", False),
+                    deployed_yaw_mode=self.config.get("deployed_yaw_mode", "goal"),
+                )
+                self.policy.load_state_dict(state_dict)
+                rospy.loginfo(f"Loaded OARM yopo_preserve checkpoint: {weight}")
+                return
+            self.policy.preserve_network.load_yopo_state_dict(state_dict, strict=True)
+            rospy.loginfo(f"Loaded official YOPO checkpoint into yopo_preserve policy: {weight}")
+            return
         validate_checkpoint_metadata(
             checkpoint_metadata,
-            self.config.get("candidate_mode", "typed_frontier"),
-            self.config.get("backbone_mode", "yopo_original"),
+            candidate_mode,
+            backbone_mode,
             allow_mismatch=self.config.get("allow_checkpoint_mismatch", False),
             enable_yield_candidates=self.config.get("enable_yield_candidates", False),
             deployed_yaw_mode=self.config.get("deployed_yaw_mode", "goal"),
