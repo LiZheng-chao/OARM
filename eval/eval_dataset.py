@@ -359,17 +359,35 @@ def evaluate(args):
     ).to(device)
     if args.checkpoint:
         state_dict, checkpoint_metadata = load_oarm_checkpoint(args.checkpoint, map_location=device)
-        validate_checkpoint_metadata(
-            checkpoint_metadata,
-            args.candidate_mode,
-            args.backbone_mode,
-            allow_mismatch=args.allow_checkpoint_mismatch,
-            enable_yield_candidates=args.enable_yield_candidates,
-            deployed_yaw_mode=args.deployed_yaw_mode,
-            risk_label_source=args.risk_label_source,
-        )
-        policy.load_state_dict(state_dict)
-        print(f"Loaded checkpoint: {args.checkpoint}")
+        if args.candidate_mode == "yopo_preserve":
+            is_oarm_preserve_checkpoint = any(key.startswith("preserve_network.") for key in state_dict)
+            if is_oarm_preserve_checkpoint:
+                validate_checkpoint_metadata(
+                    checkpoint_metadata,
+                    args.candidate_mode,
+                    args.backbone_mode,
+                    allow_mismatch=args.allow_checkpoint_mismatch,
+                    enable_yield_candidates=args.enable_yield_candidates,
+                    deployed_yaw_mode=args.deployed_yaw_mode,
+                    risk_label_source=args.risk_label_source,
+                )
+                policy.load_state_dict(state_dict)
+                print(f"Loaded OARM yopo_preserve checkpoint: {args.checkpoint}")
+            else:
+                policy.preserve_network.load_yopo_state_dict(state_dict, strict=True)
+                print(f"Loaded official YOPO checkpoint into yopo_preserve policy: {args.checkpoint}")
+        else:
+            validate_checkpoint_metadata(
+                checkpoint_metadata,
+                args.candidate_mode,
+                args.backbone_mode,
+                allow_mismatch=args.allow_checkpoint_mismatch,
+                enable_yield_candidates=args.enable_yield_candidates,
+                deployed_yaw_mode=args.deployed_yaw_mode,
+                risk_label_source=args.risk_label_source,
+            )
+            policy.load_state_dict(state_dict)
+            print(f"Loaded checkpoint: {args.checkpoint}")
     else:
         print("No checkpoint provided; evaluating randomly initialized OARMNetwork.")
     policy.eval()
@@ -554,7 +572,7 @@ def parser():
     )
     p.add_argument("--checkpoint", type=str, default="")
     p.add_argument("--allow-checkpoint-mismatch", action="store_true")
-    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier"], default="")
+    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve"], default="")
     p.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="")
     p.add_argument("--enable-yield-candidates", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
