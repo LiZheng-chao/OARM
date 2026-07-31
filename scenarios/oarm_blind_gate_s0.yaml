@@ -1,0 +1,13 @@
+# Deterministic OARM blind-gate scene. Generate the PLY first with:
+# python3 OARM/scenarios/generate_oarm_occlusion_scene.py --scene blind_gate_s0
+random_map: false
+ply_file: "/workspace/YOPO/OARM/scenarios/generated/oarm_blind_gate_s0.ply"
+render_depth: true
+render_lidar: true
+
+seed: 0
+x_length: 120
+y_length: 80
+z_length: 15
+maze_type: 7
+

@@ -1,0 +1,17 @@
+# Light long wall-occlusion scene for checking that 50m runs are solvable.
+random_map: true
+render_depth: true
+render_lidar: true
+
+seed: 32
+x_length: 120
+y_length: 80
+z_length: 15
+maze_type: 7
+
+wall_width_min: 3.0
+wall_width_max: 5.5
+wall_thick: 0.5
+wall_number: 30
+wall_ceiling: 1
+

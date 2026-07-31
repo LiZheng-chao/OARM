@@ -1,0 +1,88 @@
+{
+  "boxes": [
+    [
+      7.0,
+      8.6,
+      -0.4,
+      4.8,
+      0.0,
+      4.0
+    ],
+    [
+      10.8,
+      12.0,
+      -1.0,
+      1.0,
+      0.0,
+      3.2
+    ],
+    [
+      13.8,
+      15.4,
+      -4.8,
+      0.4,
+      0.0,
+      4.0
+    ],
+    [
+      17.6,
+      18.8,
+      -1.0,
+      1.0,
+      0.0,
+      3.2
+    ],
+    [
+      21.0,
+      22.6,
+      -0.4,
+      4.8,
+      0.0,
+      4.0
+    ],
+    [
+      24.8,
+      26.0,
+      -1.0,
+      1.0,
+      0.0,
+      3.2
+    ],
+    [
+      28.2,
+      29.8,
+      -4.8,
+      0.4,
+      0.0,
+      4.0
+    ],
+    [
+      32.0,
+      33.2,
+      -1.0,
+      1.0,
+      0.0,
+      3.2
+    ],
+    [
+      35.0,
+      36.4,
+      -0.4,
+      4.2,
+      0.0,
+      4.0
+    ]
+  ],
+  "dataset_pointcloud": "/home/lizheng/research/OARM-Planner/dataset/oarm_blind_gate_v3_s0_gt/pointcloud-0.ply",
+  "goal": [
+    50.0,
+    0.0,
+    2.0
+  ],
+  "output_ply": "/home/lizheng/research/OARM-Planner/OARM/scenarios/generated/oarm_blind_gate_v3_s0.ply",
+  "point_count": 60430,
+  "resolution": 0.1,
+  "risk_design": "center stoppers are close to the nominal route and partly hidden by upstream walls",
+  "safe_route_hint": "stay near the alternating open side while passing close to center hidden stoppers",
+  "scene": "blind_gate_v3_s0"
+}

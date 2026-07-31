@@ -1,0 +1,11 @@
+# Deterministic OARM blind-gate v3 scene.
+random_map: false
+ply_file: "/workspace/YOPO/OARM/scenarios/generated/oarm_blind_gate_v3_s0.ply"
+render_depth: true
+render_lidar: true
+
+seed: 30
+x_length: 120
+y_length: 80
+z_length: 15
+maze_type: 7

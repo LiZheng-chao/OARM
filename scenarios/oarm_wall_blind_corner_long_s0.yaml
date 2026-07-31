@@ -1,0 +1,18 @@
+# OARM occlusion scenario for 50m goals.
+# The larger map keeps goal-x=50 inside the generated GT pointcloud bounds.
+random_map: true
+render_depth: true
+render_lidar: true
+
+seed: 20
+x_length: 120
+y_length: 80
+z_length: 15
+maze_type: 7
+
+wall_width_min: 4.0
+wall_width_max: 8.0
+wall_thick: 0.5
+wall_number: 80
+wall_ceiling: 1
+

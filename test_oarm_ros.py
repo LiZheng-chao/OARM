@@ -84,6 +84,8 @@ class OARMNet:
         self.agile_lateral_penalty = self.config.get("agile_lateral_penalty", 0.0)
         self.agile_time_penalty = self.config.get("agile_time_penalty", 0.0)
         self.agile_stop_penalty = self.config.get("agile_stop_penalty", 0.0)
+        self.oarm_margin_alpha = float(self.config.get("oarm_margin_alpha", 0.0))
+        self.oarm_risk_beta = float(self.config.get("oarm_risk_beta", 0.0))
         self.selector_min_goal_drop_rate = self.config.get("selector_min_goal_drop_rate", None)
         self.selector_max_lateral_rate = self.config.get("selector_max_lateral_rate", None)
         self.depth_clearance_weight = float(self.config.get("depth_clearance_weight", 0.0))
@@ -160,18 +162,20 @@ class OARMNet:
                 self.depth_clearance_weight,
                 float(self.depth_clearance_gate),
                 float(self.depth_emergency_stop),
+                self.oarm_margin_alpha,
+                self.oarm_risk_beta,
             )
         )
         if self.main_experiment and (self.fast_sim_mode or self.progress_bonus_weight != 0.0 or agile_bonus_enabled):
             raise ValueError(
                 "main_experiment requires all online selector bonuses to be zero. "
-                "Use --selector-experiment without --main-experiment for agile selector ablations."
+                "Use --selector-experiment without --main-experiment for selector ablations."
             )
         if self.main_experiment and self.selector_experiment:
             raise ValueError("--main-experiment and --selector-experiment are mutually exclusive.")
         if agile_bonus_enabled and not self.selector_experiment:
             raise ValueError(
-                "Online agile selector bonuses require --selector-experiment. "
+                "Online selector bonuses require --selector-experiment. "
                 "Use --main-experiment only for learned-utility paper runs."
             )
         self.min_command_z = self.config["min_command_z"]
@@ -816,6 +820,10 @@ class OARMNet:
         self.last_stop_fallback_altitude_valid_count = None
         if self.fast_sim_mode and candidate_type is not None:
             score = score - 0.25 * (candidate_type == 2) - 0.6 * (candidate_type == 3)
+        if self.oarm_margin_alpha != 0.0 and margin_pred is not None:
+            score = score + self.oarm_margin_alpha * margin_pred
+        if self.oarm_risk_beta != 0.0 and risk_prob is not None:
+            score = score - self.oarm_risk_beta * risk_prob
 
         selector_valid = None
         if (
@@ -1337,6 +1345,8 @@ class OARMNet:
             "enable_yield_candidates": bool(self.config.get("enable_yield_candidates", False)),
             "deployed_yaw_mode": self.config.get("deployed_yaw_mode", "goal"),
             "selector_experiment": bool(self.selector_experiment),
+            "oarm_margin_alpha": float(self.oarm_margin_alpha),
+            "oarm_risk_beta": float(self.oarm_risk_beta),
             "agile_progress_weight": float(self.agile_progress_weight),
             "agile_goal_distance_weight": float(self.agile_goal_distance_weight),
             "agile_lateral_penalty": float(self.agile_lateral_penalty),
@@ -1393,6 +1403,8 @@ class OARMNet:
             "selected_time": float(traj_time[action_id]),
             "selected_utility": float(utility[action_id]),
             "selected_selection_score": float(selection_score[action_id]),
+            "selected_oarm_margin_bonus": float(self.oarm_margin_alpha * margin_pred[action_id]),
+            "selected_oarm_risk_penalty": float(self.oarm_risk_beta * risk_prob[action_id]),
             "selected_margin_pred": float(margin_pred[action_id]),
             "reaction_margin": float(margin_pred[action_id]),
             "selected_risk_prob": float(risk_prob[action_id]),
@@ -1541,8 +1553,10 @@ def parser():
     parser.add_argument(
         "--selector-experiment",
         action="store_true",
-        help="allow online agile selector bonuses as an ablation, separate from --main-experiment",
+        help="allow online selector bonuses as an ablation, separate from --main-experiment",
     )
+    parser.add_argument("--oarm-margin-alpha", type=float, default=0.0, help="A2 selector: add alpha * predicted reaction margin to selection score")
+    parser.add_argument("--oarm-risk-beta", type=float, default=0.0, help="A2 selector: subtract beta * predicted risk probability from selection score")
     parser.add_argument("--progress-bonus-weight", type=float, default=0.0)
     parser.add_argument("--agile-progress-weight", type=float, default=0.0)
     parser.add_argument("--agile-goal-distance-weight", type=float, default=0.0)
@@ -1629,6 +1643,8 @@ if __name__ == "__main__":
         "position_control_mode": args.position_control_mode,
         "start_immediately": args.start_immediately,
         "fast_sim_mode": args.fast_sim_mode,
+        "oarm_margin_alpha": args.oarm_margin_alpha,
+        "oarm_risk_beta": args.oarm_risk_beta,
         "progress_bonus_weight": args.progress_bonus_weight,
         "agile_progress_weight": args.agile_progress_weight,
         "agile_goal_distance_weight": args.agile_goal_distance_weight,

@@ -1,0 +1,80 @@
+{
+  "boxes": [
+    [
+      8.0,
+      10.2,
+      -1.2,
+      1.2,
+      0.0,
+      4.5
+    ],
+    [
+      12.0,
+      18.0,
+      -6.6,
+      -2.5,
+      0.0,
+      4.5
+    ],
+    [
+      17.5,
+      18.8,
+      2.8,
+      7.0,
+      0.0,
+      4.5
+    ],
+    [
+      24.0,
+      25.2,
+      -2.2,
+      3.0,
+      0.0,
+      4.5
+    ],
+    [
+      31.5,
+      33.0,
+      -6.8,
+      -2.0,
+      0.0,
+      4.5
+    ],
+    [
+      38.0,
+      39.2,
+      2.0,
+      6.5,
+      0.0,
+      4.5
+    ],
+    [
+      18.8,
+      20.8,
+      -0.7,
+      0.7,
+      0.0,
+      3.4
+    ],
+    [
+      44.0,
+      45.2,
+      -6.5,
+      -3.0,
+      0.0,
+      4.5
+    ]
+  ],
+  "dataset_pointcloud": "/home/lizheng/research/OARM-Planner/dataset/oarm_blind_gate_s1_gt/pointcloud-0.ply",
+  "goal": [
+    50.0,
+    0.0,
+    2.0
+  ],
+  "output_ply": "/home/lizheng/research/OARM-Planner/OARM/scenarios/generated/oarm_blind_gate_s1.ply",
+  "point_count": 73187,
+  "resolution": 0.1,
+  "risk_design": "negative-y side after the first gate contains a hidden stopper occluded at approach",
+  "safe_route_hint": "positive-y side of the first gate, mirrored from s0",
+  "scene": "blind_gate_s1"
+}

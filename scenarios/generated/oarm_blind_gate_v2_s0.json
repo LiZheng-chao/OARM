@@ -1,0 +1,80 @@
+{
+  "boxes": [
+    [
+      8.0,
+      10.0,
+      -0.8,
+      5.2,
+      0.0,
+      4.2
+    ],
+    [
+      13.0,
+      14.4,
+      -1.2,
+      1.1,
+      0.0,
+      3.4
+    ],
+    [
+      16.0,
+      18.0,
+      -5.2,
+      0.8,
+      0.0,
+      4.2
+    ],
+    [
+      21.0,
+      22.4,
+      -1.1,
+      1.2,
+      0.0,
+      3.4
+    ],
+    [
+      24.0,
+      26.0,
+      -0.8,
+      5.2,
+      0.0,
+      4.2
+    ],
+    [
+      29.0,
+      30.4,
+      -1.2,
+      1.1,
+      0.0,
+      3.4
+    ],
+    [
+      32.0,
+      34.0,
+      -5.2,
+      0.8,
+      0.0,
+      4.2
+    ],
+    [
+      37.0,
+      38.2,
+      -1.0,
+      1.0,
+      0.0,
+      3.2
+    ]
+  ],
+  "dataset_pointcloud": "/home/lizheng/research/OARM-Planner/dataset/oarm_blind_gate_v2_s0_gt/pointcloud-0.ply",
+  "goal": [
+    50.0,
+    0.0,
+    2.0
+  ],
+  "output_ply": "/home/lizheng/research/OARM-Planner/OARM/scenarios/generated/oarm_blind_gate_v2_s0.ply",
+  "point_count": 66131,
+  "resolution": 0.1,
+  "risk_design": "short center stoppers are hidden behind partial walls during approach",
+  "safe_route_hint": "slalom through alternating lower and upper openings, then straight to goal",
+  "scene": "blind_gate_v2_s0"
+}

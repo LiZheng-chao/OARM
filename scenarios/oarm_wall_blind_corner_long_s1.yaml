@@ -1,0 +1,17 @@
+# Same long wall-occlusion protocol as s0, with a different map seed.
+random_map: true
+render_depth: true
+render_lidar: true
+
+seed: 21
+x_length: 120
+y_length: 80
+z_length: 15
+maze_type: 7
+
+wall_width_min: 4.0
+wall_width_max: 8.0
+wall_thick: 0.5
+wall_number: 80
+wall_ceiling: 1
+

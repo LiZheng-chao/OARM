@@ -1,0 +1,17 @@
+# Medium-difficulty OARM wall-occlusion scene for 50m goals.
+random_map: true
+render_depth: true
+render_lidar: true
+
+seed: 30
+x_length: 120
+y_length: 80
+z_length: 15
+maze_type: 7
+
+wall_width_min: 3.0
+wall_width_max: 6.0
+wall_thick: 0.5
+wall_number: 45
+wall_ceiling: 1
+

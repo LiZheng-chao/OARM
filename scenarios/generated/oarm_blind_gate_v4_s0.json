@@ -1,0 +1,96 @@
+{
+  "boxes": [
+    [
+      4.0,
+      42.0,
+      -6.2,
+      -5.7,
+      0.0,
+      3.8
+    ],
+    [
+      4.0,
+      42.0,
+      5.7,
+      6.2,
+      0.0,
+      3.8
+    ],
+    [
+      8.0,
+      9.4,
+      -5.7,
+      1.2,
+      0.0,
+      3.8
+    ],
+    [
+      12.2,
+      13.2,
+      -1.0,
+      1.0,
+      0.0,
+      3.1
+    ],
+    [
+      15.5,
+      16.9,
+      -1.2,
+      5.7,
+      0.0,
+      3.8
+    ],
+    [
+      19.7,
+      20.7,
+      -1.0,
+      1.0,
+      0.0,
+      3.1
+    ],
+    [
+      23.0,
+      24.4,
+      -5.7,
+      1.2,
+      0.0,
+      3.8
+    ],
+    [
+      27.2,
+      28.2,
+      -1.0,
+      1.0,
+      0.0,
+      3.1
+    ],
+    [
+      30.5,
+      31.9,
+      -1.2,
+      5.7,
+      0.0,
+      3.8
+    ],
+    [
+      34.7,
+      35.7,
+      -1.0,
+      1.0,
+      0.0,
+      3.1
+    ]
+  ],
+  "dataset_pointcloud": "/home/lizheng/research/OARM-Planner/dataset/oarm_blind_gate_v4_s0_gt/pointcloud-0.ply",
+  "goal": [
+    50.0,
+    0.0,
+    2.0
+  ],
+  "output_ply": "/home/lizheng/research/OARM-Planner/OARM/scenarios/generated/oarm_blind_gate_v4_s0.ply",
+  "point_count": 120753,
+  "resolution": 0.1,
+  "risk_design": "center stoppers and alternating gates create repeated hidden near-route risks",
+  "safe_route_hint": "follow the bounded slalom corridor and pass center stoppers with clearance",
+  "scene": "blind_gate_v4_s0"
+}

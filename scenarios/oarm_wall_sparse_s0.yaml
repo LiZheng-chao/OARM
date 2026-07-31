@@ -1,0 +1,17 @@
+# Easier wall-occlusion scene for quick sanity checks before the denser blind-corner map.
+random_map: true
+render_depth: true
+render_lidar: true
+
+seed: 12
+x_length: 60
+y_length: 60
+z_length: 15
+maze_type: 7
+
+wall_width_min: 4.0
+wall_width_max: 6.0
+wall_thick: 0.5
+wall_number: 25
+wall_ceiling: 1
+
