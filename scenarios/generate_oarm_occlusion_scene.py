@@ -1,4 +1,4 @@
-"""Generate deterministic OARM occlusion benchmark pointclouds.
+﻿"""Generate deterministic OARM occlusion benchmark pointclouds.
 
 The generated PLY can be used by the YOPO Simulator through
 `random_map: false` and as the matched GT pointcloud for OARM postprocess.
@@ -257,6 +257,77 @@ def blind_gate_v4_s1(res: float) -> tuple[set[tuple[int, int, int]], dict]:
     }
     return points, meta
 
+
+def ceiling_gate_v1_s0(res: float) -> tuple[set[tuple[int, int, int]], dict]:
+    points: set[tuple[int, int, int]] = set()
+    wall_h = 3.05
+    ceiling_z0 = 3.05
+    ceiling_z1 = 3.25
+    boxes = [
+        # Low ceiling and side rails make vertical escape physically invalid.
+        (4.0, 44.0, -6.1, -5.6, 0.0, ceiling_z1),
+        (4.0, 44.0, 5.6, 6.1, 0.0, ceiling_z1),
+        (4.0, 44.0, -5.6, 5.6, ceiling_z0, ceiling_z1),
+        # Alternating doorway-like occluders; each leaves one lateral opening.
+        (8.0, 9.4, -5.6, 0.9, 0.0, wall_h),
+        (11.8, 12.8, -0.9, 0.9, 0.0, 2.75),
+        (15.2, 16.6, -0.9, 5.6, 0.0, wall_h),
+        (19.0, 20.0, -0.9, 0.9, 0.0, 2.75),
+        (22.4, 23.8, -5.6, 0.9, 0.0, wall_h),
+        (26.2, 27.2, -0.9, 0.9, 0.0, 2.75),
+        (29.6, 31.0, -0.9, 5.6, 0.0, wall_h),
+        (33.4, 34.4, -0.9, 0.9, 0.0, 2.75),
+        # A final visible doorway encourages returning to the goal line.
+        (37.0, 38.2, -5.6, -1.2, 0.0, wall_h),
+        (37.0, 38.2, 1.2, 5.6, 0.0, wall_h),
+    ]
+    for box in boxes:
+        add_surface_box(points, box, res)
+    add_ground(points, (-6.0, 58.0), (-8.0, 8.0), res, ground_res=0.25)
+    meta = {
+        "scene": "ceiling_gate_v1_s0",
+        "goal": [50.0, 0.0, 2.0],
+        "safe_route_hint": "under-ceiling slalom through alternating lateral door openings",
+        "risk_design": "low ceiling prevents vertical escape; hidden center stoppers test reaction-margin reranking",
+        "ceiling_z": [ceiling_z0, ceiling_z1],
+        "boxes": boxes,
+    }
+    return points, meta
+
+
+def ceiling_gate_v1_s1(res: float) -> tuple[set[tuple[int, int, int]], dict]:
+    points: set[tuple[int, int, int]] = set()
+    wall_h = 3.05
+    ceiling_z0 = 3.05
+    ceiling_z1 = 3.25
+    boxes = [
+        (4.0, 44.0, -6.1, -5.6, 0.0, ceiling_z1),
+        (4.0, 44.0, 5.6, 6.1, 0.0, ceiling_z1),
+        (4.0, 44.0, -5.6, 5.6, ceiling_z0, ceiling_z1),
+        (8.0, 9.4, -0.9, 5.6, 0.0, wall_h),
+        (11.8, 12.8, -0.9, 0.9, 0.0, 2.75),
+        (15.2, 16.6, -5.6, 0.9, 0.0, wall_h),
+        (19.0, 20.0, -0.9, 0.9, 0.0, 2.75),
+        (22.4, 23.8, -0.9, 5.6, 0.0, wall_h),
+        (26.2, 27.2, -0.9, 0.9, 0.0, 2.75),
+        (29.6, 31.0, -5.6, 0.9, 0.0, wall_h),
+        (33.4, 34.4, -0.9, 0.9, 0.0, 2.75),
+        (37.0, 38.2, -5.6, -1.2, 0.0, wall_h),
+        (37.0, 38.2, 1.2, 5.6, 0.0, wall_h),
+    ]
+    for box in boxes:
+        add_surface_box(points, box, res)
+    add_ground(points, (-6.0, 58.0), (-8.0, 8.0), res, ground_res=0.25)
+    meta = {
+        "scene": "ceiling_gate_v1_s1",
+        "goal": [50.0, 0.0, 2.0],
+        "safe_route_hint": "mirrored under-ceiling slalom through lateral door openings",
+        "risk_design": "mirrored low-ceiling hidden center-stopper risk",
+        "ceiling_z": [ceiling_z0, ceiling_z1],
+        "boxes": boxes,
+    }
+    return points, meta
+
 SCENES = {
     "blind_gate_s0": blind_gate_s0,
     "blind_gate_s1": blind_gate_s1,
@@ -266,6 +337,8 @@ SCENES = {
     "blind_gate_v3_s1": blind_gate_v3_s1,
     "blind_gate_v4_s0": blind_gate_v4_s0,
     "blind_gate_v4_s1": blind_gate_v4_s1,
+    "ceiling_gate_v1_s0": ceiling_gate_v1_s0,
+    "ceiling_gate_v1_s1": ceiling_gate_v1_s1,
 }
 
 
@@ -319,4 +392,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

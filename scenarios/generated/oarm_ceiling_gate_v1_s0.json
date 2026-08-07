@@ -1,0 +1,124 @@
+{
+  "boxes": [
+    [
+      4.0,
+      44.0,
+      -6.1,
+      -5.6,
+      0.0,
+      3.25
+    ],
+    [
+      4.0,
+      44.0,
+      5.6,
+      6.1,
+      0.0,
+      3.25
+    ],
+    [
+      4.0,
+      44.0,
+      -5.6,
+      5.6,
+      3.05,
+      3.25
+    ],
+    [
+      8.0,
+      9.4,
+      -5.6,
+      0.9,
+      0.0,
+      3.05
+    ],
+    [
+      11.8,
+      12.8,
+      -0.9,
+      0.9,
+      0.0,
+      2.75
+    ],
+    [
+      15.2,
+      16.6,
+      -0.9,
+      5.6,
+      0.0,
+      3.05
+    ],
+    [
+      19.0,
+      20.0,
+      -0.9,
+      0.9,
+      0.0,
+      2.75
+    ],
+    [
+      22.4,
+      23.8,
+      -5.6,
+      0.9,
+      0.0,
+      3.05
+    ],
+    [
+      26.2,
+      27.2,
+      -0.9,
+      0.9,
+      0.0,
+      2.75
+    ],
+    [
+      29.6,
+      31.0,
+      -0.9,
+      5.6,
+      0.0,
+      3.05
+    ],
+    [
+      33.4,
+      34.4,
+      -0.9,
+      0.9,
+      0.0,
+      2.75
+    ],
+    [
+      37.0,
+      38.2,
+      -5.6,
+      -1.2,
+      0.0,
+      3.05
+    ],
+    [
+      37.0,
+      38.2,
+      1.2,
+      5.6,
+      0.0,
+      3.05
+    ]
+  ],
+  "ceiling_z": [
+    3.05,
+    3.25
+  ],
+  "dataset_pointcloud": "dataset/oarm_ceiling_gate_v1_s0_gt/pointcloud-0.ply",
+  "goal": [
+    50.0,
+    0.0,
+    2.0
+  ],
+  "output_ply": "OARM/scenarios/generated/oarm_ceiling_gate_v1_s0.ply",
+  "point_count": 195466,
+  "resolution": 0.1,
+  "risk_design": "low ceiling prevents vertical escape; hidden center stoppers test reaction-margin reranking",
+  "safe_route_hint": "under-ceiling slalom through alternating lateral door openings",
+  "scene": "ceiling_gate_v1_s0"
+}
