@@ -44,6 +44,8 @@ class OARMCandidate:
     frontier_score: torch.Tensor = None
     time_anchor: torch.Tensor = None
     yaw_anchor: torch.Tensor = None
+    utility_base: torch.Tensor = None
+    utility_delta: torch.Tensor = None
 
     def flatten(self) -> Dict[str, torch.Tensor]:
         b, _, v, h = self.end_state_b.shape
@@ -66,4 +68,8 @@ class OARMCandidate:
             flat["time_anchor"] = self.time_anchor.reshape(b * n)
         if self.yaw_anchor is not None:
             flat["yaw_anchor"] = self.yaw_anchor.reshape(b * n)
+        if self.utility_base is not None:
+            flat["utility_base"] = self.utility_base.reshape(b * n)
+        if self.utility_delta is not None:
+            flat["utility_delta"] = self.utility_delta.reshape(b * n)
         return flat

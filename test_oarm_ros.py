@@ -68,12 +68,13 @@ class OARMNet:
         self.width = cfg["image_width"]
         self.min_dis, self.max_dis = 0.04, 20.0
         self.goal = np.array(self.config["goal"], dtype=np.float32)
-        self.yopo_preserve_mode = self.config.get("candidate_mode") == "yopo_preserve"
+        self.yopo_preserve_mode = self.config.get("candidate_mode") in {"yopo_preserve", "yopo_preserve_rerank"}
         self.goal_received = self.config["start_immediately"]
         self.plan_from_reference = self.config["plan_from_reference"]
         self.verbose = self.config["verbose"]
         self.visualize = self.config["visualize"]
         self.debug = self.config["debug"]
+        self.log_candidate_table = bool(self.config.get("log_candidate_table", False))
         self.main_experiment = self.config["main_experiment"]
         self.selector_experiment = self.config.get("selector_experiment", False)
         self.position_control_mode = self.config["position_control_mode"]
@@ -285,7 +286,7 @@ class OARMNet:
         state_dict, checkpoint_metadata = load_oarm_checkpoint(weight, map_location=self.device)
         candidate_mode = self.config.get("candidate_mode", "typed_frontier")
         backbone_mode = self.config.get("backbone_mode", "yopo_original")
-        if candidate_mode == "yopo_preserve":
+        if candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             is_oarm_preserve_checkpoint = any(key.startswith("preserve_network.") for key in state_dict)
             if is_oarm_preserve_checkpoint:
                 validate_checkpoint_metadata(
@@ -297,10 +298,10 @@ class OARMNet:
                     deployed_yaw_mode=self.config.get("deployed_yaw_mode", "goal"),
                 )
                 self.policy.load_state_dict(state_dict)
-                rospy.loginfo(f"Loaded OARM yopo_preserve checkpoint: {weight}")
+                rospy.loginfo(f"Loaded OARM {candidate_mode} checkpoint: {weight}")
                 return
             self.policy.preserve_network.load_yopo_state_dict(state_dict, strict=True)
-            rospy.loginfo(f"Loaded official YOPO checkpoint into yopo_preserve policy: {weight}")
+            rospy.loginfo(f"Loaded official YOPO checkpoint into {candidate_mode} policy: {weight}")
             return
         validate_checkpoint_metadata(
             checkpoint_metadata,
@@ -431,6 +432,10 @@ class OARMNet:
         flat = candidate.flatten()
         endstate = flat["end_state_b"].detach().cpu().numpy()
         utility = flat["utility_score"].detach().cpu().numpy()
+        utility_base = flat.get("utility_base")
+        utility_base = None if utility_base is None else utility_base.detach().cpu().numpy()
+        utility_delta = flat.get("utility_delta")
+        utility_delta = None if utility_delta is None else utility_delta.detach().cpu().numpy()
         traj_time = flat["traj_time"].detach().cpu().numpy()
         candidate_type = flat.get("candidate_type")
         candidate_type = None if candidate_type is None else candidate_type.detach().cpu().numpy()
@@ -532,6 +537,8 @@ class OARMNet:
             yield_prob,
             yaw_terminal,
             depth_clearance,
+            utility_base,
+            utility_delta,
             altitude_violation,
             inference_latency_ms=(forward_end - forward_start) * 1000.0,
             candidate_decode_ms=(time3 - forward_end) * 1000.0,
@@ -1276,6 +1283,8 @@ class OARMNet:
         yield_prob,
         yaw_terminal,
         depth_clearance,
+        utility_base,
+        utility_delta,
         altitude_violation,
         inference_latency_ms,
         candidate_decode_ms,
@@ -1451,6 +1460,40 @@ class OARMNet:
             "uses_privileged_online": False,
             "mapless_online_inference": True,
         }
+        if self.log_candidate_table:
+            candidates = []
+            for i in range(int(len(utility))):
+                cand_type = self.candidate_type_name(candidate_type[i] if candidate_type is not None else None)
+                cand_end_offset = endstate_w[i, :, 0]
+                cand_end_pos = start_pos + cand_end_offset
+                cand = {
+                    "id": int(i),
+                    "type": cand_type,
+                    "time": float(traj_time[i]),
+                    "utility": float(utility[i]),
+                    "utility_base": None if utility_base is None else float(utility_base[i]),
+                    "utility_delta": None if utility_delta is None else float(utility_delta[i]),
+                    "selection_score": float(selection_score[i]),
+                    "margin_pred": float(margin_pred[i]),
+                    "risk_prob": float(risk_prob[i]),
+                    "yield_prob": float(yield_prob[i]),
+                    "yaw_terminal": float(yaw_terminal[i]),
+                    "end_offset_w": cand_end_offset.astype(float).tolist(),
+                    "end_pos_w": cand_end_pos.astype(float).tolist(),
+                    "end_vel_w": endstate_w[i, :, 1].astype(float).tolist(),
+                    "end_acc_w": endstate_w[i, :, 2].astype(float).tolist(),
+                }
+                if depth_clearance is not None and np.isfinite(depth_clearance[i]):
+                    cand["depth_clearance"] = float(depth_clearance[i])
+                if altitude_violation is not None:
+                    cand["altitude_violation"] = float(altitude_violation[i])
+                if self.last_candidate_min_z is not None:
+                    cand["min_z"] = float(self.last_candidate_min_z[i])
+                if self.last_candidate_max_z is not None:
+                    cand["max_z"] = float(self.last_candidate_max_z[i])
+                candidates.append(cand)
+            row["candidates"] = candidates
+            row["candidate_count"] = len(candidates)
         self.log_jsonl_file.write(json.dumps(row, sort_keys=True) + "\n")
         self.log_jsonl_file.flush()
 
@@ -1609,12 +1652,13 @@ def parser():
     parser.add_argument("--log-jsonl", type=str, default="", help="write per-planning-step benchmark rows")
     parser.add_argument("--exec-log-jsonl", type=str, default="", help="write high-rate odometry execution rows")
     parser.add_argument("--append-logs", action="store_true", help="append to existing JSONL logs instead of overwriting")
+    parser.add_argument("--log-candidate-table", action="store_true", help="store all per-candidate scores/endpoints in benchmark JSONL for offline oracle analysis")
     parser.add_argument("--run-id", type=str, default="", help="stable id shared by planner and execution logs")
     parser.add_argument("--method", type=str, default="oarm", help="method label for benchmark grouping")
     parser.add_argument("--scenario", type=str, default="unknown", help="scenario label written into logs")
     parser.add_argument("--seed", type=int, default=0, help="run seed or map variant id written into logs")
     parser.add_argument("--map-id", type=int, default=0, help="GT ESDF/pointcloud map id for offline annotation")
-    parser.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve"], default="typed_frontier")
+    parser.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank"], default="typed_frontier")
     parser.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="yopo_original")
     parser.add_argument("--enable-yield-candidates", action="store_true")
     parser.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="goal")
@@ -1694,6 +1738,7 @@ if __name__ == "__main__":
         "log_jsonl": args.log_jsonl,
         "exec_log_jsonl": args.exec_log_jsonl,
         "append_logs": args.append_logs,
+        "log_candidate_table": args.log_candidate_table,
         "run_id": args.run_id,
         "method": args.method,
         "scenario": args.scenario,

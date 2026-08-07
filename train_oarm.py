@@ -87,7 +87,7 @@ def parser():
     p.add_argument("--checkpoint", type=str, default="")
     p.add_argument("--yopo-checkpoint", type=str, default="", help="official YOPO checkpoint used to initialize candidate_mode=yopo_preserve")
     p.add_argument("--allow-checkpoint-mismatch", action="store_true")
-    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve"], default="")
+    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank"], default="")
     p.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="")
     p.add_argument("--enable-yield-candidates", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)

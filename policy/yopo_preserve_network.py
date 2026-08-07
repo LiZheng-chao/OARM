@@ -30,11 +30,15 @@ class YOPOPreserveOARMNetwork(nn.Module):
         hidden_state=64,
         freeze_yopo_base=True,
         margin_scale=oarm_cfg.margin_scale,
+        enable_utility_delta=False,
+        utility_delta_scale=oarm_cfg.yopo_preserve_utility_delta_scale,
     ):
         super().__init__()
-        self.candidate_mode = "yopo_preserve"
+        self.candidate_mode = "yopo_preserve_rerank" if enable_utility_delta else "yopo_preserve"
         self.backbone_mode = "yopo_original"
         self.margin_scale = float(margin_scale)
+        self.enable_utility_delta = bool(enable_utility_delta)
+        self.utility_delta_scale = float(utility_delta_scale)
         self.state_transform = StateTransform()
         self.lattice_primitive = LatticePrimitive.get_instance()
         segment_time = float(self.lattice_primitive.segment_time)
@@ -48,10 +52,11 @@ class YOPOPreserveOARMNetwork(nn.Module):
         self.image_backbone = YopoBackbone(hidden_state)
         self.state_backbone = nn.Sequential()
         self.yopo_head = YopoHead(hidden_state + observation_dim, 10)
+        aux_channels = 3 if self.enable_utility_delta else 2
         self.aux_head = nn.Sequential(
             nn.Conv2d(hidden_state + observation_dim, 128, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 2, kernel_size=1),
+            nn.Conv2d(128, aux_channels, kernel_size=1),
         )
         self.reset_aux_head()
         if freeze_yopo_base:
@@ -125,7 +130,12 @@ class YOPOPreserveOARMNetwork(nn.Module):
         margin_pred = self.margin_scale * torch.tanh(aux[:, 0:1])
         risk_logit = aux[:, 1:2]
         backup_logit = torch.zeros_like(risk_logit)
-        utility_score = -score_pred
+        utility_base = -score_pred
+        if self.enable_utility_delta:
+            utility_delta = self.utility_delta_scale * torch.tanh(aux[:, 2:3])
+        else:
+            utility_delta = torch.zeros_like(risk_logit)
+        utility_score = utility_base + utility_delta.reshape(b, v, h)
         anchors = self.candidate_generator.yopo_anchors(b, device=depth.device)
         candidate_type = torch.full((b, v, h), self.candidate_generator.PROGRESS, device=depth.device, dtype=torch.long)
         return OARMCandidate(
@@ -140,4 +150,6 @@ class YOPOPreserveOARMNetwork(nn.Module):
             frontier_score=torch.zeros((b, v, h), device=depth.device, dtype=depth.dtype),
             time_anchor=anchors.time_anchor.reshape(b, v, h),
             yaw_anchor=anchors.yaw_anchor.reshape(b, v, h),
+            utility_base=utility_base,
+            utility_delta=utility_delta.reshape(b, v, h),
         )

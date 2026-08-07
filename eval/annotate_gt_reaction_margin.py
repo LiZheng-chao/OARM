@@ -134,6 +134,115 @@ def build_selected_trajectory(row, eval_points, device, deployed_yaw_mode):
     return sampled_pos, sampled_time, yaw_ref
 
 
+def build_candidate_trajectory(row, candidate, eval_points, device, deployed_yaw_mode):
+    start_pos = parse_vector(row, "start_pos_w")
+    start_vel = parse_vector(row, "start_vel_w")
+    start_acc = parse_vector(row, "start_acc_w")
+    end_pos = np.asarray(candidate.get("end_pos_w"), dtype=np.float32)
+    end_vel = np.asarray(candidate.get("end_vel_w"), dtype=np.float32)
+    end_acc = np.asarray(candidate.get("end_acc_w"), dtype=np.float32)
+    if end_pos.shape != (3,) or end_vel.shape != (3,) or end_acc.shape != (3,):
+        raise ValueError("Candidate geometry must contain end_pos_w/end_vel_w/end_acc_w with length 3")
+    traj_time = float(candidate.get("time"))
+    yaw0 = parse_float(row, "yaw0", 0.0)
+    yaw_terminal = float(candidate.get("yaw_terminal", yaw0))
+
+    start_state = torch.from_numpy(np.stack([start_pos, start_vel, start_acc])[None]).to(device=device)
+    end_state = torch.from_numpy(np.stack([end_pos, end_vel, end_acc])[None]).to(device=device)
+    time_tensor = torch.tensor([traj_time], dtype=torch.float32, device=device)
+    coeff = quintic_coefficients(start_state, end_state, time_tensor)
+    sampled_pos, sampled_vel, _, _ = sample_polynomial(coeff, time_tensor, eval_points, include_zero=True)
+    sampled_time = time_tensor[:, None] * torch.linspace(0.0, 1.0, eval_points, device=device)[None, :]
+
+    if deployed_yaw_mode == "predicted":
+        yaw0_t = torch.tensor([yaw0], dtype=torch.float32, device=device)
+        yaw_rate0 = torch.zeros_like(yaw0_t)
+        yaw_t = torch.tensor([yaw_terminal], dtype=torch.float32, device=device)
+        yaw_coeff = yaw_cubic_coefficients(yaw0_t, yaw_rate0, yaw_t, time_tensor)
+        yaw_ref, _ = sample_yaw_cubic(yaw_coeff, time_tensor, eval_points, include_zero=True)
+    elif deployed_yaw_mode == "hold":
+        yaw_ref = torch.full_like(sampled_time, float(yaw0))
+    else:
+        yaw_ref = goal_oriented_yaw(sampled_pos, sampled_vel, sampled_time, row, yaw0)
+    return sampled_pos, sampled_time, yaw_ref
+
+
+def candidate_reaction_margin_gt(row, candidate, line_of_sight, args, device, map_id):
+    sampled_pos, sampled_time, yaw_ref = build_candidate_trajectory(
+        row, candidate, args.eval_points, device, args.deployed_yaw_mode
+    )
+    min_clearance = trajectory_min_clearance(sampled_pos, map_id, args.dataset_dir)
+    result = {
+        "min_clearance_gt": min_clearance,
+        "collision_gt": bool(min_clearance < args.collision_clearance),
+    }
+    risk_points = select_gt_risk_points(
+        sampled_pos,
+        map_id,
+        args.dataset_dir,
+        args.risk_radius,
+        args.max_risk_points,
+    )
+    if risk_points is None:
+        result.update({
+            "gt_annotation_status": "no_nearby_gt_risk_points",
+            "gt_risk_point_count": 0,
+            "reaction_margin_gt": None,
+            "selected_rmvr_gt": None,
+            "valid_reaction_margin_gt": False,
+            "hidden_risk_gt": None,
+        })
+        return result
+
+    risk_points_t = torch.tensor(risk_points, dtype=torch.float32, device=device).unsqueeze(0)
+    map_tensor = torch.tensor([map_id], dtype=torch.long, device=device)
+    visibility_mask = line_of_sight(sampled_pos, risk_points_t, map_tensor) if args.use_esdf_los else None
+    components = reaction_margin_components(
+        sampled_pos,
+        sampled_time,
+        yaw_ref,
+        risk_points_t,
+        horizon_fov_rad=math.radians(args.horizon_fov_deg),
+        vertical_fov_rad=math.radians(args.vertical_fov_deg),
+        reaction_time=args.reaction_time,
+        visibility_mask=visibility_mask,
+        max_arrival_distance_m=args.arrival_radius,
+    )
+    first_vis = components["first_visible_time"]
+    arrival = components["first_entry_time"]
+    margin = components["reaction_margin_points"]
+    valid_mask = components["arrival_valid"].bool() & torch.isfinite(margin)
+    if bool(valid_mask.any()):
+        masked_margin = torch.where(valid_mask, margin, torch.full_like(margin, torch.inf))
+        margin_flat = masked_margin.reshape(-1)
+        first_flat = first_vis.reshape(-1)
+        arrival_flat = arrival.reshape(-1)
+        crit_idx = int(torch.argmin(margin_flat).detach().cpu())
+        crit_first = first_flat[crit_idx]
+        crit_arrival = arrival_flat[crit_idx]
+        reaction_margin_gt = float(margin_flat[crit_idx].detach().cpu())
+        result.update({
+            "gt_annotation_status": "ok",
+            "gt_risk_point_count": int(len(risk_points)),
+            "critical_first_visible_time_gt": None if bool(torch.isinf(crit_first)) else float(crit_first.detach().cpu()),
+            "critical_arrival_time_gt": None if bool(torch.isinf(crit_arrival)) else float(crit_arrival.detach().cpu()),
+            "reaction_margin_gt": reaction_margin_gt,
+            "selected_rmvr_gt": float(reaction_margin_gt < 0.0),
+            "valid_reaction_margin_gt": True,
+            "hidden_risk_gt": bool(torch.isinf(crit_first) or crit_first > args.hidden_risk_eps),
+        })
+    else:
+        result.update({
+            "gt_annotation_status": "censored",
+            "gt_risk_point_count": int(len(risk_points)),
+            "reaction_margin_gt": None,
+            "selected_rmvr_gt": None,
+            "valid_reaction_margin_gt": False,
+            "hidden_risk_gt": None,
+        })
+    return result
+
+
 def select_gt_risk_points(sampled_pos, map_id, dataset_dir, risk_radius, max_points):
     points, tree = load_pointcloud(map_id, dataset_dir)
     traj_np = sampled_pos.detach().cpu().numpy().reshape(-1, 3)
@@ -257,6 +366,28 @@ def annotate_row(row, line_of_sight, args, device):
             "deployed_yaw_mode": args.deployed_yaw_mode,
         }
     )
+    if args.annotate_candidates and row.get("candidates"):
+        annotated = []
+        selected_id = int(row.get("selected_id", -1))
+        for candidate in row["candidates"]:
+            cand = dict(candidate)
+            try:
+                cand.update(candidate_reaction_margin_gt(row, cand, line_of_sight, args, device, map_id))
+            except Exception as exc:
+                cand["gt_annotation_status"] = f"error:{type(exc).__name__}"
+                cand["gt_annotation_error"] = str(exc)
+            cand["is_selected"] = int(cand.get("id", -2)) == selected_id
+            annotated.append(cand)
+        row["candidates"] = annotated
+        valid_candidates = [c for c in annotated if c.get("valid_reaction_margin_gt") and c.get("reaction_margin_gt") is not None]
+        if valid_candidates:
+            oracle = max(valid_candidates, key=lambda c: c["reaction_margin_gt"])
+            row["candidate_oracle_id"] = int(oracle.get("id", -1))
+            row["candidate_oracle_reaction_margin_gt"] = float(oracle["reaction_margin_gt"])
+            row["candidate_oracle_selection_score"] = float(oracle.get("selection_score", 0.0))
+            row["safe_candidate_available_gt"] = bool(oracle["reaction_margin_gt"] > 0.0)
+            if reaction_margin_gt is not None:
+                row["candidate_oracle_margin_gap_gt"] = float(oracle["reaction_margin_gt"] - reaction_margin_gt)
     return row
 
 
@@ -307,6 +438,7 @@ def parser():
     p.add_argument("--horizon-fov-deg", type=float, default=cfg["horizon_camera_fov"])
     p.add_argument("--vertical-fov-deg", type=float, default=cfg["vertical_camera_fov"])
     p.add_argument("--use-esdf-los", action="store_true", help="require GT ESDF line-of-sight for first-visible time")
+    p.add_argument("--annotate-candidates", action="store_true", help="also annotate per-candidate geometry stored by --log-candidate-table")
     p.add_argument(
         "--deployed-yaw-mode",
         choices=["goal", "hold", "predicted"],

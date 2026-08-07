@@ -93,6 +93,13 @@ class OARMConfig:
     ranking_margin_delta: float = 0.10
     ranking_speed_eps: float = 0.75
     ranking_time_eps: float = 0.35
+    # A3 learned residual must stay conservative: YOPO base score remains the
+    # main policy, and residual only nudges candidates when margin evidence is clear.
+    yopo_preserve_utility_delta_scale: float = 0.35
+    yopo_preserve_residual_reg_weight: float = 0.08
+    yopo_preserve_unsafe_boost_weight: float = 0.45
+    yopo_preserve_safe_suppression_weight: float = 0.05
+    yopo_preserve_safe_margin_m: float = 0.20
     yaw_weight: float = 0.05
     yaw_early_time_tau: float = 0.6
     braking_weight: float = 0.05

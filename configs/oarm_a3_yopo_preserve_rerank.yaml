@@ -1,0 +1,17 @@
+# A3: preserve official YOPO trajectories/time/base score, learn only an auxiliary
+# margin/risk head plus a zero-initialized utility residual for pairwise reranking.
+candidate_mode: yopo_preserve_rerank
+backbone_mode: yopo_original
+enable_yield_candidates: false
+train_occlusion_risk: true
+train_risk_point_guidance: true
+train_reaction_margin: true
+train_margin_ranking: true
+train_yaw_visibility: false
+deployed_yaw_mode: goal
+risk_label_source: gt_pointcloud
+train_backup_feasibility: false
+train_yield_feasibility: false
+use_esdf_collision: false
+use_occlusion_aware_visibility: true
+use_privileged_risk_filter: false

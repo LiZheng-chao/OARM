@@ -33,15 +33,16 @@ class OARMNetwork(nn.Module):
     ):
         super().__init__()
         self.preserve_network = None
-        if candidate_mode == "yopo_preserve":
+        if candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             if backbone_mode != "yopo_original":
-                raise ValueError("candidate_mode=yopo_preserve requires backbone_mode=yopo_original")
+                raise ValueError(f"candidate_mode={candidate_mode} requires backbone_mode=yopo_original")
             self.candidate_mode = candidate_mode
             self.backbone_mode = backbone_mode
             self.preserve_network = YOPOPreserveOARMNetwork(
                 observation_dim=observation_dim,
                 hidden_state=hidden_state,
                 freeze_yopo_base=True,
+                enable_utility_delta=(candidate_mode == "yopo_preserve_rerank"),
             )
             return
         if output_dim != 15:

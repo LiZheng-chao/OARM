@@ -134,13 +134,13 @@ class OARMTrainer:
         self.train_yield_feasibility = bool(train_backup_feasibility or train_yield_feasibility)
         self.train_backup_feasibility = self.train_yield_feasibility
         self.use_privileged_risk_filter = use_privileged_risk_filter
-        if self.candidate_mode == "yopo_preserve":
+        if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             if self.train_backup_feasibility or self.train_yield_feasibility:
-                raise ValueError("A1 yopo_preserve only supports margin/risk auxiliary training; disable backup/yield feasibility")
-            if self.train_margin_ranking:
-                raise ValueError("A1 yopo_preserve keeps YOPO selection fixed; disable margin ranking until A2")
+                raise ValueError("YOPO-preserve modes only support margin/risk/rerank auxiliary training; disable backup/yield feasibility")
+            if self.candidate_mode == "yopo_preserve" and self.train_margin_ranking:
+                raise ValueError("A1 yopo_preserve keeps YOPO selection fixed; use yopo_preserve_rerank for learned ranking")
             if self.train_yaw_visibility:
-                raise ValueError("A1 yopo_preserve keeps yaw policy fixed; disable yaw visibility training")
+                raise ValueError("YOPO-preserve modes keep yaw policy fixed; disable yaw visibility training")
         self.experiment_options = dict(experiment_options or {})
         self.best_val_loss = float("inf")
         if save_on_exit:
@@ -168,7 +168,7 @@ class OARMTrainer:
                 risk_label_source=self.risk_label_source,
             )
             self.policy.load_state_dict(state_dict)
-        elif self.candidate_mode == "yopo_preserve":
+        elif self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             if not yopo_checkpoint_path:
                 raise ValueError("candidate_mode=yopo_preserve requires --yopo-checkpoint for YOPO base initialization")
             state_dict = torch.load(yopo_checkpoint_path, map_location=self.device, weights_only=True)
@@ -387,16 +387,57 @@ class OARMTrainer:
 
         map_id_expanded = map_id.to(self.device).repeat_interleave(self.traj_num, dim=0)
         loss_dict = self.oarm_loss(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
-        if self.candidate_mode == "yopo_preserve":
+        if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             aux_loss = torch.zeros((), device=self.device)
             if self.train_occlusion_risk:
                 aux_loss = aux_loss + oarm_cfg.risk_bce_weight * loss_dict["risk_loss"]
             if self.train_reaction_margin:
                 aux_loss = aux_loss + oarm_cfg.margin_reg_weight * loss_dict["margin_loss"]
 
+            rerank_loss = torch.zeros((), device=self.device)
+            residual_reg = torch.zeros((), device=self.device)
+            unsafe_boost_loss = torch.zeros((), device=self.device)
+            safe_suppression_loss = torch.zeros((), device=self.device)
+            unsafe_residual_positive_rate = torch.zeros((), device=self.device)
+            safe_residual_negative_rate = torch.zeros((), device=self.device)
+            if self.candidate_mode == "yopo_preserve_rerank":
+                rerank_loss = oarm_cfg.ranking_weight * loss_dict["ranking_loss"]
+                delta = flat.get("utility_delta")
+                if delta is not None:
+                    residual_reg = oarm_cfg.yopo_preserve_residual_reg_weight * delta.square().mean()
+                    margin_label = flat_labels.get("reaction_margin")
+                    if margin_label is not None:
+                        margin_label = margin_label.to(self.device).reshape_as(delta).float()
+                        margin_valid = flat_labels.get("reaction_margin_valid")
+                        if margin_valid is None:
+                            margin_valid = torch.ones_like(delta, dtype=torch.bool)
+                        else:
+                            margin_valid = margin_valid.to(self.device).reshape_as(delta).bool()
+                        margin_valid = margin_valid & torch.isfinite(margin_label) & torch.isfinite(delta)
+                        unsafe = margin_valid & (margin_label < 0.0)
+                        safe = margin_valid & (margin_label > oarm_cfg.yopo_preserve_safe_margin_m)
+                        if bool(unsafe.any()):
+                            unsafe_positive = torch.relu(delta[unsafe])
+                            unsafe_boost_loss = (
+                                oarm_cfg.yopo_preserve_unsafe_boost_weight * unsafe_positive.square().mean()
+                            )
+                            unsafe_residual_positive_rate = (delta[unsafe] > 0.0).float().mean()
+                        if bool(safe.any()):
+                            safe_negative = torch.relu(-delta[safe])
+                            safe_suppression_loss = (
+                                oarm_cfg.yopo_preserve_safe_suppression_weight * safe_negative.square().mean()
+                            )
+                            safe_residual_negative_rate = (delta[safe] < 0.0).float().mean()
+
             loss_dict["aux_only_loss"] = aux_loss
+            loss_dict["rerank_only_loss"] = rerank_loss
+            loss_dict["utility_delta_reg_loss"] = residual_reg
+            loss_dict["unsafe_boost_loss"] = unsafe_boost_loss
+            loss_dict["safe_suppression_loss"] = safe_suppression_loss
+            loss_dict["unsafe_residual_positive_rate"] = unsafe_residual_positive_rate
+            loss_dict["safe_residual_negative_rate"] = safe_residual_negative_rate
             loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
-            loss_dict["total_loss"] = aux_loss
+            loss_dict["total_loss"] = aux_loss + rerank_loss + residual_reg + unsafe_boost_loss + safe_suppression_loss
         return loss_dict
 
     def log_losses(self, prefix, loss_dict, epoch, step):
@@ -466,9 +507,9 @@ class OARMTrainer:
         return [name for name, param in self.policy.named_parameters() if param.requires_grad]
 
     def configure_trainable_parameters(self):
-        if self.candidate_mode == "yopo_preserve":
+        if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             if self.train_yield_head_only:
-                raise ValueError("--train-yield-head-only is not compatible with candidate_mode=yopo_preserve")
+                raise ValueError(f"--train-yield-head-only is not compatible with candidate_mode={self.candidate_mode}")
             for name, param in self.policy.named_parameters():
                 param.requires_grad_(name.startswith("preserve_network.aux_head."))
             return
@@ -506,12 +547,12 @@ class OARMTrainer:
         trainable = self.trainable_parameter_names()
         if not trainable:
             raise RuntimeError("No trainable OARM parameters were configured")
-        if self.candidate_mode != "yopo_preserve":
+        if self.candidate_mode not in {"yopo_preserve", "yopo_preserve_rerank"}:
             return
         bad = [name for name in trainable if not name.startswith("preserve_network.aux_head.")]
         if bad:
             raise RuntimeError(
-                "A1 yopo_preserve must train only auxiliary heads; unexpected trainable parameters: "
+                f"{self.candidate_mode} must train only preserve auxiliary heads; unexpected trainable parameters: "
                 + ", ".join(bad)
             )
         aux_names = [name for name, _param in self.policy.named_parameters() if name.startswith("preserve_network.aux_head.")]
@@ -539,6 +580,7 @@ class OARMTrainer:
                 "state_backbone_training": bool(preserve.state_backbone.training),
                 "yopo_head_training": bool(preserve.yopo_head.training),
                 "aux_head_training": bool(preserve.aux_head.training),
+                "enable_utility_delta": bool(getattr(preserve, "enable_utility_delta", False)),
             }
         artifact = {
             "candidate_mode": self.candidate_mode,
@@ -549,6 +591,7 @@ class OARMTrainer:
             "frozen_count": len(frozen),
             "yopo_base_modules": yopo_base_modules,
             "a1_auxiliary_only": bool(self.candidate_mode == "yopo_preserve"),
+            "preserve_rerank": bool(self.candidate_mode == "yopo_preserve_rerank"),
         }
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(artifact, f, indent=2, sort_keys=True)
