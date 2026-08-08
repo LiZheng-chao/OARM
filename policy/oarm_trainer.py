@@ -79,6 +79,14 @@ class OARMTrainer:
         use_esdf_collision=oarm_cfg.use_esdf_collision,
         use_occlusion_aware_visibility=oarm_cfg.use_occlusion_aware_visibility,
         use_privileged_risk_filter=oarm_cfg.use_privileged_risk_filter,
+        yopo_preserve_safety_residual_weight=oarm_cfg.yopo_preserve_safety_residual_weight,
+        yopo_preserve_safe_clearance_residual_weight=oarm_cfg.yopo_preserve_safe_clearance_residual_weight,
+        yopo_preserve_safety_cost_threshold=oarm_cfg.yopo_preserve_safety_cost_threshold,
+        yopo_preserve_safe_cost_threshold=oarm_cfg.yopo_preserve_safe_cost_threshold,
+        yopo_preserve_safety_pairwise_weight=oarm_cfg.yopo_preserve_safety_pairwise_weight,
+        yopo_preserve_safety_pairwise_margin=oarm_cfg.yopo_preserve_safety_pairwise_margin,
+        yopo_preserve_unsafe_delta_target=oarm_cfg.yopo_preserve_unsafe_delta_target,
+        yopo_preserve_safe_delta_target=oarm_cfg.yopo_preserve_safe_delta_target,
         experiment_options=None,
         config_path="",
         log_interval=50,
@@ -134,6 +142,14 @@ class OARMTrainer:
         self.train_yield_feasibility = bool(train_backup_feasibility or train_yield_feasibility)
         self.train_backup_feasibility = self.train_yield_feasibility
         self.use_privileged_risk_filter = use_privileged_risk_filter
+        self.yopo_preserve_safety_residual_weight = float(yopo_preserve_safety_residual_weight)
+        self.yopo_preserve_safe_clearance_residual_weight = float(yopo_preserve_safe_clearance_residual_weight)
+        self.yopo_preserve_safety_cost_threshold = float(yopo_preserve_safety_cost_threshold)
+        self.yopo_preserve_safe_cost_threshold = float(yopo_preserve_safe_cost_threshold)
+        self.yopo_preserve_safety_pairwise_weight = float(yopo_preserve_safety_pairwise_weight)
+        self.yopo_preserve_safety_pairwise_margin = float(yopo_preserve_safety_pairwise_margin)
+        self.yopo_preserve_unsafe_delta_target = float(yopo_preserve_unsafe_delta_target)
+        self.yopo_preserve_safe_delta_target = float(yopo_preserve_safe_delta_target)
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             if self.train_backup_feasibility or self.train_yield_feasibility:
                 raise ValueError("YOPO-preserve modes only support margin/risk/rerank auxiliary training; disable backup/yield feasibility")
@@ -398,8 +414,16 @@ class OARMTrainer:
             residual_reg = torch.zeros((), device=self.device)
             unsafe_boost_loss = torch.zeros((), device=self.device)
             safe_suppression_loss = torch.zeros((), device=self.device)
+            safety_residual_loss = torch.zeros((), device=self.device)
+            safe_clearance_residual_loss = torch.zeros((), device=self.device)
+            safety_pairwise_loss = torch.zeros((), device=self.device)
             unsafe_residual_positive_rate = torch.zeros((), device=self.device)
             safe_residual_negative_rate = torch.zeros((), device=self.device)
+            safety_residual_positive_rate = torch.zeros((), device=self.device)
+            safe_clearance_residual_negative_rate = torch.zeros((), device=self.device)
+            safety_candidate_rate = torch.zeros((), device=self.device)
+            safe_clearance_candidate_rate = torch.zeros((), device=self.device)
+            safety_pairwise_pair_rate = torch.zeros((), device=self.device)
             if self.candidate_mode == "yopo_preserve_rerank":
                 rerank_loss = oarm_cfg.ranking_weight * loss_dict["ranking_loss"]
                 delta = flat.get("utility_delta")
@@ -428,16 +452,73 @@ class OARMTrainer:
                                 oarm_cfg.yopo_preserve_safe_suppression_weight * safe_negative.square().mean()
                             )
                             safe_residual_negative_rate = (delta[safe] < 0.0).float().mean()
-
+                    safety_cost = loss_dict.get("safety_cost_per_candidate")
+                    if safety_cost is not None:
+                        safety_cost = safety_cost.to(self.device).reshape_as(delta).float()
+                        safety_valid = torch.isfinite(safety_cost) & torch.isfinite(delta)
+                        unsafe_safety = safety_valid & (safety_cost > self.yopo_preserve_safety_cost_threshold)
+                        safe_clearance = safety_valid & (safety_cost <= self.yopo_preserve_safe_cost_threshold)
+                        safety_candidate_rate = unsafe_safety.float().mean()
+                        safe_clearance_candidate_rate = safe_clearance.float().mean()
+                        if bool(unsafe_safety.any()) and self.yopo_preserve_safety_residual_weight > 0.0:
+                            safety_positive = torch.relu(delta[unsafe_safety] + self.yopo_preserve_unsafe_delta_target)
+                            safety_residual_loss = (
+                                self.yopo_preserve_safety_residual_weight * safety_positive.square().mean()
+                            )
+                            safety_residual_positive_rate = (delta[unsafe_safety] > 0.0).float().mean()
+                        if bool(safe_clearance.any()) and self.yopo_preserve_safe_clearance_residual_weight > 0.0:
+                            safe_clearance_negative = torch.relu(self.yopo_preserve_safe_delta_target - delta[safe_clearance])
+                            safe_clearance_residual_loss = (
+                                self.yopo_preserve_safe_clearance_residual_weight * safe_clearance_negative.square().mean()
+                            )
+                            safe_clearance_residual_negative_rate = (delta[safe_clearance] < 0.0).float().mean()
+                        if self.yopo_preserve_safety_pairwise_weight > 0.0 and delta.numel() % self.traj_num == 0:
+                            pairwise_score = flat.get("utility_score", delta).reshape_as(delta)
+                            score_group = pairwise_score.reshape(-1, self.traj_num)
+                            unsafe_group = unsafe_safety.reshape(-1, self.traj_num)
+                            safe_group = safe_clearance.reshape(-1, self.traj_num)
+                            has_safety_pair = unsafe_group.any(dim=1) & safe_group.any(dim=1)
+                            safety_pairwise_pair_rate = has_safety_pair.float().mean()
+                            if bool(has_safety_pair.any()):
+                                neg_inf = torch.full_like(score_group, -float("inf"))
+                                safe_best_score = torch.where(safe_group, score_group, neg_inf).max(dim=1).values
+                                unsafe_best_score = torch.where(unsafe_group, score_group, neg_inf).max(dim=1).values
+                                safety_pairwise_gap = torch.relu(
+                                    unsafe_best_score[has_safety_pair]
+                                    + self.yopo_preserve_safety_pairwise_margin
+                                    - safe_best_score[has_safety_pair]
+                                )
+                                safety_pairwise_loss = (
+                                    self.yopo_preserve_safety_pairwise_weight * safety_pairwise_gap.square().mean()
+                                )
             loss_dict["aux_only_loss"] = aux_loss
             loss_dict["rerank_only_loss"] = rerank_loss
             loss_dict["utility_delta_reg_loss"] = residual_reg
             loss_dict["unsafe_boost_loss"] = unsafe_boost_loss
             loss_dict["safe_suppression_loss"] = safe_suppression_loss
+            loss_dict["safety_residual_loss"] = safety_residual_loss
+            loss_dict["safe_clearance_residual_loss"] = safe_clearance_residual_loss
+            loss_dict["safety_pairwise_loss"] = safety_pairwise_loss
+
             loss_dict["unsafe_residual_positive_rate"] = unsafe_residual_positive_rate
             loss_dict["safe_residual_negative_rate"] = safe_residual_negative_rate
+            loss_dict["safety_residual_positive_rate"] = safety_residual_positive_rate
+            loss_dict["safe_clearance_residual_negative_rate"] = safe_clearance_residual_negative_rate
+            loss_dict["safety_candidate_rate"] = safety_candidate_rate
+            loss_dict["safe_clearance_candidate_rate"] = safe_clearance_candidate_rate
+            loss_dict["safety_pairwise_pair_rate"] = safety_pairwise_pair_rate
+
             loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
-            loss_dict["total_loss"] = aux_loss + rerank_loss + residual_reg + unsafe_boost_loss + safe_suppression_loss
+            loss_dict["total_loss"] = (
+                aux_loss
+                + rerank_loss
+                + residual_reg
+                + unsafe_boost_loss
+                + safe_suppression_loss
+                + safety_residual_loss
+                + safe_clearance_residual_loss
+                + safety_pairwise_loss
+            )
         return loss_dict
 
     def log_losses(self, prefix, loss_dict, epoch, step):

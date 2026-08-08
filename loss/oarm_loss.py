@@ -145,10 +145,12 @@ class OARMLoss(nn.Module):
             safety_cost = labels["safety_cost"].reshape_as(total_cost)
             total_cost = total_cost + safety_cost
             losses["safety_cost"] = safety_cost.mean()
+            losses["safety_cost_per_candidate"] = safety_cost.detach()
         elif self.collision_loss is not None and map_id is not None:
             safety_cost = self.collision_loss(pos, map_id.reshape(-1))
             total_cost = total_cost + oarm_cfg.collision_weight * safety_cost
             losses["safety_cost"] = safety_cost.mean()
+            losses["safety_cost_per_candidate"] = safety_cost.detach()
 
         if self.enable_occlusion_risk and labels is not None and "occlusion_risk" in labels:
             risk_label = labels["occlusion_risk"].reshape_as(candidate_flat["risk_logit"]).float()

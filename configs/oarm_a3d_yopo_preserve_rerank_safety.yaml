@@ -1,0 +1,22 @@
+# A3d: A3 rerank with ESDF-aware residual safety constraints.
+# Keeps YOPO trajectory anchors unchanged; only prevents the learned residual from
+# promoting candidates that the GT ESDF collision loss marks as unsafe.
+candidate_mode: yopo_preserve_rerank
+backbone_mode: yopo_original
+enable_yield_candidates: false
+train_occlusion_risk: true
+train_risk_point_guidance: true
+train_reaction_margin: true
+train_margin_ranking: true
+train_yaw_visibility: false
+deployed_yaw_mode: goal
+risk_label_source: gt_pointcloud
+train_backup_feasibility: false
+train_yield_feasibility: false
+use_esdf_collision: true
+use_occlusion_aware_visibility: true
+use_privileged_risk_filter: false
+yopo_preserve_safety_residual_weight: 1.0
+yopo_preserve_safe_clearance_residual_weight: 0.05
+yopo_preserve_safety_cost_threshold: 0.01
+yopo_preserve_safe_cost_threshold: 0.001

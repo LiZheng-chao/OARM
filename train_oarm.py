@@ -52,7 +52,14 @@ TRAINING_OPTION_KEYS = (
     "use_esdf_collision",
     "use_occlusion_aware_visibility",
     "use_privileged_risk_filter",
-)
+    "yopo_preserve_safety_residual_weight",
+    "yopo_preserve_safe_clearance_residual_weight",
+    "yopo_preserve_safety_cost_threshold",
+    "yopo_preserve_safe_cost_threshold",
+    "yopo_preserve_safety_pairwise_weight",
+    "yopo_preserve_safety_pairwise_margin",
+    "yopo_preserve_unsafe_delta_target",
+    "yopo_preserve_safe_delta_target",)
 
 
 def configure_random_seed(seed):
