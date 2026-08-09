@@ -250,6 +250,7 @@ class OARMNet:
             candidate_mode=self.config.get("candidate_mode", "typed_frontier"),
             backbone_mode=self.config.get("backbone_mode", "yopo_original"),
             enable_yield_candidates=self.config.get("enable_yield_candidates", False),
+            utility_delta_scale=self.config.get("yopo_preserve_utility_delta_scale", 0.35),
         ).to(self.device)
         self.load_policy(weight)
         self.policy.eval()
@@ -1662,6 +1663,7 @@ def parser():
     parser.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="yopo_original")
     parser.add_argument("--enable-yield-candidates", action="store_true")
     parser.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="goal")
+    parser.add_argument("--yopo-preserve-utility-delta-scale", type=float, default=0.35)
     parser.add_argument("--allow-checkpoint-mismatch", action="store_true")
     return parser
 
@@ -1748,6 +1750,7 @@ if __name__ == "__main__":
         "candidate_mode": args.candidate_mode,
         "backbone_mode": args.backbone_mode,
         "enable_yield_candidates": args.enable_yield_candidates,
+        "yopo_preserve_utility_delta_scale": args.yopo_preserve_utility_delta_scale,
         "deployed_yaw_mode": args.deployed_yaw_mode,
         "allow_checkpoint_mismatch": args.allow_checkpoint_mismatch,
     }

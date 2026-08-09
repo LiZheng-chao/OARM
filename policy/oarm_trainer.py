@@ -79,6 +79,7 @@ class OARMTrainer:
         use_esdf_collision=oarm_cfg.use_esdf_collision,
         use_occlusion_aware_visibility=oarm_cfg.use_occlusion_aware_visibility,
         use_privileged_risk_filter=oarm_cfg.use_privileged_risk_filter,
+        yopo_preserve_utility_delta_scale=oarm_cfg.yopo_preserve_utility_delta_scale,
         yopo_preserve_safety_residual_weight=oarm_cfg.yopo_preserve_safety_residual_weight,
         yopo_preserve_safe_clearance_residual_weight=oarm_cfg.yopo_preserve_safe_clearance_residual_weight,
         yopo_preserve_safety_cost_threshold=oarm_cfg.yopo_preserve_safety_cost_threshold,
@@ -142,6 +143,7 @@ class OARMTrainer:
         self.train_yield_feasibility = bool(train_backup_feasibility or train_yield_feasibility)
         self.train_backup_feasibility = self.train_yield_feasibility
         self.use_privileged_risk_filter = use_privileged_risk_filter
+        self.yopo_preserve_utility_delta_scale = float(yopo_preserve_utility_delta_scale)
         self.yopo_preserve_safety_residual_weight = float(yopo_preserve_safety_residual_weight)
         self.yopo_preserve_safe_clearance_residual_weight = float(yopo_preserve_safe_clearance_residual_weight)
         self.yopo_preserve_safety_cost_threshold = float(yopo_preserve_safety_cost_threshold)
@@ -171,6 +173,7 @@ class OARMTrainer:
             candidate_mode=self.candidate_mode,
             backbone_mode=self.backbone_mode,
             enable_yield_candidates=self.enable_yield_candidates,
+            utility_delta_scale=self.yopo_preserve_utility_delta_scale,
         ).to(self.device)
         if checkpoint_path:
             state_dict, checkpoint_metadata = load_oarm_checkpoint(checkpoint_path, map_location=self.device)
@@ -424,6 +427,8 @@ class OARMTrainer:
             safety_candidate_rate = torch.zeros((), device=self.device)
             safe_clearance_candidate_rate = torch.zeros((), device=self.device)
             safety_pairwise_pair_rate = torch.zeros((), device=self.device)
+            margin_pairwise_unsafe = None
+            margin_pairwise_safe = None
             if self.candidate_mode == "yopo_preserve_rerank":
                 rerank_loss = oarm_cfg.ranking_weight * loss_dict["ranking_loss"]
                 delta = flat.get("utility_delta")
@@ -439,7 +444,9 @@ class OARMTrainer:
                             margin_valid = margin_valid.to(self.device).reshape_as(delta).bool()
                         margin_valid = margin_valid & torch.isfinite(margin_label) & torch.isfinite(delta)
                         unsafe = margin_valid & (margin_label < 0.0)
+                        margin_pairwise_unsafe = unsafe
                         safe = margin_valid & (margin_label > oarm_cfg.yopo_preserve_safe_margin_m)
+                        margin_pairwise_safe = safe
                         if bool(unsafe.any()):
                             unsafe_positive = torch.relu(delta[unsafe])
                             unsafe_boost_loss = (
@@ -458,6 +465,12 @@ class OARMTrainer:
                         safety_valid = torch.isfinite(safety_cost) & torch.isfinite(delta)
                         unsafe_safety = safety_valid & (safety_cost > self.yopo_preserve_safety_cost_threshold)
                         safe_clearance = safety_valid & (safety_cost <= self.yopo_preserve_safe_cost_threshold)
+                        pairwise_unsafe = unsafe_safety
+                        pairwise_safe = safe_clearance
+                        if margin_pairwise_unsafe is not None:
+                            pairwise_unsafe = pairwise_unsafe | margin_pairwise_unsafe
+                        if margin_pairwise_safe is not None:
+                            pairwise_safe = pairwise_safe | margin_pairwise_safe
                         safety_candidate_rate = unsafe_safety.float().mean()
                         safe_clearance_candidate_rate = safe_clearance.float().mean()
                         if bool(unsafe_safety.any()) and self.yopo_preserve_safety_residual_weight > 0.0:
@@ -475,8 +488,8 @@ class OARMTrainer:
                         if self.yopo_preserve_safety_pairwise_weight > 0.0 and delta.numel() % self.traj_num == 0:
                             pairwise_score = flat.get("utility_score", delta).reshape_as(delta)
                             score_group = pairwise_score.reshape(-1, self.traj_num)
-                            unsafe_group = unsafe_safety.reshape(-1, self.traj_num)
-                            safe_group = safe_clearance.reshape(-1, self.traj_num)
+                            unsafe_group = pairwise_unsafe.reshape(-1, self.traj_num)
+                            safe_group = pairwise_safe.reshape(-1, self.traj_num)
                             has_safety_pair = unsafe_group.any(dim=1) & safe_group.any(dim=1)
                             safety_pairwise_pair_rate = has_safety_pair.float().mean()
                             if bool(has_safety_pair.any()):

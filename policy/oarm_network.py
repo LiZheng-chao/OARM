@@ -30,6 +30,7 @@ class OARMNetwork(nn.Module):
         candidate_mode=oarm_cfg.candidate_mode,
         backbone_mode=oarm_cfg.backbone_mode,
         enable_yield_candidates=oarm_cfg.enable_yield_candidates,
+        utility_delta_scale=oarm_cfg.yopo_preserve_utility_delta_scale,
     ):
         super().__init__()
         self.preserve_network = None
@@ -43,6 +44,7 @@ class OARMNetwork(nn.Module):
                 hidden_state=hidden_state,
                 freeze_yopo_base=True,
                 enable_utility_delta=(candidate_mode == "yopo_preserve_rerank"),
+                utility_delta_scale=utility_delta_scale,
             )
             return
         if output_dim != 15:
