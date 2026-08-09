@@ -25,6 +25,7 @@ from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_state_transform import rotate_body2world, state_body2world
 from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
+from OARM.utils.gt_clearance import candidate_min_clearance_gt
 from OARM.utils.visible_free_distance import visible_free_distance_from_depth
 from OARM.utils.yopo_compat import ensure_yopo_path
 from OARM.utils.yopo_dataset_context import yopo_dataset_cfg
@@ -111,6 +112,19 @@ def add_metric(accumulator, key, value, weight=1):
     accumulator[key].append((value, weight))
 
 
+def add_quantile_metrics(accumulator, prefix, values, weight=1):
+    flat = values.reshape(-1)
+    flat = flat[torch.isfinite(flat)]
+    if flat.numel() == 0:
+        return
+    probs = torch.tensor([0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99], device=flat.device, dtype=flat.dtype)
+    quantiles = torch.quantile(flat, probs)
+    names = ("p01", "p05", "p25", "p50", "p75", "p95", "p99")
+    metric_weight = int(flat.numel()) if weight is None else weight
+    for name, value in zip(names, quantiles):
+        add_metric(accumulator, f"{prefix}_{name}", value, metric_weight)
+
+
 def finalize_metrics(accumulator):
     metrics = {}
     for key, values in accumulator.items():
@@ -145,6 +159,9 @@ def resolve_utility_delta_scale(args, checkpoint_metadata):
 EVAL_PROTOCOL_ARG_KEYS = (
     "yopo_preserve_safety_cost_threshold",
     "yopo_preserve_safe_cost_threshold",
+    "yopo_preserve_geometry_oracle_source",
+    "yopo_preserve_unsafe_clearance_m",
+    "yopo_preserve_safe_clearance_m",
     "yopo_preserve_safe_margin_m",
     "yopo_preserve_oracle_min_progress",
 )
@@ -176,12 +193,14 @@ def apply_checkpoint_eval_protocol(args, checkpoint_metadata):
             setattr(args, key, stored)
     preset = get_oarm_training_preset(args.stage)
     for key in EVAL_PROTOCOL_ARG_KEYS:
-        if getattr(args, key) is not None:
-            continue
         stored = training_options.get(key)
-        if stored is None:
-            stored = getattr(preset, key, getattr(oarm_cfg, key))
-        setattr(args, key, stored)
+        if stored is not None:
+            setattr(args, key, stored)
+            continue
+        current = getattr(args, key)
+        if current is not None and current != "":
+            continue
+        setattr(args, key, getattr(preset, key, getattr(oarm_cfg, key)))
 
 def flatten_labels(labels, flat, device, args):
     flat_labels = {}
@@ -327,7 +346,7 @@ def maybe_generate_reaction_margin_labels(
     return flat_labels
 
 
-def selected_candidate_stats(candidate, accumulator, args, flat_labels=None, safety_cost=None, progress=None):
+def selected_candidate_stats(candidate, accumulator, args, flat_labels=None, safety_cost=None, progress=None, min_clearance_gt=None):
     utility = candidate.utility_score.reshape(candidate.utility_score.shape[0], -1)
     best_id = utility.argmax(dim=1)
     batch_size = utility.shape[0]
@@ -343,21 +362,63 @@ def selected_candidate_stats(candidate, accumulator, args, flat_labels=None, saf
     if safety_cost is not None:
         flat_safety = safety_cost.reshape(batch_size, -1).to(device=utility.device, dtype=utility.dtype)
         finite_safety = torch.isfinite(flat_safety)
-        geom_unsafe = finite_safety & (flat_safety > args.yopo_preserve_safety_cost_threshold)
-        geom_safe = finite_safety & (flat_safety <= args.yopo_preserve_safe_cost_threshold)
+        esdf_unsafe = finite_safety & (flat_safety > args.yopo_preserve_safety_cost_threshold)
+        esdf_safe = finite_safety & (flat_safety <= args.yopo_preserve_safe_cost_threshold)
         selected_safety = flat_safety.gather(1, best_id[:, None]).squeeze(1)
         selected_safety_valid = torch.isfinite(selected_safety)
+        if bool(finite_safety.any()):
+            add_quantile_metrics(accumulator, "esdf_safety_cost", flat_safety[finite_safety], int(finite_safety.sum().item()))
         if bool(selected_safety_valid.any()):
             add_metric(accumulator, "selected_safety_cost", selected_safety[selected_safety_valid].mean(), int(selected_safety_valid.sum().item()))
             add_metric(
                 accumulator,
-                "selected_geom_unsafe_candidate_rate",
+                "selected_esdf_unsafe_candidate_rate",
                 (selected_safety[selected_safety_valid] > args.yopo_preserve_safety_cost_threshold).float().mean(),
                 int(selected_safety_valid.sum().item()),
             )
-        add_metric(accumulator, "geom_unsafe_candidate_rate", geom_unsafe.float().mean(), batch_size)
-        add_metric(accumulator, "geom_safe_candidate_rate", geom_safe.float().mean(), batch_size)
-        add_metric(accumulator, "geom_safe_candidate_available_rate", geom_safe.any(dim=1).float().mean(), batch_size)
+        add_metric(accumulator, "esdf_unsafe_candidate_rate", esdf_unsafe.float().mean(), batch_size)
+        add_metric(accumulator, "esdf_safe_candidate_rate", esdf_safe.float().mean(), batch_size)
+        add_metric(accumulator, "esdf_safe_candidate_available_rate", esdf_safe.any(dim=1).float().mean(), batch_size)
+        if args.yopo_preserve_geometry_oracle_source == "esdf_cost":
+            geom_unsafe = esdf_unsafe
+            geom_safe = esdf_safe
+            if bool(selected_safety_valid.any()):
+                add_metric(
+                    accumulator,
+                    "selected_geom_unsafe_candidate_rate",
+                    (selected_safety[selected_safety_valid] > args.yopo_preserve_safety_cost_threshold).float().mean(),
+                    int(selected_safety_valid.sum().item()),
+                )
+            add_metric(accumulator, "geom_unsafe_candidate_rate", geom_unsafe.float().mean(), batch_size)
+            add_metric(accumulator, "geom_safe_candidate_rate", geom_safe.float().mean(), batch_size)
+            add_metric(accumulator, "geom_safe_candidate_available_rate", geom_safe.any(dim=1).float().mean(), batch_size)
+
+    if min_clearance_gt is not None:
+        flat_clearance = min_clearance_gt.reshape(batch_size, -1).to(device=utility.device, dtype=utility.dtype)
+        finite_clearance = torch.isfinite(flat_clearance)
+        gt_unsafe = finite_clearance & (flat_clearance < args.yopo_preserve_unsafe_clearance_m)
+        gt_safe = finite_clearance & (flat_clearance > args.yopo_preserve_safe_clearance_m)
+        if bool(finite_clearance.any()):
+            add_metric(accumulator, "gt_min_clearance_mean", flat_clearance[finite_clearance].mean(), int(finite_clearance.sum().item()))
+            add_quantile_metrics(accumulator, "gt_min_clearance", flat_clearance[finite_clearance], int(finite_clearance.sum().item()))
+        selected_clearance = flat_clearance.gather(1, best_id[:, None]).squeeze(1)
+        selected_clearance_valid = torch.isfinite(selected_clearance)
+        if bool(selected_clearance_valid.any()):
+            weight = int(selected_clearance_valid.sum().item())
+            add_metric(accumulator, "selected_gt_min_clearance", selected_clearance[selected_clearance_valid].mean(), weight)
+            add_metric(accumulator, "selected_gt_clearance_collision_rate", (selected_clearance[selected_clearance_valid] < args.yopo_preserve_unsafe_clearance_m).float().mean(), weight)
+        add_metric(accumulator, "gt_clearance_valid_rate", finite_clearance.float().mean(), batch_size)
+        add_metric(accumulator, "gt_clearance_unsafe_candidate_rate", gt_unsafe.float().mean(), batch_size)
+        add_metric(accumulator, "gt_clearance_safe_candidate_rate", gt_safe.float().mean(), batch_size)
+        add_metric(accumulator, "gt_clearance_safe_candidate_available_rate", gt_safe.any(dim=1).float().mean(), batch_size)
+        if args.yopo_preserve_geometry_oracle_source == "gt_clearance":
+            geom_unsafe = gt_unsafe
+            geom_safe = gt_safe
+            if bool(selected_clearance_valid.any()):
+                add_metric(accumulator, "selected_geom_unsafe_candidate_rate", (selected_clearance[selected_clearance_valid] < args.yopo_preserve_unsafe_clearance_m).float().mean(), int(selected_clearance_valid.sum().item()))
+            add_metric(accumulator, "geom_unsafe_candidate_rate", geom_unsafe.float().mean(), batch_size)
+            add_metric(accumulator, "geom_safe_candidate_rate", geom_safe.float().mean(), batch_size)
+            add_metric(accumulator, "geom_safe_candidate_available_rate", geom_safe.any(dim=1).float().mean(), batch_size)
 
     if candidate.risk_logit is not None:
         flat_risk = torch.sigmoid(candidate.risk_logit.reshape(batch_size, -1))
@@ -601,6 +662,12 @@ def evaluate(args):
                 loss_fn,
             )
             loss_dict = loss_fn(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
+            min_clearance_gt = None
+            if args.yopo_preserve_geometry_oracle_source == "gt_clearance":
+                sampled_pos_w = loss_dict.get("sampled_pos_w")
+                if sampled_pos_w is None:
+                    raise RuntimeError("GT clearance eval requires sampled_pos_w from OARMLoss")
+                min_clearance_gt = candidate_min_clearance_gt(sampled_pos_w, map_id_expanded, dataset.dataset_dir)
 
             batch_size = depth.shape[0]
             for key, value in loss_dict.items():
@@ -615,6 +682,7 @@ def evaluate(args):
                 flat_labels,
                 loss_dict.get("safety_cost_per_candidate"),
                 selected_progress,
+                min_clearance_gt,
             )
 
             if "reaction_margin" in flat_labels:
@@ -745,6 +813,9 @@ def parser():
     p.add_argument("--yopo-preserve-utility-delta-scale", type=float, default=None)
     p.add_argument("--yopo-preserve-safety-cost-threshold", type=float, default=None)
     p.add_argument("--yopo-preserve-safe-cost-threshold", type=float, default=None)
+    p.add_argument("--yopo-preserve-geometry-oracle-source", choices=["esdf_cost", "gt_clearance"], default="")
+    p.add_argument("--yopo-preserve-unsafe-clearance-m", type=float, default=None)
+    p.add_argument("--yopo-preserve-safe-clearance-m", type=float, default=None)
     p.add_argument("--yopo-preserve-safe-margin-m", type=float, default=None)
     p.add_argument("--yopo-preserve-oracle-min-progress", type=float, default=None)
     p.add_argument("--gt-risk-point-count", type=int, default=None)

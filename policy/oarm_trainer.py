@@ -9,7 +9,8 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from rich.progress import Progress
+from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard.writer import SummaryWriter
 
@@ -20,9 +21,10 @@ from OARM.loss import OARMLoss
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_state_transform import rotate_body2world, state_body2world
 from OARM.utils.checkpoint import load_oarm_checkpoint, make_oarm_checkpoint, validate_checkpoint_metadata
+from OARM.utils.gt_clearance import candidate_min_clearance_gt
 from OARM.utils.visible_free_distance import visible_free_distance_from_depth
 from OARM.utils.yopo_compat import ensure_yopo_path
-from OARM.utils.yopo_dataset_context import yopo_dataset_cfg
+from OARM.utils.yopo_dataset_context import resolve_dataset_dir, yopo_dataset_cfg
 
 ensure_yopo_path()
 from config.config import cfg
@@ -91,6 +93,9 @@ class OARMTrainer:
         yopo_preserve_safe_clearance_residual_weight=oarm_cfg.yopo_preserve_safe_clearance_residual_weight,
         yopo_preserve_safety_cost_threshold=oarm_cfg.yopo_preserve_safety_cost_threshold,
         yopo_preserve_safe_cost_threshold=oarm_cfg.yopo_preserve_safe_cost_threshold,
+        yopo_preserve_geometry_oracle_source=oarm_cfg.yopo_preserve_geometry_oracle_source,
+        yopo_preserve_unsafe_clearance_m=oarm_cfg.yopo_preserve_unsafe_clearance_m,
+        yopo_preserve_safe_clearance_m=oarm_cfg.yopo_preserve_safe_clearance_m,
         yopo_preserve_safety_pairwise_weight=oarm_cfg.yopo_preserve_safety_pairwise_weight,
         yopo_preserve_safety_pairwise_margin=oarm_cfg.yopo_preserve_safety_pairwise_margin,
         yopo_preserve_unsafe_delta_target=oarm_cfg.yopo_preserve_unsafe_delta_target,
@@ -107,6 +112,7 @@ class OARMTrainer:
         grad_clip_norm=1.0,
         use_fused_adamw=False,
         train_yield_head_only=False,
+        progress_bar=True,
     ):
         self.batch_size = batch_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -115,11 +121,12 @@ class OARMTrainer:
         self.traj_num = cfg["traj_num"]
         self.max_train_batches = max_train_batches
         self.max_val_batches = max_val_batches
-        self.dataset_root = dataset_root
+        self.dataset_root = resolve_dataset_dir(dataset_root)
         self.log_interval = max(1, int(log_interval)) if log_interval else None
         self.grad_clip_norm = float(grad_clip_norm) if grad_clip_norm is not None else 0.0
         self.use_fused_adamw = bool(use_fused_adamw)
         self.train_yield_head_only = bool(train_yield_head_only)
+        self.progress_bar = bool(progress_bar)
         self._frozen_output_rows = None
         self.a1_initialization_report = {}
         self.candidate_mode = candidate_mode
@@ -166,6 +173,11 @@ class OARMTrainer:
         self.yopo_preserve_safe_clearance_residual_weight = float(yopo_preserve_safe_clearance_residual_weight)
         self.yopo_preserve_safety_cost_threshold = float(yopo_preserve_safety_cost_threshold)
         self.yopo_preserve_safe_cost_threshold = float(yopo_preserve_safe_cost_threshold)
+        self.yopo_preserve_geometry_oracle_source = str(yopo_preserve_geometry_oracle_source)
+        self.yopo_preserve_unsafe_clearance_m = float(yopo_preserve_unsafe_clearance_m)
+        self.yopo_preserve_safe_clearance_m = float(yopo_preserve_safe_clearance_m)
+        if self.yopo_preserve_geometry_oracle_source not in {"esdf_cost", "gt_clearance"}:
+            raise ValueError(f"Unknown yopo_preserve_geometry_oracle_source: {self.yopo_preserve_geometry_oracle_source}")
         self.yopo_preserve_safety_pairwise_weight = float(yopo_preserve_safety_pairwise_weight)
         self.yopo_preserve_safety_pairwise_margin = float(yopo_preserve_safety_pairwise_margin)
         self.yopo_preserve_unsafe_delta_target = float(yopo_preserve_unsafe_delta_target)
@@ -187,7 +199,19 @@ class OARMTrainer:
         if save_on_exit:
             self._exit_func = atexit.register(self.save_model)
 
-        self.progress_log = Progress()
+        self.console = Console(force_terminal=self.progress_bar)
+        self.progress_log = Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=self.console,
+            transient=False,
+            refresh_per_second=2,
+            disable=not self.progress_bar,
+        )
         self.tensorboard_path = self.get_next_log_path(tensorboard_path)
         self.tensorboard_log = SummaryWriter(log_dir=self.tensorboard_path)
         self.write_experiment_artifacts(experiment_options or {}, config_path)
@@ -339,6 +363,9 @@ class OARMTrainer:
             if self.max_train_batches is not None and step >= self.max_train_batches:
                 break
             if batch[0].shape[0] != self.batch_size:
+                self.progress_log.update(one_epoch_progress, advance=1)
+                if total_progress is not None:
+                    self.progress_log.update(total_progress, advance=1)
                 continue
             global_step = epoch * total_steps + step
             self.optimizer.zero_grad(set_to_none=True)
@@ -384,6 +411,7 @@ class OARMTrainer:
             if self.max_val_batches is not None and step >= self.max_val_batches:
                 break
             if batch[0].shape[0] != self.batch_size:
+                self.progress_log.update(one_epoch_progress, advance=1)
                 continue
             loss_dict = self.forward_and_compute_loss(batch)
             total_loss = loss_dict["total_loss"]
@@ -506,6 +534,11 @@ class OARMTrainer:
             safe_and_unsafe_overlap_rate = torch.zeros((), device=self.device)
             geom_unsafe_and_margin_safe_rate = torch.zeros((), device=self.device)
             geom_safe_and_margin_unsafe_rate = torch.zeros((), device=self.device)
+            gt_min_clearance_mean = torch.zeros((), device=self.device)
+            gt_min_clearance_selected_mean = torch.zeros((), device=self.device)
+            gt_clearance_valid_rate = torch.zeros((), device=self.device)
+            gt_clearance_unsafe_candidate_rate = torch.zeros((), device=self.device)
+            gt_clearance_safe_candidate_rate = torch.zeros((), device=self.device)
             oracle_ce_primary_rate = torch.zeros((), device=self.device)
             oracle_ce_fallback_rate = torch.zeros((), device=self.device)
             if self.candidate_mode == "yopo_preserve_rerank":
@@ -524,7 +557,29 @@ class OARMTrainer:
                     margin_valid = None
 
                     safety_cost = loss_dict.get("safety_cost_per_candidate")
-                    if safety_cost is not None:
+                    if self.yopo_preserve_geometry_oracle_source == "gt_clearance":
+                        sampled_pos_w = loss_dict.get("sampled_pos_w")
+                        if sampled_pos_w is None:
+                            raise RuntimeError("GT clearance oracle requires sampled_pos_w from OARMLoss")
+                        min_clearance = candidate_min_clearance_gt(sampled_pos_w, map_id_expanded, self.dataset_root).reshape_as(delta)
+                        clearance_valid = torch.isfinite(min_clearance) & finite_delta
+                        geom_unsafe = clearance_valid & (min_clearance < self.yopo_preserve_unsafe_clearance_m)
+                        geom_safe = clearance_valid & (min_clearance > self.yopo_preserve_safe_clearance_m)
+                        gt_clearance_valid_rate = clearance_valid.float().mean()
+                        if bool(clearance_valid.any()):
+                            gt_min_clearance_mean = min_clearance[clearance_valid].mean()
+                        selected_id = flat.get("utility_score", delta).reshape(-1, self.traj_num).argmax(dim=1)
+                        selected_clearance = min_clearance.reshape(-1, self.traj_num).gather(1, selected_id[:, None]).squeeze(1)
+                        selected_valid = torch.isfinite(selected_clearance)
+                        if bool(selected_valid.any()):
+                            gt_min_clearance_selected_mean = selected_clearance[selected_valid].mean()
+                        gt_clearance_unsafe_candidate_rate = geom_unsafe.float().mean()
+                        gt_clearance_safe_candidate_rate = geom_safe.float().mean()
+                        safety_candidate_rate = gt_clearance_unsafe_candidate_rate
+                        safe_clearance_candidate_rate = gt_clearance_safe_candidate_rate
+                        geom_unsafe_mask_rate = safety_candidate_rate
+                        geom_safe_mask_rate = safe_clearance_candidate_rate
+                    elif safety_cost is not None:
                         safety_cost = safety_cost.to(self.device).reshape_as(delta).float()
                         safety_valid = torch.isfinite(safety_cost) & finite_delta
                         geom_unsafe = safety_valid & (safety_cost > self.yopo_preserve_safety_cost_threshold)
@@ -690,6 +745,11 @@ class OARMTrainer:
             loss_dict["safe_and_unsafe_overlap_rate"] = safe_and_unsafe_overlap_rate
             loss_dict["geom_unsafe_and_margin_safe_rate"] = geom_unsafe_and_margin_safe_rate
             loss_dict["geom_safe_and_margin_unsafe_rate"] = geom_safe_and_margin_unsafe_rate
+            loss_dict["gt_min_clearance_mean"] = gt_min_clearance_mean
+            loss_dict["gt_min_clearance_selected_mean"] = gt_min_clearance_selected_mean
+            loss_dict["gt_clearance_valid_rate"] = gt_clearance_valid_rate
+            loss_dict["gt_clearance_unsafe_candidate_rate"] = gt_clearance_unsafe_candidate_rate
+            loss_dict["gt_clearance_safe_candidate_rate"] = gt_clearance_safe_candidate_rate
 
             loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
             loss_dict["total_loss"] = (

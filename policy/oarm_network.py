@@ -77,8 +77,10 @@ class OARMNetwork(nn.Module):
         adapted = self.preserve_network.adapt_legacy_aux_state_dict(state_dict)
         missing, unexpected = super().load_state_dict(adapted, strict=False)
         allowed_missing = []
-        if self.candidate_mode == "yopo_preserve_rerank":
-            allowed_missing.extend([key for key in missing if key.startswith("preserve_network.rerank_head.")])
+        # Older A1 yopo_preserve checkpoints predate the split rerank head.
+        # The head is unused unless candidate_mode=yopo_preserve_rerank, so it is
+        # safe to leave it randomly initialized for A1 geometry diagnostics.
+        allowed_missing.extend([key for key in missing if key.startswith("preserve_network.rerank_head.")])
         allowed_missing.extend([key for key in missing if key.startswith("preserve_network.margin_risk_head.") and any(k.startswith("preserve_network.aux_head.") for k in state_dict)])
         bad_missing = sorted(set(missing) - set(allowed_missing))
         if strict and (bad_missing or unexpected):

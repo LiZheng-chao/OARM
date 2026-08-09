@@ -62,6 +62,9 @@ TRAINING_OPTION_KEYS = (
     "yopo_preserve_safe_clearance_residual_weight",
     "yopo_preserve_safety_cost_threshold",
     "yopo_preserve_safe_cost_threshold",
+    "yopo_preserve_geometry_oracle_source",
+    "yopo_preserve_unsafe_clearance_m",
+    "yopo_preserve_safe_clearance_m",
     "yopo_preserve_safety_pairwise_weight",
     "yopo_preserve_safety_pairwise_margin",
     "yopo_preserve_unsafe_delta_target",
@@ -119,6 +122,9 @@ def parser():
     p.add_argument("--train-yaw-visibility", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
     p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="")
+    p.add_argument("--yopo-preserve-geometry-oracle-source", choices=["esdf_cost", "gt_clearance"], default="")
+    p.add_argument("--yopo-preserve-unsafe-clearance-m", type=float, default=None)
+    p.add_argument("--yopo-preserve-safe-clearance-m", type=float, default=None)
     p.add_argument("--gt-risk-point-count", type=int, default=None)
     p.add_argument("--gt-hidden-depth-margin-m", type=float, default=None)
     p.add_argument("--gt-min-forward-m", type=float, default=None)
@@ -149,6 +155,7 @@ def parser():
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
     p.add_argument("--use-fused-adamw", action="store_true")
     p.add_argument("--train-yield-head-only", action="store_true")
+    p.add_argument("--no-progress-bar", action="store_true", help="disable the live Rich progress bar; useful for clean log files")
     return p
 
 
@@ -215,6 +222,8 @@ def resolve_training_options(args):
         options["deployed_yaw_mode"] = args.deployed_yaw_mode
     if args.risk_label_source:
         options["risk_label_source"] = args.risk_label_source
+    if args.yopo_preserve_geometry_oracle_source:
+        options["yopo_preserve_geometry_oracle_source"] = args.yopo_preserve_geometry_oracle_source
     for key in (
         "gt_risk_point_count",
         "gt_hidden_depth_margin_m",
@@ -234,6 +243,8 @@ def resolve_training_options(args):
         "risk_assoc_distance_m",
         "risk_assoc_sigma_m",
         "risk_arrival_radius_m",
+        "yopo_preserve_unsafe_clearance_m",
+        "yopo_preserve_safe_clearance_m",
     ):
         value = getattr(args, key)
         if value is not None and value != "":
@@ -297,6 +308,7 @@ if __name__ == "__main__":
             "grad_clip_norm": args.grad_clip_norm,
             "use_fused_adamw": args.use_fused_adamw,
             "train_yield_head_only": args.train_yield_head_only,
+            "progress_bar": not args.no_progress_bar,
             **training_options,
         },
         config_path=args.config,
@@ -305,5 +317,6 @@ if __name__ == "__main__":
         grad_clip_norm=args.grad_clip_norm,
         use_fused_adamw=args.use_fused_adamw,
         train_yield_head_only=args.train_yield_head_only,
+        progress_bar=not args.no_progress_bar,
     )
     trainer.train(epoch=args.epoch)

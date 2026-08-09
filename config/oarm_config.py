@@ -105,6 +105,9 @@ class OARMConfig:
     yopo_preserve_safe_clearance_residual_weight: float = 0.0
     yopo_preserve_safety_cost_threshold: float = 0.01
     yopo_preserve_safe_cost_threshold: float = 0.001
+    yopo_preserve_geometry_oracle_source: str = "esdf_cost"
+    yopo_preserve_unsafe_clearance_m: float = 0.25
+    yopo_preserve_safe_clearance_m: float = 0.35
     yopo_preserve_safety_pairwise_weight: float = 0.0
     yopo_preserve_safety_pairwise_margin: float = 0.20
     yopo_preserve_unsafe_delta_target: float = 0.0

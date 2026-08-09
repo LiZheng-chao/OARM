@@ -139,6 +139,7 @@ class OARMLoss(nn.Module):
             "progress_bonus_cost": progress_bonus_cost.mean(),
             "agility_time_cost": agility_time_cost.mean(),
             "stop_type_rate": stop_type.mean(),
+            "sampled_pos_w": pos.detach(),
         }
 
         if labels is not None and "safety_cost" in labels:
