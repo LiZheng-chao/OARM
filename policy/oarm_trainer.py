@@ -639,7 +639,7 @@ class OARMTrainer:
                             primary_available = safe_group.any(dim=1)
                             fallback_available = torch.zeros_like(primary_available)
                             if geom_safe is not None and margin_valid is not None:
-                                fallback = geom_safe & margin_valid & ~final_unsafe
+                                fallback = geom_safe & margin_valid
                                 if progress_ok is not None:
                                     fallback = fallback & progress_ok
                                 fallback_group = fallback.reshape(-1, self.traj_num)

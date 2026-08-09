@@ -343,8 +343,8 @@ def selected_candidate_stats(candidate, accumulator, args, flat_labels=None, saf
     if safety_cost is not None:
         flat_safety = safety_cost.reshape(batch_size, -1).to(device=utility.device, dtype=utility.dtype)
         finite_safety = torch.isfinite(flat_safety)
-        geom_unsafe = finite_safety & (flat_safety > oarm_cfg.yopo_preserve_safety_cost_threshold)
-        geom_safe = finite_safety & (flat_safety <= oarm_cfg.yopo_preserve_safe_cost_threshold)
+        geom_unsafe = finite_safety & (flat_safety > args.yopo_preserve_safety_cost_threshold)
+        geom_safe = finite_safety & (flat_safety <= args.yopo_preserve_safe_cost_threshold)
         selected_safety = flat_safety.gather(1, best_id[:, None]).squeeze(1)
         selected_safety_valid = torch.isfinite(selected_safety)
         if bool(selected_safety_valid.any()):
