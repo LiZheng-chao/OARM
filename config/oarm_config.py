@@ -109,6 +109,12 @@ class OARMConfig:
     yopo_preserve_safety_pairwise_margin: float = 0.20
     yopo_preserve_unsafe_delta_target: float = 0.0
     yopo_preserve_safe_delta_target: float = 0.0
+    # A3h: isolate A1 margin/risk representation and train reranking directly.
+    yopo_preserve_freeze_margin_risk_head: bool = False
+    yopo_preserve_oracle_ce_weight: float = 0.0
+    yopo_preserve_oracle_ce_temperature: float = 0.5
+    yopo_preserve_oracle_min_margin: float = 0.0
+    yopo_preserve_oracle_min_progress: float = 0.0
     yaw_weight: float = 0.05
     yaw_early_time_tau: float = 0.6
     braking_weight: float = 0.05

@@ -122,6 +122,25 @@ def finalize_metrics(accumulator):
     return metrics
 
 
+def checkpoint_training_option(metadata, key, default=None):
+    if not metadata:
+        return default
+    if key in metadata and metadata[key] is not None:
+        return metadata[key]
+    training_options = metadata.get("training_options") or {}
+    return training_options.get(key, default)
+
+
+def resolve_utility_delta_scale(args, checkpoint_metadata):
+    if args.yopo_preserve_utility_delta_scale is not None:
+        return float(args.yopo_preserve_utility_delta_scale)
+    stored = checkpoint_training_option(checkpoint_metadata, "yopo_preserve_utility_delta_scale")
+    if stored is not None:
+        return float(stored)
+    preset = get_oarm_training_preset(args.stage)
+    return float(getattr(preset, "yopo_preserve_utility_delta_scale", oarm_cfg.yopo_preserve_utility_delta_scale))
+
+
 def flatten_labels(labels, flat, device, args):
     flat_labels = {}
     if args.eval_occlusion_risk and "occlusion_risk" in labels:
@@ -266,7 +285,7 @@ def maybe_generate_reaction_margin_labels(
     return flat_labels
 
 
-def selected_candidate_stats(candidate, accumulator, flat_labels=None):
+def selected_candidate_stats(candidate, accumulator, flat_labels=None, safety_cost=None, progress=None):
     utility = candidate.utility_score.reshape(candidate.utility_score.shape[0], -1)
     best_id = utility.argmax(dim=1)
     batch_size = utility.shape[0]
@@ -274,6 +293,29 @@ def selected_candidate_stats(candidate, accumulator, flat_labels=None):
 
     flat_time = candidate.traj_time.reshape(batch_size, -1)
     add_metric(accumulator, "selected_time", flat_time.gather(1, best_id[:, None]).mean(), batch_size)
+
+    flat_safety = None
+    finite_safety = None
+    geom_unsafe = None
+    geom_safe = None
+    if safety_cost is not None:
+        flat_safety = safety_cost.reshape(batch_size, -1).to(device=utility.device, dtype=utility.dtype)
+        finite_safety = torch.isfinite(flat_safety)
+        geom_unsafe = finite_safety & (flat_safety > oarm_cfg.yopo_preserve_safety_cost_threshold)
+        geom_safe = finite_safety & (flat_safety <= oarm_cfg.yopo_preserve_safe_cost_threshold)
+        selected_safety = flat_safety.gather(1, best_id[:, None]).squeeze(1)
+        selected_safety_valid = torch.isfinite(selected_safety)
+        if bool(selected_safety_valid.any()):
+            add_metric(accumulator, "selected_safety_cost", selected_safety[selected_safety_valid].mean(), int(selected_safety_valid.sum().item()))
+            add_metric(
+                accumulator,
+                "selected_geom_unsafe_candidate_rate",
+                (selected_safety[selected_safety_valid] > oarm_cfg.yopo_preserve_safety_cost_threshold).float().mean(),
+                int(selected_safety_valid.sum().item()),
+            )
+        add_metric(accumulator, "geom_unsafe_candidate_rate", geom_unsafe.float().mean(), batch_size)
+        add_metric(accumulator, "geom_safe_candidate_rate", geom_safe.float().mean(), batch_size)
+        add_metric(accumulator, "geom_safe_candidate_available_rate", geom_safe.any(dim=1).float().mean(), batch_size)
 
     if candidate.risk_logit is not None:
         flat_risk = torch.sigmoid(candidate.risk_logit.reshape(batch_size, -1))
@@ -311,11 +353,13 @@ def selected_candidate_stats(candidate, accumulator, flat_labels=None):
             add_metric(accumulator, "selected_reaction_margin", selected_valid.mean(), selected_weight)
             add_metric(accumulator, "selected_reaction_margin_violation_rate", (selected_valid < 0.0).float().mean(), selected_weight)
             add_metric(accumulator, "selected_rmvr", (selected_valid < 0.0).float().mean(), selected_weight)
+
         oracle_valid = finite_margin.any(dim=1)
         oracle_source = flat_margin.masked_fill(~finite_margin, -torch.inf)
         oracle_margin, oracle_id = oracle_source.max(dim=1)
-        safe_available = (oracle_margin > 0.0) & oracle_valid
-        add_metric(accumulator, "safe_candidate_available_rate", safe_available.float().mean(), batch_size)
+        positive_margin_available = (oracle_margin > 0.0) & oracle_valid
+        add_metric(accumulator, "safe_candidate_available_rate", positive_margin_available.float().mean(), batch_size)
+        add_metric(accumulator, "positive_margin_candidate_available_rate", positive_margin_available.float().mean(), batch_size)
         if bool(oracle_valid.any()):
             oracle_valid_margin = oracle_margin[oracle_valid]
             oracle_weight = int(oracle_valid_margin.numel())
@@ -323,18 +367,67 @@ def selected_candidate_stats(candidate, accumulator, flat_labels=None):
             add_metric(accumulator, "oracle_margin_selected_rate", (best_id[oracle_valid] == oracle_id[oracle_valid]).float().mean(), oracle_weight)
         gap_mask = oracle_valid & selected_finite
         if bool(gap_mask.any()):
-            selected_safe = selected_margin[gap_mask] > 0.0
+            selected_positive = selected_margin[gap_mask] > 0.0
             gap_weight = int(gap_mask.float().sum().item())
             oracle_gap = oracle_margin[gap_mask] - selected_margin[gap_mask]
             add_metric(accumulator, "margin_oracle_gap", oracle_gap.mean(), gap_weight)
-            add_metric(accumulator, "safe_candidate_missed_rate", (safe_available[gap_mask] & ~selected_safe).float().mean(), gap_weight)
+            missed = positive_margin_available[gap_mask] & ~selected_positive
+            add_metric(accumulator, "safe_candidate_missed_rate", missed.float().mean(), gap_weight)
+            add_metric(accumulator, "positive_margin_candidate_missed_rate", missed.float().mean(), gap_weight)
+
+        if geom_safe is None:
+            geom_safe_for_oracle = torch.ones_like(finite_margin, dtype=torch.bool)
+            geom_unsafe_for_oracle = torch.zeros_like(finite_margin, dtype=torch.bool)
+        else:
+            geom_safe_for_oracle = geom_safe
+            geom_unsafe_for_oracle = geom_unsafe
+        margin_unsafe = finite_margin & (flat_margin < 0.0)
+        margin_safe = finite_margin & (flat_margin > oarm_cfg.yopo_preserve_safe_margin_m)
+        final_unsafe = geom_unsafe_for_oracle | margin_unsafe
+        safety_oracle_mask = geom_safe_for_oracle & margin_safe & ~final_unsafe
+        if progress is not None and oarm_cfg.yopo_preserve_oracle_min_progress > 0.0:
+            flat_progress = progress.reshape(batch_size, -1).to(device=utility.device, dtype=utility.dtype)
+            progress_ok = torch.isfinite(flat_progress) & (flat_progress > oarm_cfg.yopo_preserve_oracle_min_progress)
+            safety_oracle_mask = safety_oracle_mask & progress_ok
+            add_metric(accumulator, "safety_oracle_progress_ok_rate", progress_ok.float().mean(), batch_size)
+        add_metric(accumulator, "safety_oracle_safe_mask_rate", safety_oracle_mask.float().mean(), batch_size)
+        add_metric(accumulator, "safety_oracle_unsafe_mask_rate", final_unsafe.float().mean(), batch_size)
+        add_metric(accumulator, "safety_oracle_overlap_rate", (safety_oracle_mask & final_unsafe).float().mean(), batch_size)
+        safety_available = safety_oracle_mask.any(dim=1)
+        add_metric(accumulator, "safety_constrained_candidate_available_rate", safety_available.float().mean(), batch_size)
+        if bool(safety_available.any()):
+            safety_source = flat_margin.masked_fill(~safety_oracle_mask, -torch.inf)
+            safety_oracle_margin, safety_oracle_id = safety_source.max(dim=1)
+            available_weight = int(safety_available.sum().item())
+            selected_safety_ok = safety_oracle_mask.gather(1, best_id[:, None]).squeeze(1)
+            add_metric(
+                accumulator,
+                "safety_constrained_oracle_selected_rate",
+                (best_id[safety_available] == safety_oracle_id[safety_available]).float().mean(),
+                available_weight,
+            )
+            add_metric(
+                accumulator,
+                "safety_constrained_safe_missed_rate",
+                (~selected_safety_ok[safety_available]).float().mean(),
+                available_weight,
+            )
+            safety_gap_mask = safety_available & selected_finite
+            if bool(safety_gap_mask.any()):
+                gap_weight = int(safety_gap_mask.sum().item())
+                add_metric(
+                    accumulator,
+                    "safety_constrained_oracle_gap",
+                    (safety_oracle_margin[safety_gap_mask] - selected_margin[safety_gap_mask]).mean(),
+                    gap_weight,
+                )
+
         if candidate.candidate_type is not None and bool(oracle_valid.any()):
             flat_type = candidate.candidate_type.reshape(batch_size, -1)
             oracle_type = flat_type.gather(1, oracle_id[:, None]).squeeze(1)[oracle_valid]
             oracle_weight = int(oracle_type.numel())
             for type_id, name in TYPE_NAMES.items():
                 add_metric(accumulator, f"oracle_{name}_rate", (oracle_type == type_id).float().mean(), oracle_weight)
-
 
 def evaluate(args):
     apply_eval_stage(args)
@@ -352,13 +445,19 @@ def evaluate(args):
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
+    state_dict = None
+    checkpoint_metadata = {}
+    if args.checkpoint:
+        state_dict, checkpoint_metadata = load_oarm_checkpoint(args.checkpoint, map_location=device)
+    args.yopo_preserve_utility_delta_scale = resolve_utility_delta_scale(args, checkpoint_metadata)
+
     policy = OARMNetwork(
         candidate_mode=args.candidate_mode,
         backbone_mode=args.backbone_mode,
         enable_yield_candidates=args.enable_yield_candidates,
+        utility_delta_scale=args.yopo_preserve_utility_delta_scale,
     ).to(device)
     if args.checkpoint:
-        state_dict, checkpoint_metadata = load_oarm_checkpoint(args.checkpoint, map_location=device)
         if args.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             is_oarm_preserve_checkpoint = any(key.startswith("preserve_network.") for key in state_dict)
             if is_oarm_preserve_checkpoint:
@@ -370,6 +469,7 @@ def evaluate(args):
                     enable_yield_candidates=args.enable_yield_candidates,
                     deployed_yaw_mode=args.deployed_yaw_mode,
                     risk_label_source=args.risk_label_source,
+                    yopo_preserve_utility_delta_scale=args.yopo_preserve_utility_delta_scale,
                 )
                 policy.load_state_dict(state_dict)
                 print(f"Loaded OARM {args.candidate_mode} checkpoint: {args.checkpoint}")
@@ -385,6 +485,7 @@ def evaluate(args):
                 enable_yield_candidates=args.enable_yield_candidates,
                 deployed_yaw_mode=args.deployed_yaw_mode,
                 risk_label_source=args.risk_label_source,
+                yopo_preserve_utility_delta_scale=args.yopo_preserve_utility_delta_scale,
             )
             policy.load_state_dict(state_dict)
             print(f"Loaded checkpoint: {args.checkpoint}")
@@ -453,7 +554,14 @@ def evaluate(args):
                 if torch.is_tensor(value) and value.dim() == 0:
                     add_metric(accumulator, key, value, batch_size)
 
-            selected_candidate_stats(candidate, accumulator, flat_labels)
+            selected_progress = -OARMLoss.goal_progress_cost(start_state_w, end_state_w, goal_w, flat["traj_time"]).detach()
+            selected_candidate_stats(
+                candidate,
+                accumulator,
+                flat_labels,
+                loss_dict.get("safety_cost_per_candidate"),
+                selected_progress,
+            )
 
             if "reaction_margin" in flat_labels:
                 margin_valid = flat_labels.get("reaction_margin_valid")
@@ -542,6 +650,7 @@ def evaluate(args):
     metrics["enable_yield_candidates"] = bool(args.enable_yield_candidates)
     metrics["deployed_yaw_mode"] = args.deployed_yaw_mode
     metrics["risk_label_source"] = args.risk_label_source
+    metrics["yopo_preserve_utility_delta_scale"] = args.yopo_preserve_utility_delta_scale
     for key in GT_SAMPLER_ARG_KEYS:
         metrics[key] = getattr(args, key)
     metrics["eval_yaw_visibility"] = bool(args.eval_yaw_visibility)
@@ -577,6 +686,7 @@ def parser():
     p.add_argument("--enable-yield-candidates", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
     p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="")
+    p.add_argument("--yopo-preserve-utility-delta-scale", type=float, default=None)
     p.add_argument("--gt-risk-point-count", type=int, default=None)
     p.add_argument("--gt-hidden-depth-margin-m", type=float, default=None)
     p.add_argument("--gt-min-forward-m", type=float, default=None)

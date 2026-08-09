@@ -52,20 +52,25 @@ class YOPOPreserveOARMNetwork(nn.Module):
         self.image_backbone = YopoBackbone(hidden_state)
         self.state_backbone = nn.Sequential()
         self.yopo_head = YopoHead(hidden_state + observation_dim, 10)
-        aux_channels = 3 if self.enable_utility_delta else 2
-        self.aux_head = nn.Sequential(
+        self.margin_risk_head = nn.Sequential(
             nn.Conv2d(hidden_state + observation_dim, 128, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, aux_channels, kernel_size=1),
+            nn.Conv2d(128, 2, kernel_size=1),
         )
-        self.reset_aux_head()
+        self.rerank_head = nn.Sequential(
+            nn.Conv2d(hidden_state + observation_dim, 128, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 1, kernel_size=1),
+        )
+        self.reset_aux_heads()
         if freeze_yopo_base:
             self.freeze_yopo_base()
 
-    def reset_aux_head(self):
-        final = self.aux_head[-1]
-        nn.init.zeros_(final.weight)
-        nn.init.zeros_(final.bias)
+    def reset_aux_heads(self):
+        for head in (self.margin_risk_head, self.rerank_head):
+            final = head[-1]
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
 
     def freeze_yopo_base(self):
         for module in (self.image_backbone, self.state_backbone, self.yopo_head):
@@ -80,10 +85,39 @@ class YOPOPreserveOARMNetwork(nn.Module):
     def train(self, mode: bool = True):
         super().train(mode)
         self.freeze_yopo_base_state()
-        self.aux_head.train(mode)
+        self.margin_risk_head.train(mode)
+        self.rerank_head.train(mode)
         return self
 
+    def adapt_legacy_aux_state_dict(self, state_dict):
+        adapted = dict(state_dict)
+        prefix = ""
+        if any(key.startswith("preserve_network.") for key in adapted):
+            prefix = "preserve_network."
+
+        old_prefix = prefix + "aux_head."
+        margin_prefix = prefix + "margin_risk_head."
+        rerank_prefix = prefix + "rerank_head."
+        if old_prefix + "0.weight" not in adapted:
+            return adapted
+
+        shared_weight = adapted.pop(old_prefix + "0.weight")
+        shared_bias = adapted.pop(old_prefix + "0.bias")
+        adapted[margin_prefix + "0.weight"] = shared_weight
+        adapted[margin_prefix + "0.bias"] = shared_bias
+        adapted[rerank_prefix + "0.weight"] = shared_weight.clone()
+        adapted[rerank_prefix + "0.bias"] = shared_bias.clone()
+        final_weight = adapted.pop(old_prefix + "2.weight")
+        final_bias = adapted.pop(old_prefix + "2.bias")
+        adapted[margin_prefix + "2.weight"] = final_weight[:2].clone()
+        adapted[margin_prefix + "2.bias"] = final_bias[:2].clone()
+        if final_weight.shape[0] >= 3:
+            adapted[rerank_prefix + "2.weight"] = final_weight[2:3].clone()
+            adapted[rerank_prefix + "2.bias"] = final_bias[2:3].clone()
+        return adapted
+
     def load_yopo_state_dict(self, state_dict, strict=True):
+        state_dict = self.adapt_legacy_aux_state_dict(state_dict)
         own_state = self.state_dict()
         adapted = {}
         for key, value in state_dict.items():
@@ -92,7 +126,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
             elif key.startswith("module.") and key[len("module.") :] in own_state:
                 adapted[key[len("module.") :]] = value
         missing, unexpected = self.load_state_dict(adapted, strict=False)
-        missing = [key for key in missing if not key.startswith("aux_head.")]
+        missing = [key for key in missing if not key.startswith("margin_risk_head.") and not key.startswith("rerank_head.")]
         if strict and (missing or unexpected):
             raise RuntimeError(
                 "YOPO checkpoint did not match YOPO-preserve network: "
@@ -110,7 +144,13 @@ class YOPOPreserveOARMNetwork(nn.Module):
             output = self.yopo_head(features)
             endstate_pred = torch.tanh(output[:, :9])
             score_pred = torch.nn.functional.softplus(output[:, 9])
-        aux = self.aux_head(features.detach())
+        detached_features = features.detach()
+        margin_risk = self.margin_risk_head(detached_features)
+        if self.enable_utility_delta:
+            utility_delta_raw = self.rerank_head(detached_features)
+            aux = torch.cat((margin_risk, utility_delta_raw), dim=1)
+        else:
+            aux = margin_risk
         return endstate_pred, score_pred, aux
 
     def inference(self, depth: torch.Tensor, obs: torch.Tensor) -> OARMCandidate:

@@ -1,0 +1,36 @@
+# A3h: YOPO-preserve reranker with split heads and safety-constrained listwise oracle.
+candidate_mode: yopo_preserve_rerank
+backbone_mode: yopo_original
+train_occlusion_risk: true
+train_reaction_margin: true
+train_margin_ranking: false
+risk_label_source: gt_pointcloud
+use_privileged_risk_filter: true
+use_occlusion_aware_visibility: true
+use_esdf_collision: true
+deployed_yaw_mode: goal
+
+# Keep YOPO as the base policy, but allow the learned residual to move rankings enough.
+yopo_preserve_utility_delta_scale: 1.0
+yopo_preserve_residual_reg_weight: 0.05
+
+# Freeze the A1 margin/risk representation; train only the independent rerank head.
+yopo_preserve_freeze_margin_risk_head: true
+
+# Direct top-1 supervision: choose geometry-safe, progress-capable, positive-margin oracle candidates.
+yopo_preserve_oracle_ce_weight: 2.0
+yopo_preserve_oracle_ce_temperature: 0.5
+yopo_preserve_oracle_min_margin: 0.0
+yopo_preserve_oracle_min_progress: 0.05
+
+# Keep conservative safety penalties, but masks are geometry-first and mutually exclusive.
+yopo_preserve_unsafe_boost_weight: 0.15
+yopo_preserve_safe_suppression_weight: 0.0
+yopo_preserve_safety_residual_weight: 0.5
+yopo_preserve_safe_clearance_residual_weight: 0.1
+yopo_preserve_safety_cost_threshold: 0.01
+yopo_preserve_safe_cost_threshold: 0.001
+yopo_preserve_safety_pairwise_weight: 1.0
+yopo_preserve_safety_pairwise_margin: 0.2
+yopo_preserve_unsafe_delta_target: 0.05
+yopo_preserve_safe_delta_target: 0.0

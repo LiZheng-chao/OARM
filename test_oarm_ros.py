@@ -246,11 +246,24 @@ class OARMNet:
         self.executed_path = Path()
         self.executed_path.header.frame_id = "world"
 
+        utility_delta_scale = self.config.get("yopo_preserve_utility_delta_scale")
+        if utility_delta_scale is None and self.checkpoint_path and os.path.isfile(self.checkpoint_path):
+            try:
+                _state_dict_for_scale, scale_metadata = load_oarm_checkpoint(self.checkpoint_path, map_location="cpu")
+                utility_delta_scale = scale_metadata.get("yopo_preserve_utility_delta_scale")
+                if utility_delta_scale is None:
+                    utility_delta_scale = (scale_metadata.get("training_options") or {}).get("yopo_preserve_utility_delta_scale")
+            except Exception as exc:
+                rospy.logwarn(f"Could not inspect checkpoint utility_delta_scale; using default 0.35: {exc}")
+        if utility_delta_scale is None:
+            utility_delta_scale = 0.35
+        self.config["yopo_preserve_utility_delta_scale"] = float(utility_delta_scale)
+
         self.policy = OARMNetwork(
             candidate_mode=self.config.get("candidate_mode", "typed_frontier"),
             backbone_mode=self.config.get("backbone_mode", "yopo_original"),
             enable_yield_candidates=self.config.get("enable_yield_candidates", False),
-            utility_delta_scale=self.config.get("yopo_preserve_utility_delta_scale", 0.35),
+            utility_delta_scale=self.config["yopo_preserve_utility_delta_scale"],
         ).to(self.device)
         self.load_policy(weight)
         self.policy.eval()
@@ -297,6 +310,7 @@ class OARMNet:
                     allow_mismatch=self.config.get("allow_checkpoint_mismatch", False),
                     enable_yield_candidates=self.config.get("enable_yield_candidates", False),
                     deployed_yaw_mode=self.config.get("deployed_yaw_mode", "goal"),
+                    yopo_preserve_utility_delta_scale=self.config.get("yopo_preserve_utility_delta_scale", 0.35),
                 )
                 self.policy.load_state_dict(state_dict)
                 rospy.loginfo(f"Loaded OARM {candidate_mode} checkpoint: {weight}")
@@ -311,6 +325,7 @@ class OARMNet:
             allow_mismatch=self.config.get("allow_checkpoint_mismatch", False),
             enable_yield_candidates=self.config.get("enable_yield_candidates", False),
             deployed_yaw_mode=self.config.get("deployed_yaw_mode", "goal"),
+            yopo_preserve_utility_delta_scale=self.config.get("yopo_preserve_utility_delta_scale", 0.35),
         )
         self.policy.load_state_dict(state_dict)
 
@@ -1663,7 +1678,7 @@ def parser():
     parser.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="yopo_original")
     parser.add_argument("--enable-yield-candidates", action="store_true")
     parser.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="goal")
-    parser.add_argument("--yopo-preserve-utility-delta-scale", type=float, default=0.35)
+    parser.add_argument("--yopo-preserve-utility-delta-scale", type=float, default=None)
     parser.add_argument("--allow-checkpoint-mismatch", action="store_true")
     return parser
 

@@ -22,6 +22,7 @@ def make_oarm_checkpoint(
     enable_yield_candidates=None,
     deployed_yaw_mode=None,
     risk_label_source=None,
+    yopo_preserve_utility_delta_scale=None,
 ):
     training_options = dict(training_options or {})
     if enable_yield_candidates is None:
@@ -30,6 +31,8 @@ def make_oarm_checkpoint(
         deployed_yaw_mode = training_options.get("deployed_yaw_mode")
     if risk_label_source is None:
         risk_label_source = training_options.get("risk_label_source")
+    if yopo_preserve_utility_delta_scale is None:
+        yopo_preserve_utility_delta_scale = training_options.get("yopo_preserve_utility_delta_scale")
     return {
         "state_dict": state_dict,
         "candidate_mode": candidate_mode,
@@ -37,6 +40,7 @@ def make_oarm_checkpoint(
         "enable_yield_candidates": enable_yield_candidates,
         "deployed_yaw_mode": deployed_yaw_mode,
         "risk_label_source": risk_label_source,
+        "yopo_preserve_utility_delta_scale": yopo_preserve_utility_delta_scale,
         "stage": training_options.get("stage"),
         "train_yaw_visibility": training_options.get("train_yaw_visibility"),
         "train_margin_ranking": training_options.get("train_margin_ranking"),
@@ -53,6 +57,7 @@ def validate_checkpoint_metadata(
     enable_yield_candidates=None,
     deployed_yaw_mode=None,
     risk_label_source=None,
+    yopo_preserve_utility_delta_scale=None,
 ):
     mismatches = []
     expected = {
@@ -65,13 +70,24 @@ def validate_checkpoint_metadata(
         expected["deployed_yaw_mode"] = deployed_yaw_mode
     if risk_label_source is not None:
         expected["risk_label_source"] = risk_label_source
+    if yopo_preserve_utility_delta_scale is not None:
+        expected["yopo_preserve_utility_delta_scale"] = float(yopo_preserve_utility_delta_scale)
     for key, value in expected.items():
         stored = metadata.get(key)
         if stored is None:
             training_options = metadata.get("training_options") or {}
             stored = training_options.get(key)
-        if stored is not None and str(stored) != str(value):
-            mismatches.append(f"{key}: checkpoint={stored}, requested={value}")
+        if stored is None:
+            continue
+        if key == "yopo_preserve_utility_delta_scale":
+            try:
+                mismatch = abs(float(stored) - float(value)) > 1e-6
+            except (TypeError, ValueError):
+                mismatch = True
+        else:
+            mismatch = str(stored) != str(value)
+        if mismatch:
+            mismatches.append(f'{key}: checkpoint={stored}, requested={value}')
     if not mismatches:
         return
     message = "OARM checkpoint metadata mismatch: " + "; ".join(mismatches)

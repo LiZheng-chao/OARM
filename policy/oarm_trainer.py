@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from rich.progress import Progress
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -79,7 +80,12 @@ class OARMTrainer:
         use_esdf_collision=oarm_cfg.use_esdf_collision,
         use_occlusion_aware_visibility=oarm_cfg.use_occlusion_aware_visibility,
         use_privileged_risk_filter=oarm_cfg.use_privileged_risk_filter,
+        ranking_weight=oarm_cfg.ranking_weight,
         yopo_preserve_utility_delta_scale=oarm_cfg.yopo_preserve_utility_delta_scale,
+        yopo_preserve_residual_reg_weight=oarm_cfg.yopo_preserve_residual_reg_weight,
+        yopo_preserve_unsafe_boost_weight=oarm_cfg.yopo_preserve_unsafe_boost_weight,
+        yopo_preserve_safe_suppression_weight=oarm_cfg.yopo_preserve_safe_suppression_weight,
+        yopo_preserve_safe_margin_m=oarm_cfg.yopo_preserve_safe_margin_m,
         yopo_preserve_safety_residual_weight=oarm_cfg.yopo_preserve_safety_residual_weight,
         yopo_preserve_safe_clearance_residual_weight=oarm_cfg.yopo_preserve_safe_clearance_residual_weight,
         yopo_preserve_safety_cost_threshold=oarm_cfg.yopo_preserve_safety_cost_threshold,
@@ -88,6 +94,11 @@ class OARMTrainer:
         yopo_preserve_safety_pairwise_margin=oarm_cfg.yopo_preserve_safety_pairwise_margin,
         yopo_preserve_unsafe_delta_target=oarm_cfg.yopo_preserve_unsafe_delta_target,
         yopo_preserve_safe_delta_target=oarm_cfg.yopo_preserve_safe_delta_target,
+        yopo_preserve_freeze_margin_risk_head=oarm_cfg.yopo_preserve_freeze_margin_risk_head,
+        yopo_preserve_oracle_ce_weight=oarm_cfg.yopo_preserve_oracle_ce_weight,
+        yopo_preserve_oracle_ce_temperature=oarm_cfg.yopo_preserve_oracle_ce_temperature,
+        yopo_preserve_oracle_min_margin=oarm_cfg.yopo_preserve_oracle_min_margin,
+        yopo_preserve_oracle_min_progress=oarm_cfg.yopo_preserve_oracle_min_progress,
         experiment_options=None,
         config_path="",
         log_interval=50,
@@ -143,7 +154,12 @@ class OARMTrainer:
         self.train_yield_feasibility = bool(train_backup_feasibility or train_yield_feasibility)
         self.train_backup_feasibility = self.train_yield_feasibility
         self.use_privileged_risk_filter = use_privileged_risk_filter
+        self.ranking_weight = float(ranking_weight)
         self.yopo_preserve_utility_delta_scale = float(yopo_preserve_utility_delta_scale)
+        self.yopo_preserve_residual_reg_weight = float(yopo_preserve_residual_reg_weight)
+        self.yopo_preserve_unsafe_boost_weight = float(yopo_preserve_unsafe_boost_weight)
+        self.yopo_preserve_safe_suppression_weight = float(yopo_preserve_safe_suppression_weight)
+        self.yopo_preserve_safe_margin_m = float(yopo_preserve_safe_margin_m)
         self.yopo_preserve_safety_residual_weight = float(yopo_preserve_safety_residual_weight)
         self.yopo_preserve_safe_clearance_residual_weight = float(yopo_preserve_safe_clearance_residual_weight)
         self.yopo_preserve_safety_cost_threshold = float(yopo_preserve_safety_cost_threshold)
@@ -152,6 +168,11 @@ class OARMTrainer:
         self.yopo_preserve_safety_pairwise_margin = float(yopo_preserve_safety_pairwise_margin)
         self.yopo_preserve_unsafe_delta_target = float(yopo_preserve_unsafe_delta_target)
         self.yopo_preserve_safe_delta_target = float(yopo_preserve_safe_delta_target)
+        self.yopo_preserve_freeze_margin_risk_head = bool(yopo_preserve_freeze_margin_risk_head)
+        self.yopo_preserve_oracle_ce_weight = float(yopo_preserve_oracle_ce_weight)
+        self.yopo_preserve_oracle_ce_temperature = max(float(yopo_preserve_oracle_ce_temperature), 1e-3)
+        self.yopo_preserve_oracle_min_margin = float(yopo_preserve_oracle_min_margin)
+        self.yopo_preserve_oracle_min_progress = float(yopo_preserve_oracle_min_progress)
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             if self.train_backup_feasibility or self.train_yield_feasibility:
                 raise ValueError("YOPO-preserve modes only support margin/risk/rerank auxiliary training; disable backup/yield feasibility")
@@ -185,6 +206,7 @@ class OARMTrainer:
                 enable_yield_candidates=self.enable_yield_candidates,
                 deployed_yaw_mode=self.deployed_yaw_mode,
                 risk_label_source=self.risk_label_source,
+                yopo_preserve_utility_delta_scale=self.yopo_preserve_utility_delta_scale,
             )
             self.policy.load_state_dict(state_dict)
         elif self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
@@ -427,13 +449,42 @@ class OARMTrainer:
             safety_candidate_rate = torch.zeros((), device=self.device)
             safe_clearance_candidate_rate = torch.zeros((), device=self.device)
             safety_pairwise_pair_rate = torch.zeros((), device=self.device)
-            margin_pairwise_unsafe = None
-            margin_pairwise_safe = None
+            oracle_ce_loss = torch.zeros((), device=self.device)
+            oracle_ce_pair_rate = torch.zeros((), device=self.device)
+            oracle_ce_top1_acc = torch.zeros((), device=self.device)
+            oracle_ce_target_margin_mean = torch.zeros((), device=self.device)
+            geom_unsafe_mask_rate = torch.zeros((), device=self.device)
+            geom_safe_mask_rate = torch.zeros((), device=self.device)
+            margin_unsafe_mask_rate = torch.zeros((), device=self.device)
+            margin_safe_mask_rate = torch.zeros((), device=self.device)
+            final_unsafe_mask_rate = torch.zeros((), device=self.device)
+            final_safe_mask_rate = torch.zeros((), device=self.device)
+            safe_and_unsafe_overlap_rate = torch.zeros((), device=self.device)
             if self.candidate_mode == "yopo_preserve_rerank":
-                rerank_loss = oarm_cfg.ranking_weight * loss_dict["ranking_loss"]
+                rerank_loss = self.ranking_weight * loss_dict["ranking_loss"]
                 delta = flat.get("utility_delta")
                 if delta is not None:
-                    residual_reg = oarm_cfg.yopo_preserve_residual_reg_weight * delta.square().mean()
+                    residual_reg = self.yopo_preserve_residual_reg_weight * delta.square().mean()
+                    finite_delta = torch.isfinite(delta)
+                    final_unsafe = None
+                    final_safe = None
+                    progress_ok = None
+                    geom_unsafe = None
+                    geom_safe = None
+                    margin_unsafe = None
+                    margin_safe = None
+
+                    safety_cost = loss_dict.get("safety_cost_per_candidate")
+                    if safety_cost is not None:
+                        safety_cost = safety_cost.to(self.device).reshape_as(delta).float()
+                        safety_valid = torch.isfinite(safety_cost) & finite_delta
+                        geom_unsafe = safety_valid & (safety_cost > self.yopo_preserve_safety_cost_threshold)
+                        geom_safe = safety_valid & (safety_cost <= self.yopo_preserve_safe_cost_threshold)
+                        safety_candidate_rate = geom_unsafe.float().mean()
+                        safe_clearance_candidate_rate = geom_safe.float().mean()
+                        geom_unsafe_mask_rate = safety_candidate_rate
+                        geom_safe_mask_rate = safe_clearance_candidate_rate
+
                     margin_label = flat_labels.get("reaction_margin")
                     if margin_label is not None:
                         margin_label = margin_label.to(self.device).reshape_as(delta).float()
@@ -442,68 +493,106 @@ class OARMTrainer:
                             margin_valid = torch.ones_like(delta, dtype=torch.bool)
                         else:
                             margin_valid = margin_valid.to(self.device).reshape_as(delta).bool()
-                        margin_valid = margin_valid & torch.isfinite(margin_label) & torch.isfinite(delta)
-                        unsafe = margin_valid & (margin_label < 0.0)
-                        margin_pairwise_unsafe = unsafe
-                        safe = margin_valid & (margin_label > oarm_cfg.yopo_preserve_safe_margin_m)
-                        margin_pairwise_safe = safe
-                        if bool(unsafe.any()):
-                            unsafe_positive = torch.relu(delta[unsafe])
+                        margin_valid = margin_valid & torch.isfinite(margin_label) & finite_delta
+                        margin_unsafe = margin_valid & (margin_label < 0.0)
+                        margin_safe = margin_valid & (margin_label > self.yopo_preserve_safe_margin_m)
+                        margin_unsafe_mask_rate = margin_unsafe.float().mean()
+                        margin_safe_mask_rate = margin_safe.float().mean()
+
+                    if self.yopo_preserve_oracle_min_progress > 0.0:
+                        progress_score = -OARMLoss.goal_progress_cost(
+                            start_state_w, end_state_w, goal_w, flat["traj_time"]
+                        ).detach()
+                        progress_ok = finite_delta & torch.isfinite(progress_score) & (progress_score > self.yopo_preserve_oracle_min_progress)
+
+                    if geom_unsafe is not None:
+                        if margin_unsafe is not None:
+                            final_unsafe = geom_unsafe | margin_unsafe
+                            final_safe = geom_safe & margin_safe & ~final_unsafe
+                        else:
+                            final_unsafe = geom_unsafe
+                            final_safe = geom_safe & ~final_unsafe
+                    elif margin_unsafe is not None:
+                        final_unsafe = margin_unsafe
+                        final_safe = margin_safe & ~final_unsafe
+
+                    if final_safe is not None and progress_ok is not None:
+                        final_safe = final_safe & progress_ok
+
+                    if final_unsafe is not None and final_safe is not None:
+                        overlap = final_unsafe & final_safe
+                        final_unsafe_mask_rate = final_unsafe.float().mean()
+                        final_safe_mask_rate = final_safe.float().mean()
+                        safe_and_unsafe_overlap_rate = overlap.float().mean()
+                        if bool(overlap.any()):
+                            raise RuntimeError("A3 safety masks must be mutually exclusive, but safe&unsafe overlap was nonzero")
+                        if bool(final_unsafe.any()):
+                            unsafe_positive = torch.relu(delta[final_unsafe])
                             unsafe_boost_loss = (
-                                oarm_cfg.yopo_preserve_unsafe_boost_weight * unsafe_positive.square().mean()
+                                self.yopo_preserve_unsafe_boost_weight * unsafe_positive.square().mean()
                             )
-                            unsafe_residual_positive_rate = (delta[unsafe] > 0.0).float().mean()
-                        if bool(safe.any()):
-                            safe_negative = torch.relu(-delta[safe])
+                            unsafe_residual_positive_rate = (delta[final_unsafe] > 0.0).float().mean()
+                        if bool(final_safe.any()):
+                            safe_negative = torch.relu(-delta[final_safe])
                             safe_suppression_loss = (
-                                oarm_cfg.yopo_preserve_safe_suppression_weight * safe_negative.square().mean()
+                                self.yopo_preserve_safe_suppression_weight * safe_negative.square().mean()
                             )
-                            safe_residual_negative_rate = (delta[safe] < 0.0).float().mean()
-                    safety_cost = loss_dict.get("safety_cost_per_candidate")
-                    if safety_cost is not None:
-                        safety_cost = safety_cost.to(self.device).reshape_as(delta).float()
-                        safety_valid = torch.isfinite(safety_cost) & torch.isfinite(delta)
-                        unsafe_safety = safety_valid & (safety_cost > self.yopo_preserve_safety_cost_threshold)
-                        safe_clearance = safety_valid & (safety_cost <= self.yopo_preserve_safe_cost_threshold)
-                        pairwise_unsafe = unsafe_safety
-                        pairwise_safe = safe_clearance
-                        if margin_pairwise_unsafe is not None:
-                            pairwise_unsafe = pairwise_unsafe | margin_pairwise_unsafe
-                        if margin_pairwise_safe is not None:
-                            pairwise_safe = pairwise_safe | margin_pairwise_safe
-                        safety_candidate_rate = unsafe_safety.float().mean()
-                        safe_clearance_candidate_rate = safe_clearance.float().mean()
-                        if bool(unsafe_safety.any()) and self.yopo_preserve_safety_residual_weight > 0.0:
-                            safety_positive = torch.relu(delta[unsafe_safety] + self.yopo_preserve_unsafe_delta_target)
-                            safety_residual_loss = (
-                                self.yopo_preserve_safety_residual_weight * safety_positive.square().mean()
+                            safe_residual_negative_rate = (delta[final_safe] < 0.0).float().mean()
+
+                    residual_unsafe = final_unsafe if final_unsafe is not None else geom_unsafe
+                    residual_safe = final_safe if final_safe is not None else (geom_safe & ~geom_unsafe if geom_safe is not None and geom_unsafe is not None else geom_safe)
+                    if residual_unsafe is not None and bool(residual_unsafe.any()) and self.yopo_preserve_safety_residual_weight > 0.0:
+                        safety_positive = torch.relu(delta[residual_unsafe] + self.yopo_preserve_unsafe_delta_target)
+                        safety_residual_loss = (
+                            self.yopo_preserve_safety_residual_weight * safety_positive.square().mean()
+                        )
+                        safety_residual_positive_rate = (delta[residual_unsafe] > 0.0).float().mean()
+                    if residual_safe is not None and bool(residual_safe.any()) and self.yopo_preserve_safe_clearance_residual_weight > 0.0:
+                        safe_clearance_negative = torch.relu(self.yopo_preserve_safe_delta_target - delta[residual_safe])
+                        safe_clearance_residual_loss = (
+                            self.yopo_preserve_safe_clearance_residual_weight * safe_clearance_negative.square().mean()
+                        )
+                        safe_clearance_residual_negative_rate = (delta[residual_safe] < 0.0).float().mean()
+
+                    if (
+                        final_unsafe is not None
+                        and final_safe is not None
+                        and delta.numel() % self.traj_num == 0
+                    ):
+                        pairwise_score = flat.get("utility_score", delta).reshape_as(delta)
+                        score_group = pairwise_score.reshape(-1, self.traj_num)
+                        unsafe_group = final_unsafe.reshape(-1, self.traj_num)
+                        safe_group = final_safe.reshape(-1, self.traj_num)
+                        margin_group = None
+                        if margin_label is not None:
+                            margin_group = margin_label.reshape(-1, self.traj_num)
+                        has_safety_pair = unsafe_group.any(dim=1) & safe_group.any(dim=1)
+                        safety_pairwise_pair_rate = has_safety_pair.float().mean()
+                        if self.yopo_preserve_safety_pairwise_weight > 0.0 and bool(has_safety_pair.any()):
+                            neg_inf = torch.full_like(score_group, -float("inf"))
+                            safe_best_score = torch.where(safe_group, score_group, neg_inf).max(dim=1).values
+                            unsafe_best_score = torch.where(unsafe_group, score_group, neg_inf).max(dim=1).values
+                            safety_pairwise_gap = torch.relu(
+                                unsafe_best_score[has_safety_pair]
+                                + self.yopo_preserve_safety_pairwise_margin
+                                - safe_best_score[has_safety_pair]
                             )
-                            safety_residual_positive_rate = (delta[unsafe_safety] > 0.0).float().mean()
-                        if bool(safe_clearance.any()) and self.yopo_preserve_safe_clearance_residual_weight > 0.0:
-                            safe_clearance_negative = torch.relu(self.yopo_preserve_safe_delta_target - delta[safe_clearance])
-                            safe_clearance_residual_loss = (
-                                self.yopo_preserve_safe_clearance_residual_weight * safe_clearance_negative.square().mean()
+                            safety_pairwise_loss = (
+                                self.yopo_preserve_safety_pairwise_weight * safety_pairwise_gap.square().mean()
                             )
-                            safe_clearance_residual_negative_rate = (delta[safe_clearance] < 0.0).float().mean()
-                        if self.yopo_preserve_safety_pairwise_weight > 0.0 and delta.numel() % self.traj_num == 0:
-                            pairwise_score = flat.get("utility_score", delta).reshape_as(delta)
-                            score_group = pairwise_score.reshape(-1, self.traj_num)
-                            unsafe_group = pairwise_unsafe.reshape(-1, self.traj_num)
-                            safe_group = pairwise_safe.reshape(-1, self.traj_num)
-                            has_safety_pair = unsafe_group.any(dim=1) & safe_group.any(dim=1)
-                            safety_pairwise_pair_rate = has_safety_pair.float().mean()
-                            if bool(has_safety_pair.any()):
-                                neg_inf = torch.full_like(score_group, -float("inf"))
-                                safe_best_score = torch.where(safe_group, score_group, neg_inf).max(dim=1).values
-                                unsafe_best_score = torch.where(unsafe_group, score_group, neg_inf).max(dim=1).values
-                                safety_pairwise_gap = torch.relu(
-                                    unsafe_best_score[has_safety_pair]
-                                    + self.yopo_preserve_safety_pairwise_margin
-                                    - safe_best_score[has_safety_pair]
+                        if self.yopo_preserve_oracle_ce_weight > 0.0 and margin_group is not None:
+                            neg_inf = torch.full_like(margin_group, -float("inf"))
+                            oracle_source = torch.where(safe_group, margin_group, neg_inf)
+                            oracle_margin, oracle_id = oracle_source.max(dim=1)
+                            has_oracle = torch.isfinite(oracle_margin) & (oracle_margin > self.yopo_preserve_oracle_min_margin)
+                            oracle_ce_pair_rate = has_oracle.float().mean()
+                            if bool(has_oracle.any()):
+                                logits = score_group[has_oracle] / self.yopo_preserve_oracle_ce_temperature
+                                oracle_ce_loss = self.yopo_preserve_oracle_ce_weight * F.cross_entropy(
+                                    logits, oracle_id[has_oracle].long()
                                 )
-                                safety_pairwise_loss = (
-                                    self.yopo_preserve_safety_pairwise_weight * safety_pairwise_gap.square().mean()
-                                )
+                                oracle_ce_top1_acc = (logits.argmax(dim=1) == oracle_id[has_oracle]).float().mean()
+                                oracle_ce_target_margin_mean = oracle_margin[has_oracle].mean()
             loss_dict["aux_only_loss"] = aux_loss
             loss_dict["rerank_only_loss"] = rerank_loss
             loss_dict["utility_delta_reg_loss"] = residual_reg
@@ -512,6 +601,7 @@ class OARMTrainer:
             loss_dict["safety_residual_loss"] = safety_residual_loss
             loss_dict["safe_clearance_residual_loss"] = safe_clearance_residual_loss
             loss_dict["safety_pairwise_loss"] = safety_pairwise_loss
+            loss_dict["oracle_ce_loss"] = oracle_ce_loss
 
             loss_dict["unsafe_residual_positive_rate"] = unsafe_residual_positive_rate
             loss_dict["safe_residual_negative_rate"] = safe_residual_negative_rate
@@ -520,6 +610,16 @@ class OARMTrainer:
             loss_dict["safety_candidate_rate"] = safety_candidate_rate
             loss_dict["safe_clearance_candidate_rate"] = safe_clearance_candidate_rate
             loss_dict["safety_pairwise_pair_rate"] = safety_pairwise_pair_rate
+            loss_dict["oracle_ce_pair_rate"] = oracle_ce_pair_rate
+            loss_dict["oracle_ce_top1_acc"] = oracle_ce_top1_acc
+            loss_dict["oracle_ce_target_margin_mean"] = oracle_ce_target_margin_mean
+            loss_dict["geom_unsafe_mask_rate"] = geom_unsafe_mask_rate
+            loss_dict["geom_safe_mask_rate"] = geom_safe_mask_rate
+            loss_dict["margin_unsafe_mask_rate"] = margin_unsafe_mask_rate
+            loss_dict["margin_safe_mask_rate"] = margin_safe_mask_rate
+            loss_dict["final_unsafe_mask_rate"] = final_unsafe_mask_rate
+            loss_dict["final_safe_mask_rate"] = final_safe_mask_rate
+            loss_dict["safe_and_unsafe_overlap_rate"] = safe_and_unsafe_overlap_rate
 
             loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
             loss_dict["total_loss"] = (
@@ -531,6 +631,7 @@ class OARMTrainer:
                 + safety_residual_loss
                 + safe_clearance_residual_loss
                 + safety_pairwise_loss
+                + oracle_ce_loss
             )
         return loss_dict
 
@@ -604,8 +705,14 @@ class OARMTrainer:
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             if self.train_yield_head_only:
                 raise ValueError(f"--train-yield-head-only is not compatible with candidate_mode={self.candidate_mode}")
+            train_prefixes = ["preserve_network.margin_risk_head."]
+            if self.candidate_mode == "yopo_preserve_rerank":
+                if self.yopo_preserve_freeze_margin_risk_head:
+                    train_prefixes = ["preserve_network.rerank_head."]
+                else:
+                    train_prefixes.append("preserve_network.rerank_head.")
             for name, param in self.policy.named_parameters():
-                param.requires_grad_(name.startswith("preserve_network.aux_head."))
+                param.requires_grad_(any(name.startswith(prefix) for prefix in train_prefixes))
             return
         if not self.train_yield_head_only:
             return
@@ -643,16 +750,26 @@ class OARMTrainer:
             raise RuntimeError("No trainable OARM parameters were configured")
         if self.candidate_mode not in {"yopo_preserve", "yopo_preserve_rerank"}:
             return
-        bad = [name for name in trainable if not name.startswith("preserve_network.aux_head.")]
+        allowed_prefixes = ("preserve_network.margin_risk_head.", "preserve_network.rerank_head.")
+        bad = [name for name in trainable if not name.startswith(allowed_prefixes)]
         if bad:
             raise RuntimeError(
                 f"{self.candidate_mode} must train only preserve auxiliary heads; unexpected trainable parameters: "
                 + ", ".join(bad)
             )
-        aux_names = [name for name, _param in self.policy.named_parameters() if name.startswith("preserve_network.aux_head.")]
+        if self.candidate_mode == "yopo_preserve":
+            required_prefixes = ("preserve_network.margin_risk_head.",)
+        elif self.yopo_preserve_freeze_margin_risk_head:
+            required_prefixes = ("preserve_network.rerank_head.",)
+        else:
+            required_prefixes = allowed_prefixes
+        aux_names = [
+            name for name, _param in self.policy.named_parameters()
+            if name.startswith(required_prefixes)
+        ]
         missing = sorted(set(aux_names) - set(trainable))
         if missing:
-            raise RuntimeError("Some preserve auxiliary head parameters are frozen: " + ", ".join(missing))
+            raise RuntimeError("Some required preserve auxiliary head parameters are frozen: " + ", ".join(missing))
 
     def write_trainable_parameter_artifact(self):
         trainable = self.trainable_parameter_names()

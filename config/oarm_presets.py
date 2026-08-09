@@ -40,7 +40,12 @@ class OARMTrainingPreset:
     use_esdf_collision: bool = oarm_cfg.use_esdf_collision
     use_occlusion_aware_visibility: bool = oarm_cfg.use_occlusion_aware_visibility
     use_privileged_risk_filter: bool = oarm_cfg.use_privileged_risk_filter
+    ranking_weight: float = oarm_cfg.ranking_weight
     yopo_preserve_utility_delta_scale: float = oarm_cfg.yopo_preserve_utility_delta_scale
+    yopo_preserve_residual_reg_weight: float = oarm_cfg.yopo_preserve_residual_reg_weight
+    yopo_preserve_unsafe_boost_weight: float = oarm_cfg.yopo_preserve_unsafe_boost_weight
+    yopo_preserve_safe_suppression_weight: float = oarm_cfg.yopo_preserve_safe_suppression_weight
+    yopo_preserve_safe_margin_m: float = oarm_cfg.yopo_preserve_safe_margin_m
     yopo_preserve_safety_residual_weight: float = oarm_cfg.yopo_preserve_safety_residual_weight
     yopo_preserve_safe_clearance_residual_weight: float = oarm_cfg.yopo_preserve_safe_clearance_residual_weight
     yopo_preserve_safety_cost_threshold: float = oarm_cfg.yopo_preserve_safety_cost_threshold
@@ -49,6 +54,11 @@ class OARMTrainingPreset:
     yopo_preserve_safety_pairwise_margin: float = oarm_cfg.yopo_preserve_safety_pairwise_margin
     yopo_preserve_unsafe_delta_target: float = oarm_cfg.yopo_preserve_unsafe_delta_target
     yopo_preserve_safe_delta_target: float = oarm_cfg.yopo_preserve_safe_delta_target
+    yopo_preserve_freeze_margin_risk_head: bool = oarm_cfg.yopo_preserve_freeze_margin_risk_head
+    yopo_preserve_oracle_ce_weight: float = oarm_cfg.yopo_preserve_oracle_ce_weight
+    yopo_preserve_oracle_ce_temperature: float = oarm_cfg.yopo_preserve_oracle_ce_temperature
+    yopo_preserve_oracle_min_margin: float = oarm_cfg.yopo_preserve_oracle_min_margin
+    yopo_preserve_oracle_min_progress: float = oarm_cfg.yopo_preserve_oracle_min_progress
 
 OARM_TRAINING_PRESETS: Dict[str, OARMTrainingPreset] = {
     "v0": OARMTrainingPreset(candidate_mode="yopo"),

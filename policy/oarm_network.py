@@ -71,6 +71,23 @@ class OARMNetwork(nn.Module):
         self.state_backbone = nn.Sequential()
         self.oarm_head = OARMHead(hidden_state + observation_dim + self.anchor_feature_dim, output_dim)
 
+    def load_state_dict(self, state_dict, strict=True):
+        if self.preserve_network is None:
+            return super().load_state_dict(state_dict, strict=strict)
+        adapted = self.preserve_network.adapt_legacy_aux_state_dict(state_dict)
+        missing, unexpected = super().load_state_dict(adapted, strict=False)
+        allowed_missing = []
+        if self.candidate_mode == "yopo_preserve_rerank":
+            allowed_missing.extend([key for key in missing if key.startswith("preserve_network.rerank_head.")])
+        allowed_missing.extend([key for key in missing if key.startswith("preserve_network.margin_risk_head.") and any(k.startswith("preserve_network.aux_head.") for k in state_dict)])
+        bad_missing = sorted(set(missing) - set(allowed_missing))
+        if strict and (bad_missing or unexpected):
+            raise RuntimeError(
+                "OARM checkpoint did not match preserve network: "
+                f"missing={bad_missing}, unexpected={unexpected}"
+            )
+        return missing, unexpected
+
     def forward(self, depth: torch.Tensor, obs: torch.Tensor, anchors=None):
         if self.preserve_network is not None:
             return self.preserve_network(depth, obs)
