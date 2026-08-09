@@ -88,7 +88,7 @@ def parser():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--stage",
-        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "full"],
+        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "full"],
         default="v0",
         help="named ablation preset; CLI flags and --config override it",
     )
@@ -103,6 +103,7 @@ def parser():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=1.5e-4)
     p.add_argument("--checkpoint", type=str, default="")
+    p.add_argument("--init-from-a1-checkpoint", type=str, default="", help="A1 yopo_preserve checkpoint used to initialize A3h split-head reranker")
     p.add_argument("--yopo-checkpoint", type=str, default="", help="official YOPO checkpoint used to initialize candidate_mode=yopo_preserve")
     p.add_argument("--allow-checkpoint-mismatch", action="store_true")
     p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank"], default="")
@@ -268,6 +269,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         tensorboard_path=args.log_dir or None,
         checkpoint_path=args.checkpoint,
+        init_from_a1_checkpoint_path=args.init_from_a1_checkpoint,
         yopo_checkpoint_path=args.yopo_checkpoint,
         save_on_exit=True,
         num_workers=args.num_workers,
@@ -279,6 +281,7 @@ if __name__ == "__main__":
             "stage": args.stage,
             "config": args.config,
             "source_yopo_checkpoint": args.yopo_checkpoint,
+            "init_from_a1_checkpoint": args.init_from_a1_checkpoint,
             "seed": args.seed,
             "argv": sys.argv,
             "epoch": args.epoch,

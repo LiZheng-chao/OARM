@@ -40,6 +40,7 @@ class OARMTrainer:
         batch_size=16,
         tensorboard_path=None,
         checkpoint_path=None,
+        init_from_a1_checkpoint_path=None,
         yopo_checkpoint_path=None,
         save_on_exit=False,
         num_workers=4,
@@ -120,6 +121,7 @@ class OARMTrainer:
         self.use_fused_adamw = bool(use_fused_adamw)
         self.train_yield_head_only = bool(train_yield_head_only)
         self._frozen_output_rows = None
+        self.a1_initialization_report = {}
         self.candidate_mode = candidate_mode
         self.backbone_mode = backbone_mode
         self.enable_yield_candidates = bool(enable_yield_candidates)
@@ -196,6 +198,8 @@ class OARMTrainer:
             enable_yield_candidates=self.enable_yield_candidates,
             utility_delta_scale=self.yopo_preserve_utility_delta_scale,
         ).to(self.device)
+        if checkpoint_path and init_from_a1_checkpoint_path:
+            raise ValueError("Use either --checkpoint for same-structure resume or --init-from-a1-checkpoint for A1->A3h initialization, not both")
         if checkpoint_path:
             state_dict, checkpoint_metadata = load_oarm_checkpoint(checkpoint_path, map_location=self.device)
             validate_checkpoint_metadata(
@@ -209,6 +213,8 @@ class OARMTrainer:
                 yopo_preserve_utility_delta_scale=self.yopo_preserve_utility_delta_scale,
             )
             self.policy.load_state_dict(state_dict)
+        elif init_from_a1_checkpoint_path:
+            self.load_a1_initialization_checkpoint(init_from_a1_checkpoint_path, allow_mismatch=allow_checkpoint_mismatch)
         elif self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             if not yopo_checkpoint_path:
                 raise ValueError("candidate_mode=yopo_preserve requires --yopo-checkpoint for YOPO base initialization")
@@ -261,6 +267,44 @@ class OARMTrainer:
             num_workers=num_workers,
             pin_memory=True,
             **loader_kwargs,
+        )
+
+
+    def load_a1_initialization_checkpoint(self, checkpoint_path, allow_mismatch=False):
+        if self.candidate_mode != "yopo_preserve_rerank":
+            raise ValueError("--init-from-a1-checkpoint is only valid for candidate_mode=yopo_preserve_rerank")
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"A1 initialization checkpoint not found: {checkpoint_path}")
+        state_dict, metadata = load_oarm_checkpoint(checkpoint_path, map_location=self.device)
+        training_options = metadata.get("training_options") or {}
+        stored_candidate = metadata.get("candidate_mode") or training_options.get("candidate_mode")
+        stored_backbone = metadata.get("backbone_mode") or training_options.get("backbone_mode")
+        if stored_candidate not in {None, "yopo_preserve"} and not allow_mismatch:
+            raise ValueError(
+                "--init-from-a1-checkpoint expects an A1 candidate_mode=yopo_preserve checkpoint; "
+                f"got candidate_mode={stored_candidate}. Pass --allow-checkpoint-mismatch only if intentional."
+            )
+        if stored_backbone not in {None, "yopo_original"} and not allow_mismatch:
+            raise ValueError(
+                "--init-from-a1-checkpoint expects backbone_mode=yopo_original; "
+                f"got backbone_mode={stored_backbone}."
+            )
+        has_preserve = any(key.startswith("preserve_network.") for key in state_dict)
+        if not has_preserve:
+            raise ValueError("A1 initialization checkpoint does not contain preserve_network.* weights")
+        missing, unexpected = self.policy.load_state_dict(state_dict, strict=True)
+        self.policy.preserve_network.reset_rerank_output()
+        self.a1_initialization_report = {
+            "path": checkpoint_path,
+            "stored_candidate_mode": stored_candidate,
+            "stored_backbone_mode": stored_backbone,
+            "loaded_margin_risk_head": True,
+            "reset_rerank_output": True,
+            "missing": list(missing),
+            "unexpected": list(unexpected),
+        }
+        self.progress_log.console.log(
+            "Loaded A1 margin/risk weights for A3h warm-start; reset rerank output to zero."
         )
 
     def train(self, epoch=50):
@@ -460,6 +504,10 @@ class OARMTrainer:
             final_unsafe_mask_rate = torch.zeros((), device=self.device)
             final_safe_mask_rate = torch.zeros((), device=self.device)
             safe_and_unsafe_overlap_rate = torch.zeros((), device=self.device)
+            geom_unsafe_and_margin_safe_rate = torch.zeros((), device=self.device)
+            geom_safe_and_margin_unsafe_rate = torch.zeros((), device=self.device)
+            oracle_ce_primary_rate = torch.zeros((), device=self.device)
+            oracle_ce_fallback_rate = torch.zeros((), device=self.device)
             if self.candidate_mode == "yopo_preserve_rerank":
                 rerank_loss = self.ranking_weight * loss_dict["ranking_loss"]
                 delta = flat.get("utility_delta")
@@ -473,6 +521,7 @@ class OARMTrainer:
                     geom_safe = None
                     margin_unsafe = None
                     margin_safe = None
+                    margin_valid = None
 
                     safety_cost = loss_dict.get("safety_cost_per_candidate")
                     if safety_cost is not None:
@@ -498,6 +547,11 @@ class OARMTrainer:
                         margin_safe = margin_valid & (margin_label > self.yopo_preserve_safe_margin_m)
                         margin_unsafe_mask_rate = margin_unsafe.float().mean()
                         margin_safe_mask_rate = margin_safe.float().mean()
+
+                    if geom_unsafe is not None and margin_safe is not None:
+                        geom_unsafe_and_margin_safe_rate = (geom_unsafe & margin_safe).float().mean()
+                    if geom_safe is not None and margin_unsafe is not None:
+                        geom_safe_and_margin_unsafe_rate = (geom_safe & margin_unsafe).float().mean()
 
                     if self.yopo_preserve_oracle_min_progress > 0.0:
                         progress_score = -OARMLoss.goal_progress_cost(
@@ -581,11 +635,23 @@ class OARMTrainer:
                                 self.yopo_preserve_safety_pairwise_weight * safety_pairwise_gap.square().mean()
                             )
                         if self.yopo_preserve_oracle_ce_weight > 0.0 and margin_group is not None:
+                            oracle_group = safe_group
+                            primary_available = safe_group.any(dim=1)
+                            fallback_available = torch.zeros_like(primary_available)
+                            if geom_safe is not None and margin_valid is not None:
+                                fallback = geom_safe & margin_valid & ~final_unsafe
+                                if progress_ok is not None:
+                                    fallback = fallback & progress_ok
+                                fallback_group = fallback.reshape(-1, self.traj_num)
+                                fallback_available = fallback_group.any(dim=1) & ~primary_available
+                                oracle_group = torch.where(primary_available[:, None], safe_group, fallback_group)
                             neg_inf = torch.full_like(margin_group, -float("inf"))
-                            oracle_source = torch.where(safe_group, margin_group, neg_inf)
+                            oracle_source = torch.where(oracle_group, margin_group, neg_inf)
                             oracle_margin, oracle_id = oracle_source.max(dim=1)
-                            has_oracle = torch.isfinite(oracle_margin) & (oracle_margin > self.yopo_preserve_oracle_min_margin)
+                            has_oracle = torch.isfinite(oracle_margin) & oracle_group.any(dim=1)
                             oracle_ce_pair_rate = has_oracle.float().mean()
+                            oracle_ce_primary_rate = (primary_available & has_oracle).float().mean()
+                            oracle_ce_fallback_rate = (fallback_available & has_oracle).float().mean()
                             if bool(has_oracle.any()):
                                 logits = score_group[has_oracle] / self.yopo_preserve_oracle_ce_temperature
                                 oracle_ce_loss = self.yopo_preserve_oracle_ce_weight * F.cross_entropy(
@@ -613,6 +679,8 @@ class OARMTrainer:
             loss_dict["oracle_ce_pair_rate"] = oracle_ce_pair_rate
             loss_dict["oracle_ce_top1_acc"] = oracle_ce_top1_acc
             loss_dict["oracle_ce_target_margin_mean"] = oracle_ce_target_margin_mean
+            loss_dict["oracle_ce_primary_rate"] = oracle_ce_primary_rate
+            loss_dict["oracle_ce_fallback_rate"] = oracle_ce_fallback_rate
             loss_dict["geom_unsafe_mask_rate"] = geom_unsafe_mask_rate
             loss_dict["geom_safe_mask_rate"] = geom_safe_mask_rate
             loss_dict["margin_unsafe_mask_rate"] = margin_unsafe_mask_rate
@@ -620,6 +688,8 @@ class OARMTrainer:
             loss_dict["final_unsafe_mask_rate"] = final_unsafe_mask_rate
             loss_dict["final_safe_mask_rate"] = final_safe_mask_rate
             loss_dict["safe_and_unsafe_overlap_rate"] = safe_and_unsafe_overlap_rate
+            loss_dict["geom_unsafe_and_margin_safe_rate"] = geom_unsafe_and_margin_safe_rate
+            loss_dict["geom_safe_and_margin_unsafe_rate"] = geom_safe_and_margin_unsafe_rate
 
             loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
             loss_dict["total_loss"] = (
@@ -790,7 +860,8 @@ class OARMTrainer:
                 "image_backbone_training": bool(preserve.image_backbone.training),
                 "state_backbone_training": bool(preserve.state_backbone.training),
                 "yopo_head_training": bool(preserve.yopo_head.training),
-                "aux_head_training": bool(preserve.aux_head.training),
+                "margin_risk_head_training": bool(preserve.margin_risk_head.training),
+                "rerank_head_training": bool(preserve.rerank_head.training),
                 "enable_utility_delta": bool(getattr(preserve, "enable_utility_delta", False)),
             }
         artifact = {
@@ -803,6 +874,7 @@ class OARMTrainer:
             "yopo_base_modules": yopo_base_modules,
             "a1_auxiliary_only": bool(self.candidate_mode == "yopo_preserve"),
             "preserve_rerank": bool(self.candidate_mode == "yopo_preserve_rerank"),
+            "a1_initialization": self.a1_initialization_report,
         }
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(artifact, f, indent=2, sort_keys=True)

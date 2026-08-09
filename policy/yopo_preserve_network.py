@@ -72,6 +72,11 @@ class YOPOPreserveOARMNetwork(nn.Module):
             nn.init.zeros_(final.weight)
             nn.init.zeros_(final.bias)
 
+    def reset_rerank_output(self):
+        final = self.rerank_head[-1]
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+
     def freeze_yopo_base(self):
         for module in (self.image_backbone, self.state_backbone, self.yopo_head):
             for param in module.parameters():

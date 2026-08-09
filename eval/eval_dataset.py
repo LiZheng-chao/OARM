@@ -141,6 +141,48 @@ def resolve_utility_delta_scale(args, checkpoint_metadata):
     return float(getattr(preset, "yopo_preserve_utility_delta_scale", oarm_cfg.yopo_preserve_utility_delta_scale))
 
 
+
+EVAL_PROTOCOL_ARG_KEYS = (
+    "yopo_preserve_safety_cost_threshold",
+    "yopo_preserve_safe_cost_threshold",
+    "yopo_preserve_safe_margin_m",
+    "yopo_preserve_oracle_min_progress",
+)
+
+
+def apply_checkpoint_eval_protocol(args, checkpoint_metadata):
+    training_options = (checkpoint_metadata or {}).get("training_options") or {}
+    if checkpoint_metadata:
+        for key in ("candidate_mode", "backbone_mode", "deployed_yaw_mode", "risk_label_source"):
+            stored = checkpoint_metadata.get(key)
+            if stored is None:
+                stored = training_options.get(key)
+            if stored not in {None, ""}:
+                setattr(args, key, stored)
+    for eval_key, preset_key in EVAL_STAGE_MAP.items():
+        if training_options.get(preset_key) and not getattr(args, eval_key):
+            setattr(args, eval_key, True)
+    for bool_key in (
+        "use_esdf_collision",
+        "use_occlusion_aware_visibility",
+        "use_privileged_risk_filter",
+        "enable_yield_candidates",
+    ):
+        if training_options.get(bool_key) and not getattr(args, bool_key):
+            setattr(args, bool_key, True)
+    for key in GT_SAMPLER_ARG_KEYS:
+        stored = training_options.get(key)
+        if stored is not None:
+            setattr(args, key, stored)
+    preset = get_oarm_training_preset(args.stage)
+    for key in EVAL_PROTOCOL_ARG_KEYS:
+        if getattr(args, key) is not None:
+            continue
+        stored = training_options.get(key)
+        if stored is None:
+            stored = getattr(preset, key, getattr(oarm_cfg, key))
+        setattr(args, key, stored)
+
 def flatten_labels(labels, flat, device, args):
     flat_labels = {}
     if args.eval_occlusion_risk and "occlusion_risk" in labels:
@@ -285,7 +327,7 @@ def maybe_generate_reaction_margin_labels(
     return flat_labels
 
 
-def selected_candidate_stats(candidate, accumulator, flat_labels=None, safety_cost=None, progress=None):
+def selected_candidate_stats(candidate, accumulator, args, flat_labels=None, safety_cost=None, progress=None):
     utility = candidate.utility_score.reshape(candidate.utility_score.shape[0], -1)
     best_id = utility.argmax(dim=1)
     batch_size = utility.shape[0]
@@ -310,7 +352,7 @@ def selected_candidate_stats(candidate, accumulator, flat_labels=None, safety_co
             add_metric(
                 accumulator,
                 "selected_geom_unsafe_candidate_rate",
-                (selected_safety[selected_safety_valid] > oarm_cfg.yopo_preserve_safety_cost_threshold).float().mean(),
+                (selected_safety[selected_safety_valid] > args.yopo_preserve_safety_cost_threshold).float().mean(),
                 int(selected_safety_valid.sum().item()),
             )
         add_metric(accumulator, "geom_unsafe_candidate_rate", geom_unsafe.float().mean(), batch_size)
@@ -382,14 +424,24 @@ def selected_candidate_stats(candidate, accumulator, flat_labels=None, safety_co
             geom_safe_for_oracle = geom_safe
             geom_unsafe_for_oracle = geom_unsafe
         margin_unsafe = finite_margin & (flat_margin < 0.0)
-        margin_safe = finite_margin & (flat_margin > oarm_cfg.yopo_preserve_safe_margin_m)
+        margin_safe = finite_margin & (flat_margin > args.yopo_preserve_safe_margin_m)
         final_unsafe = geom_unsafe_for_oracle | margin_unsafe
-        safety_oracle_mask = geom_safe_for_oracle & margin_safe & ~final_unsafe
-        if progress is not None and oarm_cfg.yopo_preserve_oracle_min_progress > 0.0:
+        safety_primary_mask = geom_safe_for_oracle & margin_safe & ~final_unsafe
+        fallback_mask = geom_safe_for_oracle & finite_margin & ~final_unsafe
+        if progress is not None and args.yopo_preserve_oracle_min_progress > 0.0:
             flat_progress = progress.reshape(batch_size, -1).to(device=utility.device, dtype=utility.dtype)
-            progress_ok = torch.isfinite(flat_progress) & (flat_progress > oarm_cfg.yopo_preserve_oracle_min_progress)
-            safety_oracle_mask = safety_oracle_mask & progress_ok
+            progress_ok = torch.isfinite(flat_progress) & (flat_progress > args.yopo_preserve_oracle_min_progress)
+            safety_primary_mask = safety_primary_mask & progress_ok
+            fallback_mask = fallback_mask & progress_ok
             add_metric(accumulator, "safety_oracle_progress_ok_rate", progress_ok.float().mean(), batch_size)
+        primary_available = safety_primary_mask.any(dim=1)
+        fallback_available = fallback_mask.any(dim=1) & ~primary_available
+        safety_oracle_mask = torch.where(primary_available[:, None], safety_primary_mask, fallback_mask)
+        if geom_unsafe is not None:
+            add_metric(accumulator, "geom_unsafe_and_margin_safe_rate", (geom_unsafe_for_oracle & margin_safe).float().mean(), batch_size)
+            add_metric(accumulator, "geom_safe_and_margin_unsafe_rate", (geom_safe_for_oracle & margin_unsafe).float().mean(), batch_size)
+        add_metric(accumulator, "safety_oracle_primary_available_rate", primary_available.float().mean(), batch_size)
+        add_metric(accumulator, "safety_oracle_fallback_available_rate", fallback_available.float().mean(), batch_size)
         add_metric(accumulator, "safety_oracle_safe_mask_rate", safety_oracle_mask.float().mean(), batch_size)
         add_metric(accumulator, "safety_oracle_unsafe_mask_rate", final_unsafe.float().mean(), batch_size)
         add_metric(accumulator, "safety_oracle_overlap_rate", (safety_oracle_mask & final_unsafe).float().mean(), batch_size)
@@ -435,6 +487,13 @@ def evaluate(args):
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
     device = torch.device(args.device)
 
+    state_dict = None
+    checkpoint_metadata = {}
+    if args.checkpoint:
+        state_dict, checkpoint_metadata = load_oarm_checkpoint(args.checkpoint, map_location=device)
+    args.yopo_preserve_utility_delta_scale = resolve_utility_delta_scale(args, checkpoint_metadata)
+    apply_checkpoint_eval_protocol(args, checkpoint_metadata)
+
     gt_sampler_options = gt_sampler_options_from_args(args)
     dataset = OARMDataset(
         mode=args.mode,
@@ -444,12 +503,6 @@ def evaluate(args):
         gt_sampler_options=gt_sampler_options,
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-
-    state_dict = None
-    checkpoint_metadata = {}
-    if args.checkpoint:
-        state_dict, checkpoint_metadata = load_oarm_checkpoint(args.checkpoint, map_location=device)
-    args.yopo_preserve_utility_delta_scale = resolve_utility_delta_scale(args, checkpoint_metadata)
 
     policy = OARMNetwork(
         candidate_mode=args.candidate_mode,
@@ -558,6 +611,7 @@ def evaluate(args):
             selected_candidate_stats(
                 candidate,
                 accumulator,
+                args,
                 flat_labels,
                 loss_dict.get("safety_cost_per_candidate"),
                 selected_progress,
@@ -651,6 +705,8 @@ def evaluate(args):
     metrics["deployed_yaw_mode"] = args.deployed_yaw_mode
     metrics["risk_label_source"] = args.risk_label_source
     metrics["yopo_preserve_utility_delta_scale"] = args.yopo_preserve_utility_delta_scale
+    for key in EVAL_PROTOCOL_ARG_KEYS:
+        metrics[key] = getattr(args, key)
     for key in GT_SAMPLER_ARG_KEYS:
         metrics[key] = getattr(args, key)
     metrics["eval_yaw_visibility"] = bool(args.eval_yaw_visibility)
@@ -675,7 +731,7 @@ def parser():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--stage",
-        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "full"],
+        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "full"],
         default="v0",
         help="named evaluation preset matching OARM/train_oarm.py",
     )
@@ -687,6 +743,10 @@ def parser():
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
     p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="")
     p.add_argument("--yopo-preserve-utility-delta-scale", type=float, default=None)
+    p.add_argument("--yopo-preserve-safety-cost-threshold", type=float, default=None)
+    p.add_argument("--yopo-preserve-safe-cost-threshold", type=float, default=None)
+    p.add_argument("--yopo-preserve-safe-margin-m", type=float, default=None)
+    p.add_argument("--yopo-preserve-oracle-min-progress", type=float, default=None)
     p.add_argument("--gt-risk-point-count", type=int, default=None)
     p.add_argument("--gt-hidden-depth-margin-m", type=float, default=None)
     p.add_argument("--gt-min-forward-m", type=float, default=None)
