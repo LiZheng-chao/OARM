@@ -1,0 +1,40 @@
+candidate_mode: yopo_preserve_rerank
+backbone_mode: yopo_original
+train_occlusion_risk: true
+train_risk_point_guidance: true
+train_reaction_margin: true
+train_margin_ranking: false
+risk_label_source: gt_pointcloud
+use_privileged_risk_filter: true
+use_occlusion_aware_visibility: true
+use_esdf_collision: true
+deployed_yaw_mode: goal
+
+yopo_preserve_utility_delta_scale: 0.5
+yopo_preserve_residual_reg_weight: 0.25
+yopo_preserve_freeze_margin_risk_head: true
+
+yopo_preserve_geometry_oracle_source: gt_clearance
+yopo_preserve_unsafe_clearance_m: 0.25
+yopo_preserve_safe_clearance_m: 0.35
+
+# Dense safety guard: among GT-clearance-safe candidates, preserve YOPO base preference.
+yopo_preserve_geometry_ce_weight: 0.75
+yopo_preserve_geometry_ce_temperature: 0.75
+
+# Sparse reaction-margin oracle remains, but with lower weight than the geometry guard.
+yopo_preserve_oracle_ce_weight: 0.5
+yopo_preserve_oracle_ce_temperature: 0.75
+yopo_preserve_oracle_min_margin: 0.0
+yopo_preserve_oracle_min_progress: 0.05
+
+yopo_preserve_unsafe_boost_weight: 0.0
+yopo_preserve_safe_suppression_weight: 0.0
+yopo_preserve_safety_residual_weight: 0.35
+yopo_preserve_safe_clearance_residual_weight: 0.0
+yopo_preserve_safety_pairwise_weight: 0.0
+yopo_preserve_unsafe_delta_target: 0.02
+yopo_preserve_safe_delta_target: 0.0
+
+yopo_preserve_safety_cost_threshold: 0.01
+yopo_preserve_safe_cost_threshold: 0.001

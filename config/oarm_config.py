@@ -118,6 +118,8 @@ class OARMConfig:
     yopo_preserve_oracle_ce_temperature: float = 0.5
     yopo_preserve_oracle_min_margin: float = 0.0
     yopo_preserve_oracle_min_progress: float = 0.0
+    yopo_preserve_geometry_ce_weight: float = 0.0
+    yopo_preserve_geometry_ce_temperature: float = 0.75
     yaw_weight: float = 0.05
     yaw_early_time_tau: float = 0.6
     braking_weight: float = 0.05

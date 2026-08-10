@@ -73,7 +73,9 @@ TRAINING_OPTION_KEYS = (
     "yopo_preserve_oracle_ce_weight",
     "yopo_preserve_oracle_ce_temperature",
     "yopo_preserve_oracle_min_margin",
-    "yopo_preserve_oracle_min_progress",)
+    "yopo_preserve_oracle_min_progress",
+    "yopo_preserve_geometry_ce_weight",
+    "yopo_preserve_geometry_ce_temperature",)
 
 
 def configure_random_seed(seed):

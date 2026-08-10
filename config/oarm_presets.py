@@ -62,6 +62,8 @@ class OARMTrainingPreset:
     yopo_preserve_oracle_ce_temperature: float = oarm_cfg.yopo_preserve_oracle_ce_temperature
     yopo_preserve_oracle_min_margin: float = oarm_cfg.yopo_preserve_oracle_min_margin
     yopo_preserve_oracle_min_progress: float = oarm_cfg.yopo_preserve_oracle_min_progress
+    yopo_preserve_geometry_ce_weight: float = oarm_cfg.yopo_preserve_geometry_ce_weight
+    yopo_preserve_geometry_ce_temperature: float = oarm_cfg.yopo_preserve_geometry_ce_temperature
 
 OARM_TRAINING_PRESETS: Dict[str, OARMTrainingPreset] = {
     "v0": OARMTrainingPreset(candidate_mode="yopo"),
@@ -121,6 +123,8 @@ OARM_TRAINING_PRESETS: Dict[str, OARMTrainingPreset] = {
         yopo_preserve_oracle_ce_temperature=0.5,
         yopo_preserve_oracle_min_margin=0.0,
         yopo_preserve_oracle_min_progress=0.05,
+        yopo_preserve_geometry_ce_weight=0.0,
+        yopo_preserve_geometry_ce_temperature=0.75,
     ),
     "full": OARMTrainingPreset(
         candidate_mode="typed_frontier",

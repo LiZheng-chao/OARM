@@ -105,6 +105,8 @@ class OARMTrainer:
         yopo_preserve_oracle_ce_temperature=oarm_cfg.yopo_preserve_oracle_ce_temperature,
         yopo_preserve_oracle_min_margin=oarm_cfg.yopo_preserve_oracle_min_margin,
         yopo_preserve_oracle_min_progress=oarm_cfg.yopo_preserve_oracle_min_progress,
+        yopo_preserve_geometry_ce_weight=oarm_cfg.yopo_preserve_geometry_ce_weight,
+        yopo_preserve_geometry_ce_temperature=oarm_cfg.yopo_preserve_geometry_ce_temperature,
         experiment_options=None,
         config_path="",
         log_interval=50,
@@ -187,6 +189,8 @@ class OARMTrainer:
         self.yopo_preserve_oracle_ce_temperature = max(float(yopo_preserve_oracle_ce_temperature), 1e-3)
         self.yopo_preserve_oracle_min_margin = float(yopo_preserve_oracle_min_margin)
         self.yopo_preserve_oracle_min_progress = float(yopo_preserve_oracle_min_progress)
+        self.yopo_preserve_geometry_ce_weight = float(yopo_preserve_geometry_ce_weight)
+        self.yopo_preserve_geometry_ce_temperature = max(float(yopo_preserve_geometry_ce_temperature), 1e-3)
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             if self.train_backup_feasibility or self.train_yield_feasibility:
                 raise ValueError("YOPO-preserve modes only support margin/risk/rerank auxiliary training; disable backup/yield feasibility")
@@ -522,9 +526,13 @@ class OARMTrainer:
             safe_clearance_candidate_rate = torch.zeros((), device=self.device)
             safety_pairwise_pair_rate = torch.zeros((), device=self.device)
             oracle_ce_loss = torch.zeros((), device=self.device)
+            geometry_ce_loss = torch.zeros((), device=self.device)
             oracle_ce_pair_rate = torch.zeros((), device=self.device)
             oracle_ce_top1_acc = torch.zeros((), device=self.device)
             oracle_ce_target_margin_mean = torch.zeros((), device=self.device)
+            geometry_ce_pair_rate = torch.zeros((), device=self.device)
+            geometry_ce_top1_acc = torch.zeros((), device=self.device)
+            geometry_ce_target_clearance_mean = torch.zeros((), device=self.device)
             geom_unsafe_mask_rate = torch.zeros((), device=self.device)
             geom_safe_mask_rate = torch.zeros((), device=self.device)
             margin_unsafe_mask_rate = torch.zeros((), device=self.device)
@@ -672,6 +680,9 @@ class OARMTrainer:
                         score_group = pairwise_score.reshape(-1, self.traj_num)
                         unsafe_group = final_unsafe.reshape(-1, self.traj_num)
                         safe_group = final_safe.reshape(-1, self.traj_num)
+                        geom_safe_group = geom_safe.reshape(-1, self.traj_num) if geom_safe is not None else safe_group
+                        if progress_ok is not None:
+                            geom_safe_group = geom_safe_group & progress_ok.reshape(-1, self.traj_num)
                         margin_group = None
                         if margin_label is not None:
                             margin_group = margin_label.reshape(-1, self.traj_num)
@@ -689,6 +700,25 @@ class OARMTrainer:
                             safety_pairwise_loss = (
                                 self.yopo_preserve_safety_pairwise_weight * safety_pairwise_gap.square().mean()
                             )
+                        if self.yopo_preserve_geometry_ce_weight > 0.0 and geom_safe_group is not None:
+                            base_score = flat.get("utility_base", pairwise_score).reshape_as(delta).detach().reshape(-1, self.traj_num)
+                            geometry_available = geom_safe_group.any(dim=1)
+                            geometry_ce_pair_rate = geometry_available.float().mean()
+                            if bool(geometry_available.any()):
+                                neg_inf = torch.full_like(base_score, -float("inf"))
+                                geometry_source = torch.where(geom_safe_group, base_score, neg_inf)
+                                geometry_target_id = geometry_source.max(dim=1).indices
+                                geometry_logits = score_group[geometry_available] / self.yopo_preserve_geometry_ce_temperature
+                                geometry_ce_loss = self.yopo_preserve_geometry_ce_weight * F.cross_entropy(
+                                    geometry_logits, geometry_target_id[geometry_available].long()
+                                )
+                                geometry_ce_top1_acc = (geometry_logits.argmax(dim=1) == geometry_target_id[geometry_available]).float().mean()
+                                if 'min_clearance' in locals():
+                                    clearance_group = min_clearance.reshape(-1, self.traj_num)
+                                    target_clearance = clearance_group.gather(1, geometry_target_id[:, None]).squeeze(1)
+                                    target_valid = geometry_available & torch.isfinite(target_clearance)
+                                    if bool(target_valid.any()):
+                                        geometry_ce_target_clearance_mean = target_clearance[target_valid].mean()
                         if self.yopo_preserve_oracle_ce_weight > 0.0 and margin_group is not None:
                             oracle_group = safe_group
                             primary_available = safe_group.any(dim=1)
@@ -723,6 +753,7 @@ class OARMTrainer:
             loss_dict["safe_clearance_residual_loss"] = safe_clearance_residual_loss
             loss_dict["safety_pairwise_loss"] = safety_pairwise_loss
             loss_dict["oracle_ce_loss"] = oracle_ce_loss
+            loss_dict["geometry_ce_loss"] = geometry_ce_loss
 
             loss_dict["unsafe_residual_positive_rate"] = unsafe_residual_positive_rate
             loss_dict["safe_residual_negative_rate"] = safe_residual_negative_rate
@@ -734,6 +765,9 @@ class OARMTrainer:
             loss_dict["oracle_ce_pair_rate"] = oracle_ce_pair_rate
             loss_dict["oracle_ce_top1_acc"] = oracle_ce_top1_acc
             loss_dict["oracle_ce_target_margin_mean"] = oracle_ce_target_margin_mean
+            loss_dict["geometry_ce_pair_rate"] = geometry_ce_pair_rate
+            loss_dict["geometry_ce_top1_acc"] = geometry_ce_top1_acc
+            loss_dict["geometry_ce_target_clearance_mean"] = geometry_ce_target_clearance_mean
             loss_dict["oracle_ce_primary_rate"] = oracle_ce_primary_rate
             loss_dict["oracle_ce_fallback_rate"] = oracle_ce_fallback_rate
             loss_dict["geom_unsafe_mask_rate"] = geom_unsafe_mask_rate
@@ -762,6 +796,7 @@ class OARMTrainer:
                 + safe_clearance_residual_loss
                 + safety_pairwise_loss
                 + oracle_ce_loss
+                + geometry_ce_loss
             )
         return loss_dict
 
