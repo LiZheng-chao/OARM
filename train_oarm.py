@@ -158,6 +158,7 @@ def parser():
     p.add_argument("--use-fused-adamw", action="store_true")
     p.add_argument("--train-yield-head-only", action="store_true")
     p.add_argument("--no-progress-bar", action="store_true", help="disable the live Rich progress bar; useful for clean log files")
+    p.add_argument("--sample-weights", type=str, default="", help="optional weights from OARM.tools.build_a3_critical_sampler for weighted train sampling")
     return p
 
 
@@ -311,6 +312,7 @@ if __name__ == "__main__":
             "use_fused_adamw": args.use_fused_adamw,
             "train_yield_head_only": args.train_yield_head_only,
             "progress_bar": not args.no_progress_bar,
+            "sample_weights": args.sample_weights,
             **training_options,
         },
         config_path=args.config,
@@ -320,5 +322,6 @@ if __name__ == "__main__":
         use_fused_adamw=args.use_fused_adamw,
         train_yield_head_only=args.train_yield_head_only,
         progress_bar=not args.no_progress_bar,
+        sample_weights_path=args.sample_weights or None,
     )
     trainer.train(epoch=args.epoch)

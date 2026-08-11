@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard.writer import SummaryWriter
 
 from OARM.dataset import OARMDataset
@@ -115,6 +115,7 @@ class OARMTrainer:
         use_fused_adamw=False,
         train_yield_head_only=False,
         progress_bar=True,
+        sample_weights_path=None,
     ):
         self.batch_size = batch_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -129,6 +130,7 @@ class OARMTrainer:
         self.use_fused_adamw = bool(use_fused_adamw)
         self.train_yield_head_only = bool(train_yield_head_only)
         self.progress_bar = bool(progress_bar)
+        self.sample_weights_path = sample_weights_path
         self._frozen_output_rows = None
         self.a1_initialization_report = {}
         self.candidate_mode = candidate_mode
@@ -280,10 +282,19 @@ class OARMTrainer:
         if num_workers and num_workers > 0:
             loader_kwargs["prefetch_factor"] = 1
 
+        train_dataset = OARMDataset(
+            mode="train",
+            dataset_root=self.dataset_root,
+            use_privileged_risk_filter=self.use_privileged_risk_filter,
+            risk_label_source=self.risk_label_source,
+            gt_sampler_options=self.gt_sampler_options,
+        )
+        train_sampler = self.build_train_sampler(train_dataset)
         self.train_dataloader = DataLoader(
-            OARMDataset(mode="train", dataset_root=self.dataset_root, use_privileged_risk_filter=self.use_privileged_risk_filter, risk_label_source=self.risk_label_source, gt_sampler_options=self.gt_sampler_options),
+            train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             num_workers=num_workers,
             pin_memory=True,
             **loader_kwargs,
@@ -296,6 +307,33 @@ class OARMTrainer:
             pin_memory=True,
             **loader_kwargs,
         )
+
+
+    def build_train_sampler(self, train_dataset):
+        if not self.sample_weights_path:
+            return None
+        if not os.path.isfile(self.sample_weights_path):
+            raise FileNotFoundError(f"A3 critical sample weights not found: {self.sample_weights_path}")
+        try:
+            payload = torch.load(self.sample_weights_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            payload = torch.load(self.sample_weights_path, map_location="cpu")
+        weights = payload.get("weights") if isinstance(payload, dict) else payload
+        weights = torch.as_tensor(weights, dtype=torch.double).reshape(-1)
+        if weights.numel() != len(train_dataset):
+            raise ValueError(
+                f"Sample weights length {weights.numel()} does not match train dataset length {len(train_dataset)}. "
+                "Regenerate weights with OARM.tools.build_a3_critical_sampler --mode train for the same dataset root."
+            )
+        finite = torch.isfinite(weights) & (weights > 0.0)
+        if not bool(finite.all()):
+            bad = int((~finite).sum().item())
+            raise ValueError(f"Sample weights must be finite and positive; invalid entries: {bad}")
+        self.progress_log.console.log(
+            f"Using weighted A3 critical-frame sampler from {self.sample_weights_path}; "
+            f"mean={weights.mean().item():.3g}, max={weights.max().item():.3g}"
+        )
+        return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
 
     def load_a1_initialization_checkpoint(self, checkpoint_path, allow_mismatch=False):
