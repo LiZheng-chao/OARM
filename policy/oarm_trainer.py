@@ -533,10 +533,13 @@ class OARMTrainer:
             geometry_ce_pair_rate = torch.zeros((), device=self.device)
             geometry_ce_top1_acc = torch.zeros((), device=self.device)
             geometry_ce_target_clearance_mean = torch.zeros((), device=self.device)
+            geometry_ce_suppressed_by_oracle_rate = torch.zeros((), device=self.device)
             geom_unsafe_mask_rate = torch.zeros((), device=self.device)
             geom_safe_mask_rate = torch.zeros((), device=self.device)
             margin_unsafe_mask_rate = torch.zeros((), device=self.device)
             margin_safe_mask_rate = torch.zeros((), device=self.device)
+            hard_unsafe_mask_rate = torch.zeros((), device=self.device)
+            hard_safe_mask_rate = torch.zeros((), device=self.device)
             final_unsafe_mask_rate = torch.zeros((), device=self.device)
             final_safe_mask_rate = torch.zeros((), device=self.device)
             safe_and_unsafe_overlap_rate = torch.zeros((), device=self.device)
@@ -557,6 +560,8 @@ class OARMTrainer:
                     finite_delta = torch.isfinite(delta)
                     final_unsafe = None
                     final_safe = None
+                    hard_unsafe = None
+                    hard_safe = None
                     progress_ok = None
                     geom_unsafe = None
                     geom_safe = None
@@ -623,6 +628,14 @@ class OARMTrainer:
                         progress_ok = finite_delta & torch.isfinite(progress_score) & (progress_score > self.yopo_preserve_oracle_min_progress)
 
                     if geom_unsafe is not None:
+                        hard_unsafe = geom_unsafe
+                        hard_safe = geom_safe & ~geom_unsafe
+                        if progress_ok is not None:
+                            hard_safe = hard_safe & progress_ok
+                        hard_unsafe_mask_rate = hard_unsafe.float().mean()
+                        hard_safe_mask_rate = hard_safe.float().mean()
+
+                    if geom_unsafe is not None:
                         if margin_unsafe is not None:
                             final_unsafe = geom_unsafe | margin_unsafe
                             final_safe = geom_safe & margin_safe & ~final_unsafe
@@ -643,12 +656,12 @@ class OARMTrainer:
                         safe_and_unsafe_overlap_rate = overlap.float().mean()
                         if bool(overlap.any()):
                             raise RuntimeError("A3 safety masks must be mutually exclusive, but safe&unsafe overlap was nonzero")
-                        if bool(final_unsafe.any()):
-                            unsafe_positive = torch.relu(delta[final_unsafe])
+                        if hard_unsafe is not None and bool(hard_unsafe.any()):
+                            unsafe_positive = torch.relu(delta[hard_unsafe])
                             unsafe_boost_loss = (
                                 self.yopo_preserve_unsafe_boost_weight * unsafe_positive.square().mean()
                             )
-                            unsafe_residual_positive_rate = (delta[final_unsafe] > 0.0).float().mean()
+                            unsafe_residual_positive_rate = (delta[hard_unsafe] > 0.0).float().mean()
                         if bool(final_safe.any()):
                             safe_negative = torch.relu(-delta[final_safe])
                             safe_suppression_loss = (
@@ -656,8 +669,8 @@ class OARMTrainer:
                             )
                             safe_residual_negative_rate = (delta[final_safe] < 0.0).float().mean()
 
-                    residual_unsafe = final_unsafe if final_unsafe is not None else geom_unsafe
-                    residual_safe = final_safe if final_safe is not None else (geom_safe & ~geom_unsafe if geom_safe is not None and geom_unsafe is not None else geom_safe)
+                    residual_unsafe = hard_unsafe
+                    residual_safe = hard_safe
                     if residual_unsafe is not None and bool(residual_unsafe.any()) and self.yopo_preserve_safety_residual_weight > 0.0:
                         safety_positive = torch.relu(delta[residual_unsafe] + self.yopo_preserve_unsafe_delta_target)
                         safety_residual_loss = (
@@ -686,6 +699,22 @@ class OARMTrainer:
                         margin_group = None
                         if margin_label is not None:
                             margin_group = margin_label.reshape(-1, self.traj_num)
+                        has_oracle = torch.zeros(score_group.shape[0], dtype=torch.bool, device=self.device)
+                        oracle_group = safe_group
+                        primary_available = safe_group.any(dim=1)
+                        fallback_available = torch.zeros_like(primary_available)
+                        if margin_group is not None:
+                            if geom_safe is not None and margin_valid is not None:
+                                fallback = geom_safe & margin_valid
+                                if progress_ok is not None:
+                                    fallback = fallback & progress_ok
+                                fallback_group = fallback.reshape(-1, self.traj_num)
+                                fallback_available = fallback_group.any(dim=1) & ~primary_available
+                                oracle_group = torch.where(primary_available[:, None], safe_group, fallback_group)
+                            neg_inf = torch.full_like(margin_group, -float("inf"))
+                            oracle_source = torch.where(oracle_group, margin_group, neg_inf)
+                            oracle_margin, oracle_id = oracle_source.max(dim=1)
+                            has_oracle = torch.isfinite(oracle_margin) & oracle_group.any(dim=1)
                         has_safety_pair = unsafe_group.any(dim=1) & safe_group.any(dim=1)
                         safety_pairwise_pair_rate = has_safety_pair.float().mean()
                         if self.yopo_preserve_safety_pairwise_weight > 0.0 and bool(has_safety_pair.any()):
@@ -702,8 +731,10 @@ class OARMTrainer:
                             )
                         if self.yopo_preserve_geometry_ce_weight > 0.0 and geom_safe_group is not None:
                             base_score = flat.get("utility_base", pairwise_score).reshape_as(delta).detach().reshape(-1, self.traj_num)
-                            geometry_available = geom_safe_group.any(dim=1)
+                            geometry_available_raw = geom_safe_group.any(dim=1)
+                            geometry_available = geometry_available_raw & ~has_oracle
                             geometry_ce_pair_rate = geometry_available.float().mean()
+                            geometry_ce_suppressed_by_oracle_rate = (geometry_available_raw & has_oracle).float().mean()
                             if bool(geometry_available.any()):
                                 neg_inf = torch.full_like(base_score, -float("inf"))
                                 geometry_source = torch.where(geom_safe_group, base_score, neg_inf)
@@ -720,20 +751,6 @@ class OARMTrainer:
                                     if bool(target_valid.any()):
                                         geometry_ce_target_clearance_mean = target_clearance[target_valid].mean()
                         if self.yopo_preserve_oracle_ce_weight > 0.0 and margin_group is not None:
-                            oracle_group = safe_group
-                            primary_available = safe_group.any(dim=1)
-                            fallback_available = torch.zeros_like(primary_available)
-                            if geom_safe is not None and margin_valid is not None:
-                                fallback = geom_safe & margin_valid
-                                if progress_ok is not None:
-                                    fallback = fallback & progress_ok
-                                fallback_group = fallback.reshape(-1, self.traj_num)
-                                fallback_available = fallback_group.any(dim=1) & ~primary_available
-                                oracle_group = torch.where(primary_available[:, None], safe_group, fallback_group)
-                            neg_inf = torch.full_like(margin_group, -float("inf"))
-                            oracle_source = torch.where(oracle_group, margin_group, neg_inf)
-                            oracle_margin, oracle_id = oracle_source.max(dim=1)
-                            has_oracle = torch.isfinite(oracle_margin) & oracle_group.any(dim=1)
                             oracle_ce_pair_rate = has_oracle.float().mean()
                             oracle_ce_primary_rate = (primary_available & has_oracle).float().mean()
                             oracle_ce_fallback_rate = (fallback_available & has_oracle).float().mean()
@@ -774,6 +791,8 @@ class OARMTrainer:
             loss_dict["geom_safe_mask_rate"] = geom_safe_mask_rate
             loss_dict["margin_unsafe_mask_rate"] = margin_unsafe_mask_rate
             loss_dict["margin_safe_mask_rate"] = margin_safe_mask_rate
+            loss_dict["hard_unsafe_mask_rate"] = hard_unsafe_mask_rate
+            loss_dict["hard_safe_mask_rate"] = hard_safe_mask_rate
             loss_dict["final_unsafe_mask_rate"] = final_unsafe_mask_rate
             loss_dict["final_safe_mask_rate"] = final_safe_mask_rate
             loss_dict["safe_and_unsafe_overlap_rate"] = safe_and_unsafe_overlap_rate
@@ -784,6 +803,7 @@ class OARMTrainer:
             loss_dict["gt_clearance_valid_rate"] = gt_clearance_valid_rate
             loss_dict["gt_clearance_unsafe_candidate_rate"] = gt_clearance_unsafe_candidate_rate
             loss_dict["gt_clearance_safe_candidate_rate"] = gt_clearance_safe_candidate_rate
+            loss_dict["geometry_ce_suppressed_by_oracle_rate"] = geometry_ce_suppressed_by_oracle_rate
 
             loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
             loss_dict["total_loss"] = (

@@ -18,11 +18,11 @@ yopo_preserve_geometry_oracle_source: gt_clearance
 yopo_preserve_unsafe_clearance_m: 0.25
 yopo_preserve_safe_clearance_m: 0.35
 
-# Dense safety guard: among GT-clearance-safe candidates, preserve YOPO base preference.
+# Geometry guard: among GT-clearance-safe candidates, preserve YOPO base preference when no reaction-margin oracle target exists.
 yopo_preserve_geometry_ce_weight: 0.75
 yopo_preserve_geometry_ce_temperature: 0.75
 
-# Sparse reaction-margin oracle remains, but with lower weight than the geometry guard.
+# Sparse reaction-margin oracle has priority on frames where a valid margin oracle target exists.
 yopo_preserve_oracle_ce_weight: 0.5
 yopo_preserve_oracle_ce_temperature: 0.75
 yopo_preserve_oracle_min_margin: 0.0
