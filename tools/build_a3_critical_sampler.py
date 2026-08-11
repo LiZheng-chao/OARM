@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from OARM.config import oarm_cfg
 from OARM.dataset import OARMDataset
-from OARM.eval.eval_dataset import build_world_states, flatten_labels
+from OARM.eval.eval_dataset import build_world_states, flatten_labels, maybe_generate_reaction_margin_labels
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.utils.checkpoint import load_oarm_checkpoint
@@ -92,7 +92,20 @@ def batch_records(args, batch_start: int, batch, policy, loss_fn, dataset_root: 
         flat = candidate.flatten()
         start_state_w, end_state_w, goal_w = build_world_states(pos, rot, obs_b, flat)
         map_id_expanded = map_id.repeat_interleave(traj_num)
-        flat_labels = flatten_labels(labels, flat, device, metric_args())
+        eval_args = metric_args()
+        flat_labels = flatten_labels(labels, flat, device, eval_args)
+        flat_labels = maybe_generate_reaction_margin_labels(
+            flat_labels,
+            flat,
+            start_state_w,
+            end_state_w,
+            map_id_expanded,
+            goal_w,
+            eval_args,
+            loss_fn.margin_labeler,
+            loss_fn.line_of_sight,
+            loss_fn,
+        )
         loss_dict = loss_fn(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
         margin = flat_labels.get("reaction_margin")
         valid = flat_labels.get("reaction_margin_valid")
@@ -106,9 +119,15 @@ def batch_records(args, batch_start: int, batch, policy, loss_fn, dataset_root: 
         clearance_valid = torch.isfinite(min_clearance)
         geom_safe = clearance_valid & (min_clearance > args.safe_clearance_m)
         geom_unsafe = clearance_valid & (min_clearance < args.unsafe_clearance_m)
-        geom_margin_valid = geom_safe & valid
+        progress_score = -OARMLoss.goal_progress_cost(start_state_w, end_state_w, goal_w, flat["traj_time"]).reshape(-1, traj_num)
+        if args.oracle_min_progress > 0.0:
+            progress_ok = torch.isfinite(progress_score) & (progress_score > args.oracle_min_progress)
+        else:
+            progress_ok = torch.isfinite(progress_score)
+        geom_margin_valid = geom_safe & valid & progress_ok
         valid_count = valid.sum(dim=1)
         geom_valid_count = geom_margin_valid.sum(dim=1)
+        progress_ok_count = progress_ok.sum(dim=1)
         positive_count = (geom_margin_valid & (margin > 0.0)).sum(dim=1)
         negative_count = (geom_margin_valid & (margin < 0.0)).sum(dim=1)
         margin_min = masked_min(margin, geom_margin_valid)
@@ -140,6 +159,7 @@ def batch_records(args, batch_start: int, batch, policy, loss_fn, dataset_root: 
                     "positive_count": int(positive_count[i].detach().cpu()),
                     "negative_count": int(negative_count[i].detach().cpu()),
                     "geom_safe_count": int(geom_safe[i].sum().detach().cpu()),
+                    "progress_ok_count": int(progress_ok_count[i].detach().cpu()),
                     "geom_unsafe_count": int(geom_unsafe[i].sum().detach().cpu()),
                     "margin_min": None if not bool(oracle_available[i]) else float(margin_min[i].detach().cpu()),
                     "margin_max": None if not bool(oracle_available[i]) else float(margin_max[i].detach().cpu()),
@@ -165,10 +185,22 @@ def summarize(records: List[Dict]) -> Dict:
     def mean(key):
         vals = [r[key] for r in records if r.get(key) is not None and math.isfinite(float(r[key]))]
         return sum(float(v) for v in vals) / max(len(vals), 1)
+    weight_sum = sum(float(r.get("sample_weight", 0.0)) for r in records)
+    weight_sum = max(weight_sum, 1e-9)
+    def weighted_rate(key):
+        return sum(float(r.get("sample_weight", 0.0)) for r in records if r.get(key)) / weight_sum
+    def weighted_mean(key):
+        vals = [(float(r.get("sample_weight", 0.0)), r.get(key)) for r in records]
+        vals = [(w, float(v)) for w, v in vals if v is not None and math.isfinite(float(v)) and w > 0.0]
+        denom = sum(w for w, _v in vals)
+        return sum(w * v for w, v in vals) / max(denom, 1e-9)
     hist = {}
+    weighted_hist = {}
     for r in records:
         c = int(r["geom_margin_valid_count"])
-        hist[str(c)] = hist.get(str(c), 0) + 1
+        key = str(c)
+        hist[key] = hist.get(key, 0) + 1
+        weighted_hist[key] = weighted_hist.get(key, 0.0) + float(r.get("sample_weight", 0.0)) / weight_sum
     return {
         "sample_count": len(records),
         "oracle_available_rate": rate("oracle_available"),
@@ -177,15 +209,40 @@ def summarize(records: List[Dict]) -> Dict:
         "high_spread_rate": rate("high_spread"),
         "valid_rich_rate": rate("valid_rich"),
         "all_negative_rate": rate("all_negative"),
+        "weighted_oracle_available_rate": weighted_rate("oracle_available"),
+        "weighted_rank_informative_rate": weighted_rate("rank_informative"),
+        "weighted_mixed_sign_rate": weighted_rate("mixed_sign"),
+        "weighted_high_spread_rate": weighted_rate("high_spread"),
+        "weighted_valid_rich_rate": weighted_rate("valid_rich"),
+        "weighted_all_negative_rate": weighted_rate("all_negative"),
         "valid_candidate_count_mean": mean("valid_candidate_count"),
         "geom_margin_valid_count_mean": mean("geom_margin_valid_count"),
+        "weighted_geom_margin_valid_count_mean": weighted_mean("geom_margin_valid_count"),
         "positive_count_mean": mean("positive_count"),
         "negative_count_mean": mean("negative_count"),
         "margin_spread_mean": mean("margin_spread"),
+        "weighted_margin_spread_mean": weighted_mean("margin_spread"),
         "sample_weight_mean": mean("sample_weight"),
         "sample_weight_max": max((float(r["sample_weight"]) for r in records), default=0.0),
         "geom_margin_valid_count_hist": hist,
+        "weighted_geom_margin_valid_count_hist": weighted_hist,
     }
+
+
+def dataset_identity(dataset_root: str, mode: str, sample_count: int) -> Dict:
+    root = Path(dataset_root).resolve()
+    pose_files = sorted(root.glob("pose-*.csv"), key=lambda item: item.name)
+    pointcloud_files = sorted(root.glob("pointcloud-*.ply"), key=lambda item: item.name)
+    payload = {
+        "dataset_root": str(root),
+        "mode": mode,
+        "sample_count": int(sample_count),
+        "pose_file_count": len(pose_files),
+        "pointcloud_file_count": len(pointcloud_files),
+        "pose_files": [item.name for item in pose_files[:8]],
+        "pointcloud_files": [item.name for item in pointcloud_files[:8]],
+    }
+    return payload
 
 
 def write_jsonl(path: Path, records: Iterable[Dict]) -> None:
@@ -252,7 +309,9 @@ def main():
                 print(f"scanned_batches={step + 1} samples={seen}")
     weights = torch.cat(weight_chunks, dim=0) if weight_chunks else torch.empty(0, dtype=torch.float32)
     summary = summarize(records)
+    identity = dataset_identity(dataset_root, args.mode, len(records))
     payload = {
+        "dataset_identity": identity,
         "dataset_root": str(dataset_root),
         "mode": args.mode,
         "candidate_mode": args.candidate_mode,
@@ -263,6 +322,7 @@ def main():
             "safe_clearance_m": args.safe_clearance_m,
             "min_valid_candidates": args.min_valid_candidates,
             "min_margin_spread": args.min_margin_spread,
+            "oracle_min_progress": args.oracle_min_progress,
         },
         "weighting": {
             "normal_weight": args.normal_weight,
@@ -315,6 +375,7 @@ def parser():
     p.add_argument("--safe-clearance-m", type=float, default=0.35)
     p.add_argument("--min-valid-candidates", type=int, default=5)
     p.add_argument("--min-margin-spread", type=float, default=0.20)
+    p.add_argument("--oracle-min-progress", type=float, default=oarm_cfg.yopo_preserve_oracle_min_progress)
     p.add_argument("--normal-weight", type=float, default=1.0)
     p.add_argument("--oracle-bonus", type=float, default=3.0)
     p.add_argument("--mixed-sign-bonus", type=float, default=6.0)

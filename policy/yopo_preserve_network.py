@@ -159,7 +159,9 @@ class YOPOPreserveOARMNetwork(nn.Module):
         return endstate_pred, score_pred, aux
 
     def inference(self, depth: torch.Tensor, obs: torch.Tensor) -> OARMCandidate:
-        obs_norm = self.state_transform.normalize_obs(obs)
+        # YOPO's StateTransform normalizes in-place; keep caller-owned obs intact
+        # because eval code also uses obs_b to build world-frame states.
+        obs_norm = self.state_transform.normalize_obs(obs.clone())
         obs_prepared = self.state_transform.prepare_input(obs_norm)
         endstate_pred, score_pred, aux = self.forward(depth, obs_prepared)
         end_state_b = self.state_transform.pred_to_endstate(endstate_pred)

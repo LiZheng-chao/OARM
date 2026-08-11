@@ -70,7 +70,7 @@ def _forward_bundle(policy, depth, pos, rot, obs_b, map_id, labels, loss_fn, dat
         "flat": flat,
         "end_state_b": flat["end_state_b"].reshape(-1, traj_num, 9),
         "traj_time": flat["traj_time"].reshape(-1, traj_num),
-        "margin_pred": flat.get("reaction_margin", torch.zeros_like(flat["traj_time"])).reshape(-1, traj_num),
+        "margin_pred": flat.get("margin_pred", torch.zeros_like(flat["traj_time"])).reshape(-1, traj_num),
         "risk_logit": flat.get("risk_logit", torch.zeros_like(flat["traj_time"])).reshape(-1, traj_num),
         "utility_base": utility_base,
         "utility_delta": utility_delta,
@@ -124,8 +124,8 @@ def run(args):
         a3h, a3h_meta = _load_policy(args.a3h_checkpoint, "yopo_preserve_rerank", device)
         loss_fn = OARMLoss(enable_occlusion_risk=True, enable_risk_point_guidance=True, enable_reaction_margin=True, enable_margin_ranking=True).to(device)
         with torch.inference_mode():
-            a1_out = _forward_bundle(a1, depth, pos, rot, obs_b, map_id, labels, loss_fn, dataset_root)
-            a3h_out = _forward_bundle(a3h, depth, pos, rot, obs_b, map_id, labels, loss_fn, dataset_root)
+            a1_out = _forward_bundle(a1, depth, pos, rot, obs_b.clone(), map_id, labels, loss_fn, dataset_root)
+            a3h_out = _forward_bundle(a3h, depth, pos, rot, obs_b.clone(), map_id, labels, loss_fn, dataset_root)
 
     label = a1_out["reaction_margin_label"]
     label_valid = a1_out["reaction_margin_valid"]

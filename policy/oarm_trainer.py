@@ -319,6 +319,27 @@ class OARMTrainer:
         except TypeError:
             payload = torch.load(self.sample_weights_path, map_location="cpu")
         weights = payload.get("weights") if isinstance(payload, dict) else payload
+        if isinstance(payload, dict):
+            summary = payload.get("summary") or {}
+            identity = summary.get("dataset_identity") or {}
+            mode = identity.get("mode")
+            if mode not in {None, "train"}:
+                raise ValueError(f"Sample weights were generated for mode={mode}, but training requires mode=train")
+            weight_root = identity.get("dataset_root")
+            if weight_root:
+                current_root = os.path.realpath(self.dataset_root)
+                stored_root = os.path.realpath(weight_root)
+                roots_match = current_root == stored_root
+                if not roots_match and os.path.exists(current_root) and os.path.exists(stored_root):
+                    try:
+                        roots_match = os.path.samefile(current_root, stored_root)
+                    except OSError:
+                        roots_match = False
+                if not roots_match:
+                    raise ValueError(
+                        "Sample weights dataset root does not match current training dataset. "
+                        f"weights={weight_root}, current={self.dataset_root}. Regenerate weights for this dataset."
+                    )
         weights = torch.as_tensor(weights, dtype=torch.double).reshape(-1)
         if weights.numel() != len(train_dataset):
             raise ValueError(
