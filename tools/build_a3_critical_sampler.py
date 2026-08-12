@@ -10,13 +10,14 @@ from torch.utils.data import DataLoader
 
 from OARM.config import oarm_cfg
 from OARM.dataset import OARMDataset
-from OARM.eval.eval_dataset import build_world_states, flatten_labels, maybe_generate_reaction_margin_labels
+from OARM.eval.eval_dataset import build_world_states, flatten_labels
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.utils.checkpoint import load_oarm_checkpoint
 from OARM.utils.gt_clearance import candidate_min_clearance_gt
 from OARM.utils.yopo_dataset_context import resolve_dataset_dir, yopo_dataset_cfg
 from OARM.utils.yopo_compat import ensure_yopo_path
+from OARM.visibility.reaction_margin_targets import generate_reaction_margin_labels
 
 ensure_yopo_path()
 from config.config import cfg
@@ -94,17 +95,17 @@ def batch_records(args, batch_start: int, batch, policy, loss_fn, dataset_root: 
         map_id_expanded = map_id.repeat_interleave(traj_num)
         eval_args = metric_args()
         flat_labels = flatten_labels(labels, flat, device, eval_args)
-        flat_labels = maybe_generate_reaction_margin_labels(
+        flat_labels = generate_reaction_margin_labels(
             flat_labels,
             flat,
             start_state_w,
             end_state_w,
             map_id_expanded,
             goal_w,
-            eval_args,
-            loss_fn.margin_labeler,
-            loss_fn.line_of_sight,
-            loss_fn,
+            enabled=eval_args.eval_reaction_margin,
+            labeler=loss_fn.margin_labeler,
+            line_of_sight=loss_fn.line_of_sight,
+            yaw_helper=loss_fn,
         )
         loss_dict = loss_fn(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
         margin = flat_labels.get("reaction_margin")

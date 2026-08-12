@@ -25,6 +25,7 @@ from OARM.utils.gt_clearance import candidate_min_clearance_gt
 from OARM.utils.visible_free_distance import visible_free_distance_from_depth
 from OARM.utils.yopo_compat import ensure_yopo_path
 from OARM.utils.yopo_dataset_context import resolve_dataset_dir, yopo_dataset_cfg
+from OARM.visibility.reaction_margin_targets import generate_reaction_margin_labels
 
 ensure_yopo_path()
 from config.config import cfg
@@ -131,6 +132,11 @@ class OARMTrainer:
         self.train_yield_head_only = bool(train_yield_head_only)
         self.progress_bar = bool(progress_bar)
         self.sample_weights_path = sample_weights_path
+        self.oracle_ce_sanity_window = 50
+        self._oracle_ce_sanity_seen = 0
+        self._oracle_ce_sanity_pair_rate_sum = 0.0
+        self._oracle_ce_sanity_loss_sum = 0.0
+        self._oracle_ce_sanity_reported = False
         self._frozen_output_rows = None
         self.a1_initialization_report = {}
         self.candidate_mode = candidate_mode
@@ -458,6 +464,7 @@ class OARMTrainer:
                 raise RuntimeError(f"Non-finite model parameters after optimizer step at epoch {epoch}, step {step}")
             losses.append(total_loss.item())
             self.log_losses("Train", loss_dict, epoch, step)
+            self.update_oracle_ce_sanity(loss_dict, epoch, step)
             self.log_progress("Train", epoch, step, total_steps, losses, epoch_start)
             self.progress_log.update(one_epoch_progress, advance=1)
             if total_progress is not None:
@@ -562,6 +569,19 @@ class OARMTrainer:
             )
 
         map_id_expanded = map_id.to(self.device).repeat_interleave(self.traj_num, dim=0)
+        if self.train_reaction_margin:
+            flat_labels = generate_reaction_margin_labels(
+                flat_labels,
+                flat,
+                start_state_w,
+                end_state_w,
+                map_id_expanded,
+                goal_w,
+                enabled=True,
+                labeler=self.oarm_loss.margin_labeler,
+                line_of_sight=self.oarm_loss.line_of_sight,
+                yaw_helper=self.oarm_loss,
+            )
         loss_dict = self.oarm_loss(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
             aux_loss = torch.zeros((), device=self.device)
@@ -617,8 +637,8 @@ class OARMTrainer:
                 if delta is not None:
                     residual_reg = self.yopo_preserve_residual_reg_weight * delta.square().mean()
                     finite_delta = torch.isfinite(delta)
-                    final_unsafe = None
-                    final_safe = None
+                    selector_unsafe = None
+                    selector_safe = None
                     hard_unsafe = None
                     hard_safe = None
                     progress_ok = None
@@ -696,22 +716,22 @@ class OARMTrainer:
 
                     if geom_unsafe is not None:
                         if margin_unsafe is not None:
-                            final_unsafe = geom_unsafe | margin_unsafe
-                            final_safe = geom_safe & margin_safe & ~final_unsafe
+                            selector_unsafe = geom_unsafe | margin_unsafe
+                            selector_safe = geom_safe & margin_safe & ~selector_unsafe
                         else:
-                            final_unsafe = geom_unsafe
-                            final_safe = geom_safe & ~final_unsafe
+                            selector_unsafe = geom_unsafe
+                            selector_safe = geom_safe & ~selector_unsafe
                     elif margin_unsafe is not None:
-                        final_unsafe = margin_unsafe
-                        final_safe = margin_safe & ~final_unsafe
+                        selector_unsafe = margin_unsafe
+                        selector_safe = margin_safe & ~selector_unsafe
 
-                    if final_safe is not None and progress_ok is not None:
-                        final_safe = final_safe & progress_ok
+                    if selector_safe is not None and progress_ok is not None:
+                        selector_safe = selector_safe & progress_ok
 
-                    if final_unsafe is not None and final_safe is not None:
-                        overlap = final_unsafe & final_safe
-                        final_unsafe_mask_rate = final_unsafe.float().mean()
-                        final_safe_mask_rate = final_safe.float().mean()
+                    if selector_unsafe is not None and selector_safe is not None:
+                        overlap = selector_unsafe & selector_safe
+                        final_unsafe_mask_rate = selector_unsafe.float().mean()
+                        final_safe_mask_rate = selector_safe.float().mean()
                         safe_and_unsafe_overlap_rate = overlap.float().mean()
                         if bool(overlap.any()):
                             raise RuntimeError("A3 safety masks must be mutually exclusive, but safe&unsafe overlap was nonzero")
@@ -721,12 +741,12 @@ class OARMTrainer:
                                 self.yopo_preserve_unsafe_boost_weight * unsafe_positive.square().mean()
                             )
                             unsafe_residual_positive_rate = (delta[hard_unsafe] > 0.0).float().mean()
-                        if bool(final_safe.any()):
-                            safe_negative = torch.relu(-delta[final_safe])
+                        if bool(selector_safe.any()):
+                            safe_negative = torch.relu(-delta[selector_safe])
                             safe_suppression_loss = (
                                 self.yopo_preserve_safe_suppression_weight * safe_negative.square().mean()
                             )
-                            safe_residual_negative_rate = (delta[final_safe] < 0.0).float().mean()
+                            safe_residual_negative_rate = (delta[selector_safe] < 0.0).float().mean()
 
                     residual_unsafe = hard_unsafe
                     residual_safe = hard_safe
@@ -744,14 +764,14 @@ class OARMTrainer:
                         safe_clearance_residual_negative_rate = (delta[residual_safe] < 0.0).float().mean()
 
                     if (
-                        final_unsafe is not None
-                        and final_safe is not None
+                        selector_unsafe is not None
+                        and selector_safe is not None
                         and delta.numel() % self.traj_num == 0
                     ):
                         pairwise_score = flat.get("utility_score", delta).reshape_as(delta)
                         score_group = pairwise_score.reshape(-1, self.traj_num)
-                        unsafe_group = final_unsafe.reshape(-1, self.traj_num)
-                        safe_group = final_safe.reshape(-1, self.traj_num)
+                        unsafe_group = selector_unsafe.reshape(-1, self.traj_num)
+                        safe_group = selector_safe.reshape(-1, self.traj_num)
                         geom_safe_group = geom_safe.reshape(-1, self.traj_num) if geom_safe is not None else safe_group
                         if progress_ok is not None:
                             geom_safe_group = geom_safe_group & progress_ok.reshape(-1, self.traj_num)
@@ -878,6 +898,52 @@ class OARMTrainer:
                 + geometry_ce_loss
             )
         return loss_dict
+
+    def update_oracle_ce_sanity(self, loss_dict, epoch, step):
+        if self._oracle_ce_sanity_reported:
+            return
+        if self.candidate_mode != "yopo_preserve_rerank":
+            return
+        if not self.train_reaction_margin or self.yopo_preserve_oracle_ce_weight <= 0.0:
+            return
+        pair_rate = loss_dict.get("oracle_ce_pair_rate")
+        oracle_loss = loss_dict.get("oracle_ce_loss")
+        if pair_rate is None or oracle_loss is None:
+            return
+        pair_rate_value = self._scalar_value(pair_rate)
+        oracle_loss_value = self._scalar_value(oracle_loss)
+        primary_rate = self._scalar_value(loss_dict.get("oracle_ce_primary_rate", 0.0))
+        fallback_rate = self._scalar_value(loss_dict.get("oracle_ce_fallback_rate", 0.0))
+        suppressed_rate = self._scalar_value(loss_dict.get("geometry_ce_suppressed_by_oracle_rate", 0.0))
+        self._oracle_ce_sanity_seen += 1
+        self._oracle_ce_sanity_pair_rate_sum += pair_rate_value
+        self._oracle_ce_sanity_loss_sum += oracle_loss_value
+        if pair_rate_value > 1e-8:
+            self.progress_log.console.log(
+                "A3 oracle CE sanity OK: "
+                f"epoch={epoch}, step={step + 1}, pair_rate={pair_rate_value:.4g}, "
+                f"loss={oracle_loss_value:.4g}, primary={primary_rate:.4g}, "
+                f"fallback={fallback_rate:.4g}, geom_suppressed={suppressed_rate:.4g}"
+            )
+            self._oracle_ce_sanity_reported = True
+            return
+        if self._oracle_ce_sanity_seen >= self.oracle_ce_sanity_window:
+            avg_pair = self._oracle_ce_sanity_pair_rate_sum / max(self._oracle_ce_sanity_seen, 1)
+            avg_loss = self._oracle_ce_sanity_loss_sum / max(self._oracle_ce_sanity_seen, 1)
+            self.progress_log.console.log(
+                "A3 oracle CE sanity WARNING: "
+                f"first {self._oracle_ce_sanity_seen} train batches had avg_pair_rate={avg_pair:.4g}, "
+                f"avg_loss={avg_loss:.4g}. Check reaction-margin labels, risk_points_w, and sampler coverage."
+            )
+            global_step = epoch * max(1, len(self.train_dataloader)) + step
+            self.tensorboard_log.add_scalar("Train/oracle_ce_sanity_warning", 1.0, global_step)
+            self._oracle_ce_sanity_reported = True
+
+    @staticmethod
+    def _scalar_value(value):
+        if torch.is_tensor(value):
+            return float(value.detach().cpu())
+        return float(value)
 
     def log_losses(self, prefix, loss_dict, epoch, step):
         global_step = epoch * max(1, len(self.train_dataloader)) + step
