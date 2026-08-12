@@ -11,6 +11,7 @@ from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
 from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial, sample_yaw_cubic, yaw_cubic_coefficients
 from OARM.utils.yopo_compat import ensure_yopo_path
 from OARM.visibility.reaction_margin_labeler import ReactionMarginLabeler
+from OARM.visibility.reaction_margin_targets import generate_reaction_margin_labels
 from OARM.visibility.risk_point_association import associate_risk_points_to_trajectory
 
 ensure_yopo_path()
@@ -249,28 +250,31 @@ class OARMLoss(nn.Module):
                 losses["risk_loss"] = risk_loss
                 losses["risk_cost"] = point_risk_label.mean()
             if self.enable_reaction_margin and (labels is None or "reaction_margin" not in labels):
-                margin_labels = self.margin_labeler(
-                    margin_pos,
-                    sampled_time,
-                    yaw_ref,
-                    risk_points_w,
-                    risk_weight,
-                    visibility_mask=visibility_mask,
+                labels = generate_reaction_margin_labels(
+                    dict(labels or {}),
+                    candidate_flat,
+                    start_state_w,
+                    end_state_w,
+                    map_id if map_id is not None else torch.zeros_like(traj_time, dtype=torch.long),
+                    goal_w,
+                    enabled=True,
+                    labeler=self.margin_labeler,
+                    line_of_sight=self.line_of_sight if map_id is not None else None,
+                    yaw_helper=self,
+                    eval_points=self.eval_points,
+                    include_diagnostics=True,
+                    risk_weight_override=risk_weight,
                 )
-                labels = dict(labels or {})
-                labels["reaction_margin"] = margin_labels["reaction_margin_softmin"].detach()
-                labels["reaction_margin_valid"] = margin_labels["reaction_margin_valid"].detach()
-                labels["reaction_margin_censored"] = margin_labels["reaction_margin_censored"].detach()
-                valid = margin_labels["reaction_margin_valid"].bool()
+                valid = labels["reaction_margin_valid"].bool()
                 zero = torch.zeros((), device=total_cost.device)
                 losses["generated_margin_valid_rate"] = valid.float().mean()
-                losses["generated_margin_censored_rate"] = margin_labels["reaction_margin_censored"].float().mean()
+                losses["generated_margin_censored_rate"] = labels["reaction_margin_censored"].float().mean()
                 if bool(valid.any()):
-                    valid_margin = margin_labels["reaction_margin_softmin"][valid]
+                    valid_margin = labels["reaction_margin"][valid]
                     losses["generated_margin_mean"] = valid_margin.mean()
-                    losses["generated_margin_min"] = margin_labels["reaction_margin_min"][valid].mean()
+                    losses["generated_margin_min"] = labels["reaction_margin_min"][valid].mean()
                     losses["generated_margin_violation_rate"] = (valid_margin < 0.0).float().mean()
-                    losses["generated_arrival_time_min"] = margin_labels["arrival_time_min"][valid].mean()
+                    losses["generated_arrival_time_min"] = labels["reaction_margin_arrival_time_min"][valid].mean()
                 else:
                     losses["generated_margin_mean"] = zero
                     losses["generated_margin_min"] = zero

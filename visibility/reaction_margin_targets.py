@@ -31,6 +31,8 @@ def generate_reaction_margin_labels(
     line_of_sight,
     yaw_helper,
     eval_points=30,
+    include_diagnostics=False,
+    risk_weight_override=None,
 ):
     """Generate candidate reaction-margin labels from risk points when raw labels are absent."""
     if "reaction_margin" in flat_labels or not enabled:
@@ -44,7 +46,7 @@ def generate_reaction_margin_labels(
     sampled_time = sampled_time_grid(traj_time, eval_points, include_zero=True)
 
     risk_points_w = expand_candidate_label(flat_labels["risk_points_w"], traj_time.shape[0], traj_time)
-    risk_weight = flat_labels.get("risk_weight")
+    risk_weight = risk_weight_override if risk_weight_override is not None else flat_labels.get("risk_weight")
     if risk_weight is None:
         risk_weight = torch.ones(risk_points_w.shape[:-1], device=traj_time.device, dtype=traj_time.dtype)
     else:
@@ -88,4 +90,7 @@ def generate_reaction_margin_labels(
     flat_labels["reaction_margin"] = margin_labels["reaction_margin_softmin"].detach()
     flat_labels["reaction_margin_valid"] = margin_labels["reaction_margin_valid"].detach()
     flat_labels["reaction_margin_censored"] = margin_labels["reaction_margin_censored"].detach()
+    if include_diagnostics:
+        flat_labels["reaction_margin_min"] = margin_labels["reaction_margin_min"].detach()
+        flat_labels["reaction_margin_arrival_time_min"] = margin_labels["arrival_time_min"].detach()
     return flat_labels
