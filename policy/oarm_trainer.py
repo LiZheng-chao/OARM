@@ -586,10 +586,11 @@ class OARMTrainer:
         loss_dict = self.oarm_loss(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             aux_loss = torch.zeros((), device=self.device)
-            if self.train_occlusion_risk:
-                aux_loss = aux_loss + oarm_cfg.risk_bce_weight * loss_dict["risk_loss"]
-            if self.train_reaction_margin:
-                aux_loss = aux_loss + oarm_cfg.margin_reg_weight * loss_dict["margin_loss"]
+            if self.candidate_mode != "a4_preserve_brake":
+                if self.train_occlusion_risk:
+                    aux_loss = aux_loss + oarm_cfg.risk_bce_weight * loss_dict["risk_loss"]
+                if self.train_reaction_margin:
+                    aux_loss = aux_loss + oarm_cfg.margin_reg_weight * loss_dict["margin_loss"]
 
             rerank_loss = torch.zeros((), device=self.device)
             residual_reg = torch.zeros((), device=self.device)
@@ -959,9 +960,11 @@ class OARMTrainer:
                 geom_safe = safety_valid & (safety_cost <= self.yopo_preserve_safe_cost_threshold)
 
         yopo_geom_unsafe = torch.zeros_like(finite_gate, dtype=torch.bool)
+        yopo_geom_safe = torch.zeros_like(finite_gate, dtype=torch.bool)
         brake_feasible = torch.zeros_like(finite_gate, dtype=torch.bool)
         if geom_unsafe is not None and geom_safe is not None:
             yopo_geom_unsafe = geom_unsafe[:, :progress_n][batch_id, yopo_id]
+            yopo_geom_safe = geom_safe[:, :progress_n][batch_id, yopo_id]
             brake_feasible = geom_safe[:, -1]
 
         margin_label = flat_labels.get("reaction_margin")
@@ -980,8 +983,9 @@ class OARMTrainer:
             yopo_margin_unsafe = yopo_margin_valid & (yopo_margin < 0.0)
 
         yopo_bad = yopo_geom_unsafe | yopo_margin_unsafe
+        yopo_keep_safe = yopo_geom_safe & (~yopo_margin_valid | (yopo_margin >= 0.0))
         target_brake = yopo_bad & brake_feasible
-        valid = finite_gate & finite_yopo & ((~yopo_bad) | brake_feasible)
+        valid = finite_gate & finite_yopo & (yopo_keep_safe | target_brake)
 
         zero = torch.zeros((), device=self.device)
         brake_gate_loss = zero
@@ -1002,10 +1006,13 @@ class OARMTrainer:
             "a4a_brake_gate_valid_rate": valid.float().mean(),
             "a4a_yopo_top1_bad_rate": yopo_bad.float().mean(),
             "a4a_yopo_top1_geom_unsafe_rate": yopo_geom_unsafe.float().mean(),
+            "a4a_yopo_top1_geom_safe_rate": yopo_geom_safe.float().mean(),
+            "a4a_yopo_top1_keep_safe_rate": yopo_keep_safe.float().mean(),
             "a4a_yopo_top1_margin_unsafe_rate": yopo_margin_unsafe.float().mean(),
             "a4a_yopo_top1_margin_valid_rate": yopo_margin_valid.float().mean(),
             "a4a_brake_feasible_rate": brake_feasible.float().mean(),
             "a4a_ignored_bad_and_no_brake_rate": (yopo_bad & ~brake_feasible & finite_gate).float().mean(),
+            "a4a_ambiguous_ignore_rate": (finite_gate & finite_yopo & ~valid).float().mean(),
         }
         if bool(valid.any()):
             metrics.update(
@@ -1145,14 +1152,15 @@ class OARMTrainer:
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             if self.train_yield_head_only:
                 raise ValueError(f"--train-yield-head-only is not compatible with candidate_mode={self.candidate_mode}")
-            train_prefixes = ["preserve_network.margin_risk_head."]
-            if self.candidate_mode == "yopo_preserve_rerank":
-                if self.yopo_preserve_freeze_margin_risk_head:
-                    train_prefixes = ["preserve_network.rerank_head."]
-                else:
-                    train_prefixes.append("preserve_network.rerank_head.")
-            elif self.candidate_mode == "a4_preserve_brake":
-                train_prefixes.append("preserve_network.brake_gate_head.")
+            if self.candidate_mode == "a4_preserve_brake":
+                train_prefixes = ["preserve_network.brake_gate_head."]
+            else:
+                train_prefixes = ["preserve_network.margin_risk_head."]
+                if self.candidate_mode == "yopo_preserve_rerank":
+                    if self.yopo_preserve_freeze_margin_risk_head:
+                        train_prefixes = ["preserve_network.rerank_head."]
+                    else:
+                        train_prefixes.append("preserve_network.rerank_head.")
             for name, param in self.policy.named_parameters():
                 param.requires_grad_(any(name.startswith(prefix) for prefix in train_prefixes))
             return
@@ -1202,7 +1210,7 @@ class OARMTrainer:
         if self.candidate_mode == "yopo_preserve":
             required_prefixes = ("preserve_network.margin_risk_head.",)
         elif self.candidate_mode == "a4_preserve_brake":
-            required_prefixes = ("preserve_network.margin_risk_head.", "preserve_network.brake_gate_head.")
+            required_prefixes = ("preserve_network.brake_gate_head.",)
         elif self.yopo_preserve_freeze_margin_risk_head:
             required_prefixes = ("preserve_network.rerank_head.",)
         else:

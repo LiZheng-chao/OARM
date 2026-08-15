@@ -3,6 +3,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import torch
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -18,6 +19,7 @@ from OARM.utils.yopo_compat import ensure_yopo_path
 
 ensure_yopo_path()
 from config.config import cfg
+from policy.poly_solver import Poly5Solver
 
 
 def parser():
@@ -37,6 +39,82 @@ def load_yopo(policy, checkpoint, device):
 
 def max_abs(a, b):
     return float((a - b).abs().max().detach().cpu())
+
+
+def max_abs_first15(base, aug, batch, n_base, n_aug):
+    base_flat = base.flatten()
+    aug_flat = aug.flatten()
+    return {
+        "end_state_b_max_abs": max_abs(
+            aug_flat["end_state_b"].reshape(batch, n_aug, 9)[:, :n_base],
+            base_flat["end_state_b"].reshape(batch, n_base, 9),
+        ),
+        "traj_time_max_abs": max_abs(
+            aug_flat["traj_time"].reshape(batch, n_aug)[:, :n_base],
+            base_flat["traj_time"].reshape(batch, n_base),
+        ),
+        "yaw_terminal_max_abs": max_abs(
+            aug_flat["yaw_terminal"].reshape(batch, n_aug)[:, :n_base],
+            base_flat["yaw_terminal"].reshape(batch, n_base),
+        ),
+        "utility_base_max_abs": max_abs(
+            aug_flat["utility_base"].reshape(batch, n_aug)[:, :n_base],
+            base_flat["utility_base"].reshape(batch, n_base),
+        ),
+        "utility_score_initial_max_abs": max_abs(
+            aug_flat["utility_score"].reshape(batch, n_aug)[:, :n_base],
+            base_flat["utility_score"].reshape(batch, n_base),
+        ),
+    }
+
+
+def set_brake_gate_bias(policy, bias):
+    head = policy.preserve_network.brake_gate_head[-1]
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.fill_(float(bias))
+
+
+def selected_ids(candidate, batch):
+    n = candidate.utility_score.numel() // batch
+    return candidate.flatten()["utility_score"].reshape(batch, n).argmax(dim=1)
+
+
+def check_brake_physics(policy, device):
+    speeds = torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0], device=device)
+    obs = torch.zeros(speeds.numel(), 9, device=device)
+    obs[:, 0] = speeds
+    end_state, brake_time = policy.preserve_network.deterministic_brake_candidate(obs, torch.float32, device)
+    end_state = end_state.reshape(speeds.numel(), 9).detach().cpu().numpy()
+    brake_time = brake_time.reshape(speeds.numel()).detach().cpu().numpy()
+    acc_max = float(policy.preserve_network.lattice_primitive.acc_max)
+    worst = {
+        "min_forward_velocity": float("inf"),
+        "max_acceleration": 0.0,
+        "max_overshoot": 0.0,
+        "terminal_speed_max": 0.0,
+        "terminal_acc_max": 0.0,
+    }
+    for i, speed in enumerate(speeds.detach().cpu().numpy()):
+        tf = float(brake_time[i])
+        px = Poly5Solver(0.0, float(speed), 0.0, float(end_state[i, 0]), 0.0, 0.0, tf)
+        ts = np.linspace(0.0, tf, 201)
+        x = px.get_position(ts)
+        v = px.get_velocity(ts)
+        a = px.get_acceleration(ts)
+        worst["min_forward_velocity"] = min(worst["min_forward_velocity"], float(v.min()))
+        worst["max_acceleration"] = max(worst["max_acceleration"], float(np.abs(a).max()))
+        worst["max_overshoot"] = max(worst["max_overshoot"], float(x.max() - end_state[i, 0]))
+        worst["terminal_speed_max"] = max(worst["terminal_speed_max"], abs(float(v[-1])))
+        worst["terminal_acc_max"] = max(worst["terminal_acc_max"], abs(float(a[-1])))
+    worst["passed"] = (
+        worst["min_forward_velocity"] >= -1e-5
+        and worst["max_overshoot"] <= 1e-5
+        and worst["max_acceleration"] <= acc_max * 1.05
+        and worst["terminal_speed_max"] <= 1e-5
+        and worst["terminal_acc_max"] <= 1e-5
+    )
+    return worst
 
 
 def main(args):
@@ -63,31 +141,34 @@ def main(args):
     base_flat = base.flatten()
     aug_flat = aug.flatten()
 
-    progress = {
-        "end_state_b_max_abs": max_abs(
-            aug_flat["end_state_b"].reshape(batch, n_aug, 9)[:, :n_base],
-            base_flat["end_state_b"].reshape(batch, n_base, 9),
-        ),
-        "traj_time_max_abs": max_abs(
-            aug_flat["traj_time"].reshape(batch, n_aug)[:, :n_base],
-            base_flat["traj_time"].reshape(batch, n_base),
-        ),
-        "yaw_terminal_max_abs": max_abs(
-            aug_flat["yaw_terminal"].reshape(batch, n_aug)[:, :n_base],
-            base_flat["yaw_terminal"].reshape(batch, n_base),
-        ),
-        "utility_base_max_abs": max_abs(
-            aug_flat["utility_base"].reshape(batch, n_aug)[:, :n_base],
-            base_flat["utility_base"].reshape(batch, n_base),
-        ),
-        "utility_score_initial_max_abs": max_abs(
-            aug_flat["utility_score"].reshape(batch, n_aug)[:, :n_base],
-            base_flat["utility_score"].reshape(batch, n_base),
-        ),
-    }
+    progress = max_abs_first15(base, aug, batch, n_base, n_aug)
     type_group = aug_flat["candidate_type"].reshape(batch, n_aug)
     brake = aug_flat["end_state_b"].reshape(batch, n_aug, 9)[:, -1]
     brake_type = type_group[:, -1]
+    set_brake_gate_bias(a4a, -10.0)
+    with torch.inference_mode():
+        gate_negative = a4a.inference(depth, obs)
+    negative_ids = selected_ids(gate_negative, batch)
+    negative_chooses_progress = bool((negative_ids < n_base).all().item())
+
+    set_brake_gate_bias(a4a, 10.0)
+    with torch.inference_mode():
+        gate_positive = a4a.inference(depth, obs)
+    positive_ids = selected_ids(gate_positive, batch)
+    positive_chooses_brake = bool((positive_ids == n_aug - 1).all().item())
+
+    optimizer = torch.optim.SGD(a4a.preserve_network.brake_gate_head.parameters(), lr=1e-3)
+    optimizer.zero_grad(set_to_none=True)
+    dummy_loss = torch.zeros((), device=device)
+    for param in a4a.preserve_network.brake_gate_head.parameters():
+        dummy_loss = dummy_loss + param.sum()
+    dummy_loss.backward()
+    optimizer.step()
+    with torch.inference_mode():
+        aug_after_step = a4a.inference(depth, obs)
+    optimizer_step_progress = max_abs_first15(base, aug_after_step, batch, n_base, n_aug)
+    brake_physics = check_brake_physics(a4a, device)
+
     metrics = {
         "candidate_count_base": n_base,
         "candidate_count_a4a": n_aug,
@@ -100,6 +181,10 @@ def main(args):
         "brake_terminal_acc_max": float(brake[:, 6:9].norm(dim=1).max().detach().cpu()),
         "brake_time_min": float(aug_flat["traj_time"].reshape(batch, n_aug)[:, -1].min().detach().cpu()),
         "brake_time_max": float(aug_flat["traj_time"].reshape(batch, n_aug)[:, -1].max().detach().cpu()),
+        "gate_negative_chooses_progress": negative_chooses_progress,
+        "gate_positive_chooses_brake": positive_chooses_brake,
+        "optimizer_step_progress_parity": optimizer_step_progress,
+        "brake_physics": brake_physics,
     }
     metrics["passed"] = (
         n_base == int(cfg["traj_num"])
@@ -109,6 +194,10 @@ def main(args):
         and metrics["brake_type_all_brake"]
         and metrics["brake_terminal_speed_max"] <= args.atol
         and metrics["brake_terminal_acc_max"] <= args.atol
+        and metrics["gate_negative_chooses_progress"]
+        and metrics["gate_positive_chooses_brake"]
+        and all(value <= args.atol for value in metrics["optimizer_step_progress_parity"].values())
+        and metrics["brake_physics"]["passed"]
     )
     print(json.dumps(metrics, indent=2, sort_keys=True))
     if args.output:

@@ -180,12 +180,13 @@ class YOPOPreserveOARMNetwork(nn.Module):
         speed = vel_b.norm(dim=1, keepdim=True)
         acc_max = max(float(self.lattice_primitive.acc_max), 1e-3)
         direction = vel_b / speed.clamp_min(1e-3)
-        stopping_distance = torch.clamp(speed.square() / (2.0 * acc_max), min=0.0, max=4.0)
+        brake_time_scalar = torch.clamp(1.5 * speed / acc_max, min=0.6, max=2.5)
+        stopping_distance = torch.clamp(0.5 * speed * brake_time_scalar, min=0.0, max=6.0)
         end_pos = torch.where(speed > 0.15, direction * stopping_distance, torch.zeros_like(vel_b))
         end_vel = torch.zeros_like(end_pos)
         end_acc = torch.zeros_like(end_pos)
         end_state = torch.cat((end_pos, end_vel, end_acc), dim=1).reshape(obs.shape[0], 9, 1, 1)
-        brake_time = torch.clamp(speed / acc_max + 0.35, min=0.6, max=2.5).reshape(obs.shape[0], 1, 1, 1)
+        brake_time = brake_time_scalar.reshape(obs.shape[0], 1, 1, 1)
         return end_state, brake_time
 
     def inference(self, depth: torch.Tensor, obs: torch.Tensor) -> OARMCandidate:

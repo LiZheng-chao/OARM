@@ -10,6 +10,7 @@ from OARM.dataset import OARMDataset
 from OARM.eval.eval_dataset import maybe_generate_reaction_margin_labels
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_network import OARMNetwork
+from OARM.policy.oarm_trainer import OARMTrainer
 from OARM.policy.oarm_state_transform import rotate_body2world, state_body2world
 from OARM.utils.occlusion import candidate_frontier_overlap
 from OARM.utils.visible_free_distance import visible_free_distance_from_depth
@@ -416,6 +417,69 @@ def check_one_batch_loss(device, batch_size, train_occlusion_risk, train_reactio
     return True
 
 
+def check_a4a_binary_brake_teacher_semantics(device):
+    trainer = OARMTrainer.__new__(OARMTrainer)
+    trainer.device = device
+    trainer.yopo_preserve_geometry_oracle_source = "esdf_cost"
+    trainer.yopo_preserve_safety_cost_threshold = 0.01
+    trainer.yopo_preserve_safe_cost_threshold = 0.001
+    trainer.yopo_preserve_unsafe_clearance_m = 0.25
+    trainer.yopo_preserve_safe_clearance_m = 0.35
+    trainer.yopo_preserve_oracle_ce_weight = 2.0
+    trainer.yopo_preserve_residual_reg_weight = 0.0
+    trainer.dataset_root = None
+
+    n = 4
+    traj_num = 16
+    utility_base = torch.zeros(n, traj_num, device=device)
+    utility_base[:, 0] = 10.0
+    utility_delta = torch.zeros(n, traj_num, device=device)
+    utility_delta[:, -1] = torch.tensor([-0.5, 0.5, -0.5, 0.5], device=device)
+    utility_score = utility_base.clone()
+    utility_score[:, -1] = utility_base[:, :15].max(dim=1).values + utility_delta[:, -1]
+
+    margin = torch.ones(n, traj_num, device=device)
+    margin[1, 0] = -0.2
+    margin[3, 0] = -0.3
+    margin_valid = torch.ones(n, traj_num, dtype=torch.bool, device=device)
+    margin_valid[2, 0] = False
+
+    safety_cost = torch.full((n, traj_num), 0.0, device=device)
+    # row 0: explicit YOPO safe -> KEEP
+    safety_cost[0, 0] = 0.0
+    safety_cost[0, -1] = 0.0
+    # row 1: YOPO bad, brake safe -> BRAKE
+    safety_cost[1, 0] = 0.02
+    safety_cost[1, -1] = 0.0
+    # row 2: YOPO geometry gray and no valid margin -> IGNORE, not KEEP
+    safety_cost[2, 0] = 0.005
+    safety_cost[2, -1] = 0.0
+    # row 3: YOPO bad, brake unsafe -> IGNORE
+    safety_cost[3, 0] = 0.02
+    safety_cost[3, -1] = 0.02
+
+    out = trainer.compute_a4a_binary_brake_loss(
+        {
+            "utility_delta": utility_delta.reshape(-1),
+            "utility_score": utility_score.reshape(-1),
+            "utility_base": utility_base.reshape(-1),
+        },
+        {
+            "reaction_margin": margin.reshape(-1),
+            "reaction_margin_valid": margin_valid.reshape(-1),
+        },
+        {"safety_cost_per_candidate": safety_cost.reshape(-1)},
+        torch.zeros(n * traj_num, dtype=torch.long, device=device),
+        traj_num,
+    )
+    assert torch.isclose(out["a4a_brake_gate_valid_rate"], torch.tensor(0.5, device=device), atol=1e-6), out
+    assert torch.isclose(out["a4a_brake_target_rate"], torch.tensor(0.5, device=device), atol=1e-6), out
+    assert torch.isclose(out["a4a_yopo_top1_keep_safe_rate"], torch.tensor(0.25, device=device), atol=1e-6), out
+    assert torch.isclose(out["a4a_ambiguous_ignore_rate"], torch.tensor(0.5, device=device), atol=1e-6), out
+    assert torch.isfinite(out["brake_gate_loss"])
+    print("a4a_binary_brake_teacher_semantics ok", float(out["brake_gate_loss"].detach().cpu()))
+
+
 def parser():
     p = argparse.ArgumentParser()
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
@@ -446,6 +510,7 @@ def main():
     check_risk_point_guidance(device)
     check_goal_yaw_matches_yopo_calculate_yaw(device)
     check_eval_label_generation_uses_deployed_yaw_mode(device)
+    check_a4a_binary_brake_teacher_semantics(device)
     if not args.skip_dataset:
         check_dataset_sample(args.dataset_root or None)
     if args.one_batch_loss:

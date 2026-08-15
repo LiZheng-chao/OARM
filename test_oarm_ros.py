@@ -68,7 +68,7 @@ class OARMNet:
         self.width = cfg["image_width"]
         self.min_dis, self.max_dis = 0.04, 20.0
         self.goal = np.array(self.config["goal"], dtype=np.float32)
-        self.yopo_preserve_mode = self.config.get("candidate_mode") in {"yopo_preserve", "yopo_preserve_rerank"}
+        self.yopo_preserve_mode = self.config.get("candidate_mode") in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}
         self.goal_received = self.config["start_immediately"]
         self.plan_from_reference = self.config["plan_from_reference"]
         self.verbose = self.config["verbose"]
@@ -300,7 +300,7 @@ class OARMNet:
         state_dict, checkpoint_metadata = load_oarm_checkpoint(weight, map_location=self.device)
         candidate_mode = self.config.get("candidate_mode", "typed_frontier")
         backbone_mode = self.config.get("backbone_mode", "yopo_original")
-        if candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
+        if candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             is_oarm_preserve_checkpoint = any(key.startswith("preserve_network.") for key in state_dict)
             if is_oarm_preserve_checkpoint:
                 validate_checkpoint_metadata(

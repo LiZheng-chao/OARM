@@ -9,7 +9,7 @@ train_margin_ranking: false
 train_yaw_visibility: false
 deployed_yaw_mode: goal
 risk_label_source: gt_pointcloud
-use_esdf_collision: true
+use_esdf_collision: false
 use_occlusion_aware_visibility: true
 use_privileged_risk_filter: true
 yopo_preserve_geometry_oracle_source: gt_clearance
