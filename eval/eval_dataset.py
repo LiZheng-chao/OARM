@@ -280,6 +280,97 @@ def sampled_time_grid(traj_time, eval_points, include_zero=True):
     return traj_time[:, None] * tau[None, :]
 
 
+def a4a_binary_gate_stats(flat, flat_labels, accumulator, args, batch_size, traj_num, min_clearance_gt=None, safety_cost=None):
+    if args.candidate_mode != "a4_preserve_brake":
+        return
+    utility_delta = flat.get("utility_delta")
+    utility_base = flat.get("utility_base")
+    utility_score = flat.get("utility_score")
+    if utility_delta is None or utility_score is None:
+        return
+    score_group = utility_score.reshape(batch_size, traj_num)
+    if utility_base is None:
+        base_group = score_group.detach()
+    else:
+        base_group = utility_base.reshape(batch_size, traj_num).detach()
+    delta_group = utility_delta.reshape(batch_size, traj_num)
+    progress_n = traj_num - 1
+    yopo_id = base_group[:, :progress_n].argmax(dim=1)
+    batch_id = torch.arange(batch_size, device=score_group.device)
+    brake_logit = delta_group[:, -1]
+    finite_gate = torch.isfinite(brake_logit)
+    finite_yopo = torch.isfinite(base_group[:, :progress_n][batch_id, yopo_id])
+
+    geom_unsafe = None
+    geom_safe = None
+    if args.yopo_preserve_geometry_oracle_source == "gt_clearance" and min_clearance_gt is not None:
+        clearance = min_clearance_gt.reshape(batch_size, traj_num).to(device=score_group.device, dtype=score_group.dtype)
+        clearance_valid = torch.isfinite(clearance)
+        geom_unsafe = clearance_valid & (clearance < args.yopo_preserve_unsafe_clearance_m)
+        geom_safe = clearance_valid & (clearance > args.yopo_preserve_safe_clearance_m)
+    elif safety_cost is not None:
+        safety = safety_cost.reshape(batch_size, traj_num).to(device=score_group.device, dtype=score_group.dtype)
+        safety_valid = torch.isfinite(safety)
+        geom_unsafe = safety_valid & (safety > args.yopo_preserve_safety_cost_threshold)
+        geom_safe = safety_valid & (safety <= args.yopo_preserve_safe_cost_threshold)
+
+    yopo_geom_unsafe = torch.zeros(batch_size, dtype=torch.bool, device=score_group.device)
+    yopo_geom_safe = torch.zeros(batch_size, dtype=torch.bool, device=score_group.device)
+    brake_feasible = torch.zeros(batch_size, dtype=torch.bool, device=score_group.device)
+    if geom_unsafe is not None and geom_safe is not None:
+        yopo_geom_unsafe = geom_unsafe[:, :progress_n][batch_id, yopo_id]
+        yopo_geom_safe = geom_safe[:, :progress_n][batch_id, yopo_id]
+        brake_feasible = geom_safe[:, -1]
+
+    margin_label = flat_labels.get("reaction_margin")
+    margin_valid_label = flat_labels.get("reaction_margin_valid")
+    yopo_margin_valid = torch.zeros(batch_size, dtype=torch.bool, device=score_group.device)
+    yopo_margin_unsafe = torch.zeros(batch_size, dtype=torch.bool, device=score_group.device)
+    yopo_margin = torch.full((batch_size,), float("nan"), dtype=score_group.dtype, device=score_group.device)
+    if margin_label is not None:
+        margin_group = margin_label.reshape(batch_size, traj_num).to(device=score_group.device, dtype=score_group.dtype)
+        if margin_valid_label is None:
+            margin_valid_group = torch.ones_like(margin_group, dtype=torch.bool)
+        else:
+            margin_valid_group = margin_valid_label.reshape(batch_size, traj_num).to(device=score_group.device).bool()
+        yopo_margin = margin_group[:, :progress_n][batch_id, yopo_id]
+        yopo_margin_valid = margin_valid_group[:, :progress_n][batch_id, yopo_id] & torch.isfinite(yopo_margin)
+        yopo_margin_unsafe = yopo_margin_valid & (yopo_margin < 0.0)
+
+    yopo_bad = yopo_geom_unsafe | yopo_margin_unsafe
+    yopo_keep_safe = yopo_geom_safe & (~yopo_margin_valid | (yopo_margin >= 0.0))
+    target_brake = yopo_bad & brake_feasible
+    valid = finite_gate & finite_yopo & (yopo_keep_safe | target_brake)
+    pred_brake = brake_logit > 0.0
+
+    add_metric(accumulator, "a4a_eval_gate_valid_rate", valid.float().mean(), batch_size)
+    add_metric(accumulator, "a4a_eval_yopo_top1_bad_rate", yopo_bad.float().mean(), batch_size)
+    add_metric(accumulator, "a4a_eval_yopo_top1_keep_safe_rate", yopo_keep_safe.float().mean(), batch_size)
+    add_metric(accumulator, "a4a_eval_brake_feasible_rate", brake_feasible.float().mean(), batch_size)
+    add_metric(accumulator, "a4a_eval_ambiguous_ignore_rate", (finite_gate & finite_yopo & ~valid).float().mean(), batch_size)
+    add_metric(accumulator, "a4a_eval_ignored_bad_and_no_brake_rate", (yopo_bad & ~brake_feasible & finite_gate).float().mean(), batch_size)
+    if not bool(valid.any()):
+        return
+    weight = int(valid.sum().item())
+    target_valid = target_brake[valid]
+    pred_valid = pred_brake[valid]
+    positive = target_valid
+    negative = ~target_valid
+    predicted_positive = pred_valid
+    add_metric(accumulator, "a4a_eval_brake_target_rate", target_valid.float().mean(), weight)
+    add_metric(accumulator, "a4a_eval_brake_pred_rate", pred_valid.float().mean(), weight)
+    add_metric(accumulator, "a4a_eval_brake_gate_acc", (pred_valid == target_valid).float().mean(), weight)
+    if bool(positive.any()):
+        add_metric(accumulator, "a4a_eval_brake_recall", pred_valid[positive].float().mean(), int(positive.sum().item()))
+    if bool(negative.any()):
+        add_metric(accumulator, "a4a_eval_false_brake_rate", pred_valid[negative].float().mean(), int(negative.sum().item()))
+        add_metric(accumulator, "a4a_eval_keep_recall", (~pred_valid[negative]).float().mean(), int(negative.sum().item()))
+    if bool(predicted_positive.any()):
+        add_metric(accumulator, "a4a_eval_brake_precision", target_valid[predicted_positive].float().mean(), int(predicted_positive.sum().item()))
+    add_metric(accumulator, "a4a_eval_brake_positive_valid_count", positive.float().sum(), 1)
+    add_metric(accumulator, "a4a_eval_keep_negative_valid_count", negative.float().sum(), 1)
+
+
 def maybe_generate_reaction_margin_labels(
     flat_labels,
     flat,
@@ -532,7 +623,7 @@ def evaluate(args):
         utility_delta_scale=args.yopo_preserve_utility_delta_scale,
     ).to(device)
     if args.checkpoint:
-        if args.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
+        if args.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             is_oarm_preserve_checkpoint = any(key.startswith("preserve_network.") for key in state_dict)
             if is_oarm_preserve_checkpoint:
                 validate_checkpoint_metadata(
@@ -644,6 +735,16 @@ def evaluate(args):
                 loss_dict.get("safety_cost_per_candidate"),
                 selected_progress,
                 min_clearance_gt,
+            )
+            a4a_binary_gate_stats(
+                flat,
+                flat_labels,
+                accumulator,
+                args,
+                batch_size,
+                traj_num,
+                min_clearance_gt=min_clearance_gt,
+                safety_cost=loss_dict.get("safety_cost_per_candidate"),
             )
 
             if "reaction_margin" in flat_labels:

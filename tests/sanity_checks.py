@@ -1,5 +1,6 @@
 import argparse
 import math
+from collections import defaultdict
 from types import SimpleNamespace
 
 import torch
@@ -7,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from OARM.config import oarm_cfg
 from OARM.dataset import OARMDataset
-from OARM.eval.eval_dataset import maybe_generate_reaction_margin_labels
+from OARM.eval.eval_dataset import a4a_binary_gate_stats, maybe_generate_reaction_margin_labels
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_trainer import OARMTrainer
@@ -480,6 +481,58 @@ def check_a4a_binary_brake_teacher_semantics(device):
     print("a4a_binary_brake_teacher_semantics ok", float(out["brake_gate_loss"].detach().cpu()))
 
 
+def check_a4a_eval_gate_stats(device):
+    args = SimpleNamespace(
+        candidate_mode="a4_preserve_brake",
+        yopo_preserve_geometry_oracle_source="gt_clearance",
+        yopo_preserve_unsafe_clearance_m=0.25,
+        yopo_preserve_safe_clearance_m=0.35,
+        yopo_preserve_safety_cost_threshold=0.01,
+        yopo_preserve_safe_cost_threshold=0.001,
+    )
+    n = 4
+    traj_num = 16
+    utility_base = torch.zeros(n, traj_num, device=device)
+    utility_base[:, 0] = 10.0
+    utility_delta = torch.zeros(n, traj_num, device=device)
+    utility_delta[:, -1] = torch.tensor([-0.5, 0.5, -0.5, 0.5], device=device)
+    utility_score = utility_base.clone()
+    utility_score[:, -1] = utility_base[:, :15].max(dim=1).values + utility_delta[:, -1]
+    margin = torch.ones(n, traj_num, device=device)
+    margin[1, 0] = -0.2
+    margin[3, 0] = -0.3
+    margin_valid = torch.ones(n, traj_num, dtype=torch.bool, device=device)
+    margin_valid[2, 0] = False
+    clearance = torch.full((n, traj_num), 0.5, device=device)
+    clearance[1, 0] = 0.1
+    clearance[2, 0] = 0.30
+    clearance[3, 0] = 0.1
+    clearance[3, -1] = 0.1
+    acc = defaultdict(list)
+    a4a_binary_gate_stats(
+        {
+            "utility_delta": utility_delta.reshape(-1),
+            "utility_score": utility_score.reshape(-1),
+            "utility_base": utility_base.reshape(-1),
+        },
+        {
+            "reaction_margin": margin.reshape(-1),
+            "reaction_margin_valid": margin_valid.reshape(-1),
+        },
+        acc,
+        args,
+        n,
+        traj_num,
+        min_clearance_gt=clearance.reshape(-1),
+    )
+    metrics = {k: v[0][0] for k, v in acc.items()}
+    assert abs(metrics["a4a_eval_gate_valid_rate"] - 0.5) < 1e-6, metrics
+    assert abs(metrics["a4a_eval_brake_target_rate"] - 0.5) < 1e-6, metrics
+    assert abs(metrics["a4a_eval_false_brake_rate"] - 0.0) < 1e-6, metrics
+    assert abs(metrics["a4a_eval_brake_recall"] - 1.0) < 1e-6, metrics
+    print("a4a_eval_gate_stats ok")
+
+
 def check_a4a_trainable_contract():
     trainer = OARMTrainer.__new__(OARMTrainer)
     trainer.candidate_mode = "a4_preserve_brake"
@@ -528,6 +581,7 @@ def main():
     check_eval_label_generation_uses_deployed_yaw_mode(device)
     check_a4a_binary_brake_teacher_semantics(device)
     check_a4a_trainable_contract()
+    check_a4a_eval_gate_stats(device)
     if not args.skip_dataset:
         check_dataset_sample(args.dataset_root or None)
     if args.one_batch_loss:
