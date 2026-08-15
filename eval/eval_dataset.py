@@ -247,7 +247,7 @@ def build_world_states(pos, rot, obs_b, flat):
     start_acc_w = rotate_body2world(rot, obs_b[:, 3:6])
     start_state_w = torch.stack([pos, start_vel_w, start_acc_w], dim=1)
 
-    traj_num = cfg["traj_num"]
+    traj_num = int(flat["traj_time"].numel() // max(pos.shape[0], 1))
     endstate_flat = flat["end_state_b"]
     pos_expanded = pos.repeat_interleave(traj_num, dim=0)
     rot_expanded = rot.repeat_interleave(traj_num, dim=0)
@@ -608,7 +608,8 @@ def evaluate(args):
                     depth,
                     flat["end_state_b"][:, 0:3],
                 )
-            map_id_expanded = map_id.repeat_interleave(cfg["traj_num"], dim=0)
+            traj_num = int(flat["traj_time"].numel() // max(depth.shape[0], 1))
+            map_id_expanded = map_id.repeat_interleave(traj_num, dim=0)
             flat_labels = maybe_generate_reaction_margin_labels(
                 flat_labels,
                 flat,
@@ -660,7 +661,7 @@ def evaluate(args):
                 ranking_metrics = pairwise_ranking_accuracy(
                     flat["utility_score"],
                     flat_labels["reaction_margin"],
-                    cfg["traj_num"],
+                    traj_num,
                     margin_delta=oarm_cfg.ranking_margin_delta,
                     valid_mask=margin_valid,
                 )
@@ -680,7 +681,7 @@ def evaluate(args):
                 matched_ranking_metrics = matched_pairwise_ranking_accuracy(
                     flat["utility_score"],
                     flat_labels["reaction_margin"],
-                    cfg["traj_num"],
+                    traj_num,
                     margin_delta=oarm_cfg.ranking_margin_delta,
                     valid_mask=margin_valid,
                     progress=ranking_progress,
@@ -759,13 +760,13 @@ def parser():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--stage",
-        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "full"],
+        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "a4a", "full"],
         default="v0",
         help="named evaluation preset matching OARM/train_oarm.py",
     )
     p.add_argument("--checkpoint", type=str, default="")
     p.add_argument("--allow-checkpoint-mismatch", action="store_true")
-    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank"], default="")
+    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"], default="")
     p.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="")
     p.add_argument("--enable-yield-candidates", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")

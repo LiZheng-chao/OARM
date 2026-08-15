@@ -34,7 +34,7 @@ class OARMNetwork(nn.Module):
     ):
         super().__init__()
         self.preserve_network = None
-        if candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
+        if candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             if backbone_mode != "yopo_original":
                 raise ValueError(f"candidate_mode={candidate_mode} requires backbone_mode=yopo_original")
             self.candidate_mode = candidate_mode
@@ -45,6 +45,7 @@ class OARMNetwork(nn.Module):
                 freeze_yopo_base=True,
                 enable_utility_delta=(candidate_mode == "yopo_preserve_rerank"),
                 utility_delta_scale=utility_delta_scale,
+                append_brake_candidate=(candidate_mode == "a4_preserve_brake"),
             )
             return
         if output_dim != 15:

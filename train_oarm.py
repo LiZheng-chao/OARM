@@ -93,7 +93,7 @@ def parser():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--stage",
-        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "full"],
+        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "a4a", "full"],
         default="v0",
         help="named ablation preset; CLI flags and --config override it",
     )
@@ -111,7 +111,7 @@ def parser():
     p.add_argument("--init-from-a1-checkpoint", type=str, default="", help="A1 yopo_preserve checkpoint used to initialize A3h split-head reranker")
     p.add_argument("--yopo-checkpoint", type=str, default="", help="official YOPO checkpoint used to initialize candidate_mode=yopo_preserve")
     p.add_argument("--allow-checkpoint-mismatch", action="store_true")
-    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank"], default="")
+    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"], default="")
     p.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="")
     p.add_argument("--enable-yield-candidates", action="store_true")
     p.add_argument("--num-workers", type=int, default=4)

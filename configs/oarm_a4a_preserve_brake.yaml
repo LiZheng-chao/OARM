@@ -1,0 +1,21 @@
+# A4a-Preserve: exact 15 YOPO candidates + one deterministic brake candidate.
+candidate_mode: a4_preserve_brake
+backbone_mode: yopo_original
+enable_yield_candidates: false
+train_occlusion_risk: false
+train_risk_point_guidance: true
+train_reaction_margin: true
+train_margin_ranking: false
+train_yaw_visibility: false
+deployed_yaw_mode: goal
+risk_label_source: gt_pointcloud
+use_esdf_collision: true
+use_occlusion_aware_visibility: true
+use_privileged_risk_filter: true
+yopo_preserve_geometry_oracle_source: gt_clearance
+yopo_preserve_unsafe_clearance_m: 0.25
+yopo_preserve_safe_clearance_m: 0.35
+yopo_preserve_oracle_ce_weight: 2.0
+yopo_preserve_oracle_ce_temperature: 0.5
+yopo_preserve_oracle_min_margin: 0.0
+yopo_preserve_oracle_min_progress: 0.0

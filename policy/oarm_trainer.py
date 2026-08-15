@@ -199,7 +199,7 @@ class OARMTrainer:
         self.yopo_preserve_oracle_min_progress = float(yopo_preserve_oracle_min_progress)
         self.yopo_preserve_geometry_ce_weight = float(yopo_preserve_geometry_ce_weight)
         self.yopo_preserve_geometry_ce_temperature = max(float(yopo_preserve_geometry_ce_temperature), 1e-3)
-        if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
+        if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             if self.train_backup_feasibility or self.train_yield_feasibility:
                 raise ValueError("YOPO-preserve modes only support margin/risk/rerank auxiliary training; disable backup/yield feasibility")
             if self.candidate_mode == "yopo_preserve" and self.train_margin_ranking:
@@ -251,7 +251,7 @@ class OARMTrainer:
             self.policy.load_state_dict(state_dict)
         elif init_from_a1_checkpoint_path:
             self.load_a1_initialization_checkpoint(init_from_a1_checkpoint_path, allow_mismatch=allow_checkpoint_mismatch)
-        elif self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
+        elif self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             if not yopo_checkpoint_path:
                 raise ValueError("candidate_mode=yopo_preserve requires --yopo-checkpoint for YOPO base initialization")
             state_dict = torch.load(yopo_checkpoint_path, map_location=self.device, weights_only=True)
@@ -513,10 +513,11 @@ class OARMTrainer:
         flat = candidate.flatten()
 
         endstate_flat = flat["end_state_b"]
-        pos_expanded = pos.repeat_interleave(self.traj_num, dim=0)
-        rot_expanded = rot.repeat_interleave(self.traj_num, dim=0)
-        start_state_w = start_state_w.repeat_interleave(self.traj_num, dim=0)
-        goal_w = goal_w.repeat_interleave(self.traj_num, dim=0)
+        traj_num = int(flat["traj_time"].numel() // max(depth.shape[0], 1))
+        pos_expanded = pos.repeat_interleave(traj_num, dim=0)
+        rot_expanded = rot.repeat_interleave(traj_num, dim=0)
+        start_state_w = start_state_w.repeat_interleave(traj_num, dim=0)
+        goal_w = goal_w.repeat_interleave(traj_num, dim=0)
 
         end_pos_w, end_vel_w, end_acc_w = state_body2world(
             pos_expanded,
@@ -568,7 +569,7 @@ class OARMTrainer:
                 endstate_flat[:, 0:3],
             )
 
-        map_id_expanded = map_id.to(self.device).repeat_interleave(self.traj_num, dim=0)
+        map_id_expanded = map_id.to(self.device).repeat_interleave(traj_num, dim=0)
         if self.train_reaction_margin:
             flat_labels = generate_reaction_margin_labels(
                 flat_labels,
@@ -583,7 +584,7 @@ class OARMTrainer:
                 yaw_helper=self.oarm_loss,
             )
         loss_dict = self.oarm_loss(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
-        if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
+        if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             aux_loss = torch.zeros((), device=self.device)
             if self.train_occlusion_risk:
                 aux_loss = aux_loss + oarm_cfg.risk_bce_weight * loss_dict["risk_loss"]
@@ -631,7 +632,7 @@ class OARMTrainer:
             gt_clearance_safe_candidate_rate = torch.zeros((), device=self.device)
             oracle_ce_primary_rate = torch.zeros((), device=self.device)
             oracle_ce_fallback_rate = torch.zeros((), device=self.device)
-            if self.candidate_mode == "yopo_preserve_rerank":
+            if self.candidate_mode in {"yopo_preserve_rerank", "a4_preserve_brake"}:
                 rerank_loss = self.ranking_weight * loss_dict["ranking_loss"]
                 delta = flat.get("utility_delta")
                 if delta is not None:
@@ -660,8 +661,8 @@ class OARMTrainer:
                         gt_clearance_valid_rate = clearance_valid.float().mean()
                         if bool(clearance_valid.any()):
                             gt_min_clearance_mean = min_clearance[clearance_valid].mean()
-                        selected_id = flat.get("utility_score", delta).reshape(-1, self.traj_num).argmax(dim=1)
-                        selected_clearance = min_clearance.reshape(-1, self.traj_num).gather(1, selected_id[:, None]).squeeze(1)
+                        selected_id = flat.get("utility_score", delta).reshape(-1, traj_num).argmax(dim=1)
+                        selected_clearance = min_clearance.reshape(-1, traj_num).gather(1, selected_id[:, None]).squeeze(1)
                         selected_valid = torch.isfinite(selected_clearance)
                         if bool(selected_valid.any()):
                             gt_min_clearance_selected_mean = selected_clearance[selected_valid].mean()
@@ -766,18 +767,18 @@ class OARMTrainer:
                     if (
                         selector_unsafe is not None
                         and selector_safe is not None
-                        and delta.numel() % self.traj_num == 0
+                        and delta.numel() % traj_num == 0
                     ):
                         pairwise_score = flat.get("utility_score", delta).reshape_as(delta)
-                        score_group = pairwise_score.reshape(-1, self.traj_num)
-                        unsafe_group = selector_unsafe.reshape(-1, self.traj_num)
-                        safe_group = selector_safe.reshape(-1, self.traj_num)
-                        geom_safe_group = geom_safe.reshape(-1, self.traj_num) if geom_safe is not None else safe_group
+                        score_group = pairwise_score.reshape(-1, traj_num)
+                        unsafe_group = selector_unsafe.reshape(-1, traj_num)
+                        safe_group = selector_safe.reshape(-1, traj_num)
+                        geom_safe_group = geom_safe.reshape(-1, traj_num) if geom_safe is not None else safe_group
                         if progress_ok is not None:
-                            geom_safe_group = geom_safe_group & progress_ok.reshape(-1, self.traj_num)
+                            geom_safe_group = geom_safe_group & progress_ok.reshape(-1, traj_num)
                         margin_group = None
                         if margin_label is not None:
-                            margin_group = margin_label.reshape(-1, self.traj_num)
+                            margin_group = margin_label.reshape(-1, traj_num)
                         has_oracle = torch.zeros(score_group.shape[0], dtype=torch.bool, device=self.device)
                         oracle_group = safe_group
                         primary_available = safe_group.any(dim=1)
@@ -787,7 +788,7 @@ class OARMTrainer:
                                 fallback = geom_safe & margin_valid
                                 if progress_ok is not None:
                                     fallback = fallback & progress_ok
-                                fallback_group = fallback.reshape(-1, self.traj_num)
+                                fallback_group = fallback.reshape(-1, traj_num)
                                 fallback_available = fallback_group.any(dim=1) & ~primary_available
                                 oracle_group = torch.where(primary_available[:, None], safe_group, fallback_group)
                             neg_inf = torch.full_like(margin_group, -float("inf"))
@@ -809,7 +810,7 @@ class OARMTrainer:
                                 self.yopo_preserve_safety_pairwise_weight * safety_pairwise_gap.square().mean()
                             )
                         if self.yopo_preserve_geometry_ce_weight > 0.0 and geom_safe_group is not None:
-                            base_score = flat.get("utility_base", pairwise_score).reshape_as(delta).detach().reshape(-1, self.traj_num)
+                            base_score = flat.get("utility_base", pairwise_score).reshape_as(delta).detach().reshape(-1, traj_num)
                             geometry_available_raw = geom_safe_group.any(dim=1)
                             geometry_available = geometry_available_raw & ~has_oracle
                             geometry_ce_pair_rate = geometry_available.float().mean()
@@ -824,7 +825,7 @@ class OARMTrainer:
                                 )
                                 geometry_ce_top1_acc = (geometry_logits.argmax(dim=1) == geometry_target_id[geometry_available]).float().mean()
                                 if 'min_clearance' in locals():
-                                    clearance_group = min_clearance.reshape(-1, self.traj_num)
+                                    clearance_group = min_clearance.reshape(-1, traj_num)
                                     target_clearance = clearance_group.gather(1, geometry_target_id[:, None]).squeeze(1)
                                     target_valid = geometry_available & torch.isfinite(target_clearance)
                                     if bool(target_valid.any()):
@@ -1012,7 +1013,7 @@ class OARMTrainer:
         return [name for name, param in self.policy.named_parameters() if param.requires_grad]
 
     def configure_trainable_parameters(self):
-        if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank"}:
+        if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             if self.train_yield_head_only:
                 raise ValueError(f"--train-yield-head-only is not compatible with candidate_mode={self.candidate_mode}")
             train_prefixes = ["preserve_network.margin_risk_head."]
@@ -1021,6 +1022,8 @@ class OARMTrainer:
                     train_prefixes = ["preserve_network.rerank_head."]
                 else:
                     train_prefixes.append("preserve_network.rerank_head.")
+            elif self.candidate_mode == "a4_preserve_brake":
+                train_prefixes.append("preserve_network.brake_gate_head.")
             for name, param in self.policy.named_parameters():
                 param.requires_grad_(any(name.startswith(prefix) for prefix in train_prefixes))
             return
@@ -1058,9 +1061,9 @@ class OARMTrainer:
         trainable = self.trainable_parameter_names()
         if not trainable:
             raise RuntimeError("No trainable OARM parameters were configured")
-        if self.candidate_mode not in {"yopo_preserve", "yopo_preserve_rerank"}:
+        if self.candidate_mode not in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             return
-        allowed_prefixes = ("preserve_network.margin_risk_head.", "preserve_network.rerank_head.")
+        allowed_prefixes = ("preserve_network.margin_risk_head.", "preserve_network.rerank_head.", "preserve_network.brake_gate_head.")
         bad = [name for name in trainable if not name.startswith(allowed_prefixes)]
         if bad:
             raise RuntimeError(
@@ -1069,6 +1072,8 @@ class OARMTrainer:
             )
         if self.candidate_mode == "yopo_preserve":
             required_prefixes = ("preserve_network.margin_risk_head.",)
+        elif self.candidate_mode == "a4_preserve_brake":
+            required_prefixes = ("preserve_network.margin_risk_head.", "preserve_network.brake_gate_head.")
         elif self.yopo_preserve_freeze_margin_risk_head:
             required_prefixes = ("preserve_network.rerank_head.",)
         else:

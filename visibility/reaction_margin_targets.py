@@ -35,8 +35,14 @@ def generate_reaction_margin_labels(
     risk_weight_override=None,
 ):
     """Generate candidate reaction-margin labels from risk points when raw labels are absent."""
-    if "reaction_margin" in flat_labels or not enabled:
+    if not enabled:
         return flat_labels
+    if "reaction_margin" in flat_labels:
+        current = flat_labels["reaction_margin"]
+        if current.shape[0] == flat["traj_time"].shape[0]:
+            return flat_labels
+        for key in ("reaction_margin", "reaction_margin_valid", "reaction_margin_censored"):
+            flat_labels.pop(key, None)
     if "risk_points_w" not in flat_labels:
         return flat_labels
 

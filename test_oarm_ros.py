@@ -1674,7 +1674,7 @@ def parser():
     parser.add_argument("--scenario", type=str, default="unknown", help="scenario label written into logs")
     parser.add_argument("--seed", type=int, default=0, help="run seed or map variant id written into logs")
     parser.add_argument("--map-id", type=int, default=0, help="GT ESDF/pointcloud map id for offline annotation")
-    parser.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank"], default="typed_frontier")
+    parser.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"], default="typed_frontier")
     parser.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="yopo_original")
     parser.add_argument("--enable-yield-candidates", action="store_true")
     parser.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="goal")
