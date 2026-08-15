@@ -15,7 +15,10 @@ use_privileged_risk_filter: true
 yopo_preserve_geometry_oracle_source: gt_clearance
 yopo_preserve_unsafe_clearance_m: 0.25
 yopo_preserve_safe_clearance_m: 0.35
+# In A4a this weight is used as BCEWithLogits weight for the binary brake gate.
 yopo_preserve_oracle_ce_weight: 2.0
+# Keep the initial negative brake bias intact; do not pull the gate toward 0 by L2.
+yopo_preserve_residual_reg_weight: 0.0
 yopo_preserve_oracle_ce_temperature: 0.5
 yopo_preserve_oracle_min_margin: 0.0
 yopo_preserve_oracle_min_progress: 0.0

@@ -607,6 +607,7 @@ class OARMTrainer:
             safety_pairwise_pair_rate = torch.zeros((), device=self.device)
             oracle_ce_loss = torch.zeros((), device=self.device)
             geometry_ce_loss = torch.zeros((), device=self.device)
+            brake_gate_loss = torch.zeros((), device=self.device)
             oracle_ce_pair_rate = torch.zeros((), device=self.device)
             oracle_ce_top1_acc = torch.zeros((), device=self.device)
             oracle_ce_target_margin_mean = torch.zeros((), device=self.device)
@@ -632,7 +633,19 @@ class OARMTrainer:
             gt_clearance_safe_candidate_rate = torch.zeros((), device=self.device)
             oracle_ce_primary_rate = torch.zeros((), device=self.device)
             oracle_ce_fallback_rate = torch.zeros((), device=self.device)
-            if self.candidate_mode in {"yopo_preserve_rerank", "a4_preserve_brake"}:
+            if self.candidate_mode == "a4_preserve_brake":
+                a4a_loss = self.compute_a4a_binary_brake_loss(
+                    flat,
+                    flat_labels,
+                    loss_dict,
+                    map_id_expanded,
+                    traj_num,
+                )
+                brake_gate_loss = a4a_loss["brake_gate_loss"]
+                residual_reg = a4a_loss["brake_gate_l2_loss"]
+                for key, value in a4a_loss.items():
+                    loss_dict[key] = value
+            elif self.candidate_mode == "yopo_preserve_rerank":
                 rerank_loss = self.ranking_weight * loss_dict["ranking_loss"]
                 delta = flat.get("utility_delta")
                 if delta is not None:
@@ -851,6 +864,7 @@ class OARMTrainer:
             loss_dict["safety_pairwise_loss"] = safety_pairwise_loss
             loss_dict["oracle_ce_loss"] = oracle_ce_loss
             loss_dict["geometry_ce_loss"] = geometry_ce_loss
+            loss_dict["brake_gate_loss"] = brake_gate_loss
 
             loss_dict["unsafe_residual_positive_rate"] = unsafe_residual_positive_rate
             loss_dict["safe_residual_negative_rate"] = safe_residual_negative_rate
@@ -897,8 +911,123 @@ class OARMTrainer:
                 + safety_pairwise_loss
                 + oracle_ce_loss
                 + geometry_ce_loss
+                + brake_gate_loss
             )
         return loss_dict
+
+    def compute_a4a_binary_brake_loss(self, flat, flat_labels, loss_dict, map_id_expanded, traj_num):
+        if traj_num < 2:
+            raise RuntimeError("A4a binary brake oracle requires YOPO candidates plus one brake candidate")
+        delta = flat.get("utility_delta")
+        utility_score = flat.get("utility_score")
+        if delta is None or utility_score is None:
+            raise RuntimeError("A4a binary brake oracle requires utility_delta and utility_score")
+
+        delta_group = delta.to(self.device).reshape(-1, traj_num).float()
+        score_group = utility_score.to(self.device).reshape(-1, traj_num).float()
+        base_score = flat.get("utility_base")
+        if base_score is None:
+            base_group = score_group.detach()
+        else:
+            base_group = base_score.to(self.device).reshape(-1, traj_num).float().detach()
+
+        progress_n = traj_num - 1
+        yopo_scores = base_group[:, :progress_n]
+        yopo_id = yopo_scores.argmax(dim=1)
+        batch_id = torch.arange(yopo_scores.shape[0], device=self.device)
+        yopo_score = yopo_scores[batch_id, yopo_id]
+        brake_logit = delta_group[:, -1]
+        finite_gate = torch.isfinite(brake_logit)
+        finite_yopo = torch.isfinite(yopo_score)
+
+        geom_unsafe = None
+        geom_safe = None
+        if self.yopo_preserve_geometry_oracle_source == "gt_clearance":
+            sampled_pos_w = loss_dict.get("sampled_pos_w")
+            if sampled_pos_w is None:
+                raise RuntimeError("A4a GT clearance oracle requires sampled_pos_w from OARMLoss")
+            min_clearance = candidate_min_clearance_gt(sampled_pos_w, map_id_expanded, self.dataset_root).reshape(-1, traj_num)
+            clearance_valid = torch.isfinite(min_clearance)
+            geom_unsafe = clearance_valid & (min_clearance < self.yopo_preserve_unsafe_clearance_m)
+            geom_safe = clearance_valid & (min_clearance > self.yopo_preserve_safe_clearance_m)
+        else:
+            safety_cost = loss_dict.get("safety_cost_per_candidate")
+            if safety_cost is not None:
+                safety_cost = safety_cost.to(self.device).reshape(-1, traj_num).float()
+                safety_valid = torch.isfinite(safety_cost)
+                geom_unsafe = safety_valid & (safety_cost > self.yopo_preserve_safety_cost_threshold)
+                geom_safe = safety_valid & (safety_cost <= self.yopo_preserve_safe_cost_threshold)
+
+        yopo_geom_unsafe = torch.zeros_like(finite_gate, dtype=torch.bool)
+        brake_feasible = torch.zeros_like(finite_gate, dtype=torch.bool)
+        if geom_unsafe is not None and geom_safe is not None:
+            yopo_geom_unsafe = geom_unsafe[:, :progress_n][batch_id, yopo_id]
+            brake_feasible = geom_safe[:, -1]
+
+        margin_label = flat_labels.get("reaction_margin")
+        margin_valid_label = flat_labels.get("reaction_margin_valid")
+        yopo_margin_unsafe = torch.zeros_like(finite_gate, dtype=torch.bool)
+        yopo_margin_valid = torch.zeros_like(finite_gate, dtype=torch.bool)
+        yopo_margin = torch.full_like(brake_logit, float("nan"))
+        if margin_label is not None:
+            margin_group = margin_label.to(self.device).reshape(-1, traj_num).float()
+            if margin_valid_label is None:
+                margin_valid_group = torch.ones_like(margin_group, dtype=torch.bool)
+            else:
+                margin_valid_group = margin_valid_label.to(self.device).reshape(-1, traj_num).bool()
+            yopo_margin = margin_group[:, :progress_n][batch_id, yopo_id]
+            yopo_margin_valid = margin_valid_group[:, :progress_n][batch_id, yopo_id] & torch.isfinite(yopo_margin)
+            yopo_margin_unsafe = yopo_margin_valid & (yopo_margin < 0.0)
+
+        yopo_bad = yopo_geom_unsafe | yopo_margin_unsafe
+        target_brake = yopo_bad & brake_feasible
+        valid = finite_gate & finite_yopo & ((~yopo_bad) | brake_feasible)
+
+        zero = torch.zeros((), device=self.device)
+        brake_gate_loss = zero
+        if bool(valid.any()):
+            target = target_brake[valid].float()
+            brake_gate_loss = self.yopo_preserve_oracle_ce_weight * F.binary_cross_entropy_with_logits(
+                brake_logit[valid], target
+            )
+        brake_gate_l2_loss = zero
+        finite_brake = torch.isfinite(brake_logit)
+        if self.yopo_preserve_residual_reg_weight > 0.0 and bool(finite_brake.any()):
+            brake_gate_l2_loss = self.yopo_preserve_residual_reg_weight * brake_logit[finite_brake].square().mean()
+
+        pred_brake = brake_logit > 0.0
+        metrics = {
+            "brake_gate_loss": brake_gate_loss,
+            "brake_gate_l2_loss": brake_gate_l2_loss,
+            "a4a_brake_gate_valid_rate": valid.float().mean(),
+            "a4a_yopo_top1_bad_rate": yopo_bad.float().mean(),
+            "a4a_yopo_top1_geom_unsafe_rate": yopo_geom_unsafe.float().mean(),
+            "a4a_yopo_top1_margin_unsafe_rate": yopo_margin_unsafe.float().mean(),
+            "a4a_yopo_top1_margin_valid_rate": yopo_margin_valid.float().mean(),
+            "a4a_brake_feasible_rate": brake_feasible.float().mean(),
+            "a4a_ignored_bad_and_no_brake_rate": (yopo_bad & ~brake_feasible & finite_gate).float().mean(),
+        }
+        if bool(valid.any()):
+            metrics.update(
+                {
+                    "a4a_brake_target_rate": target_brake[valid].float().mean(),
+                    "a4a_brake_pred_rate": pred_brake[valid].float().mean(),
+                    "a4a_brake_gate_acc": (pred_brake[valid] == target_brake[valid]).float().mean(),
+                    "a4a_yopo_top1_margin_mean": yopo_margin[valid & yopo_margin_valid].mean()
+                    if bool((valid & yopo_margin_valid).any())
+                    else zero,
+                }
+            )
+        else:
+            metrics.update(
+                {
+                    "a4a_brake_target_rate": zero,
+                    "a4a_brake_pred_rate": zero,
+                    "a4a_brake_gate_acc": zero,
+                    "a4a_yopo_top1_margin_mean": zero,
+                }
+            )
+        return metrics
 
     def update_oracle_ce_sanity(self, loss_dict, epoch, step):
         if self._oracle_ce_sanity_reported:
