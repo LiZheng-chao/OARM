@@ -145,6 +145,9 @@ def main(args):
     type_group = aug_flat["candidate_type"].reshape(batch, n_aug)
     brake = aug_flat["end_state_b"].reshape(batch, n_aug, 9)[:, -1]
     brake_type = type_group[:, -1]
+    base_selected_id = selected_ids(base, batch)
+    aug_selected_id = selected_ids(aug, batch)
+    selected_id_parity = bool((base_selected_id == aug_selected_id).all().item())
     set_brake_gate_bias(a4a, -10.0)
     with torch.inference_mode():
         gate_negative = a4a.inference(depth, obs)
@@ -176,6 +179,9 @@ def main(args):
         "appended_candidate_count": n_aug - n_base,
         "progress_parity": progress,
         "progress_types_all_progress": bool((type_group[:, :n_base] == OARMCandidateGenerator.PROGRESS).all().item()),
+        "selected_id_parity": selected_id_parity,
+        "base_selected_id": base_selected_id.detach().cpu().tolist(),
+        "a4a_initial_selected_id": aug_selected_id.detach().cpu().tolist(),
         "brake_type_all_brake": bool((brake_type == OARMCandidateGenerator.BRAKE).all().item()),
         "brake_terminal_speed_max": float(brake[:, 3:6].norm(dim=1).max().detach().cpu()),
         "brake_terminal_acc_max": float(brake[:, 6:9].norm(dim=1).max().detach().cpu()),
@@ -191,6 +197,7 @@ def main(args):
         and n_aug == int(cfg["traj_num"]) + 1
         and all(value <= args.atol for value in progress.values())
         and metrics["progress_types_all_progress"]
+        and metrics["selected_id_parity"]
         and metrics["brake_type_all_brake"]
         and metrics["brake_terminal_speed_max"] <= args.atol
         and metrics["brake_terminal_acc_max"] <= args.atol

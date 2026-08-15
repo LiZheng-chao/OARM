@@ -480,6 +480,22 @@ def check_a4a_binary_brake_teacher_semantics(device):
     print("a4a_binary_brake_teacher_semantics ok", float(out["brake_gate_loss"].detach().cpu()))
 
 
+def check_a4a_trainable_contract():
+    trainer = OARMTrainer.__new__(OARMTrainer)
+    trainer.candidate_mode = "a4_preserve_brake"
+    trainer.train_yield_head_only = False
+    trainer.yopo_preserve_freeze_margin_risk_head = False
+    trainer._frozen_output_rows = {}
+    trainer.policy = OARMNetwork(candidate_mode="a4_preserve_brake", backbone_mode="yopo_original")
+    trainer.configure_trainable_parameters()
+    trainer.assert_trainable_parameter_contract()
+    names = trainer.trainable_parameter_names()
+    assert names
+    assert all(name.startswith("preserve_network.brake_gate_head.") for name in names), names
+    assert not any(name.startswith("preserve_network.margin_risk_head.") for name in names), names
+    print("a4a_trainable_contract ok", len(names))
+
+
 def parser():
     p = argparse.ArgumentParser()
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
@@ -511,6 +527,7 @@ def main():
     check_goal_yaw_matches_yopo_calculate_yaw(device)
     check_eval_label_generation_uses_deployed_yaw_mode(device)
     check_a4a_binary_brake_teacher_semantics(device)
+    check_a4a_trainable_contract()
     if not args.skip_dataset:
         check_dataset_sample(args.dataset_root or None)
     if args.one_batch_loss:

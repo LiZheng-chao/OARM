@@ -1015,11 +1015,24 @@ class OARMTrainer:
             "a4a_ambiguous_ignore_rate": (finite_gate & finite_yopo & ~valid).float().mean(),
         }
         if bool(valid.any()):
+            target_valid = target_brake[valid]
+            pred_valid = pred_brake[valid]
+            positive = target_valid
+            negative = ~target_valid
+            predicted_positive = pred_valid
             metrics.update(
                 {
-                    "a4a_brake_target_rate": target_brake[valid].float().mean(),
-                    "a4a_brake_pred_rate": pred_brake[valid].float().mean(),
-                    "a4a_brake_gate_acc": (pred_brake[valid] == target_brake[valid]).float().mean(),
+                    "a4a_brake_target_rate": target_valid.float().mean(),
+                    "a4a_brake_pred_rate": pred_valid.float().mean(),
+                    "a4a_brake_gate_acc": (pred_valid == target_valid).float().mean(),
+                    "a4a_brake_recall": pred_valid[positive].float().mean() if bool(positive.any()) else zero,
+                    "a4a_false_brake_rate": pred_valid[negative].float().mean() if bool(negative.any()) else zero,
+                    "a4a_keep_recall": (~pred_valid[negative]).float().mean() if bool(negative.any()) else zero,
+                    "a4a_brake_precision": target_valid[predicted_positive].float().mean()
+                    if bool(predicted_positive.any())
+                    else zero,
+                    "a4a_brake_positive_valid_count": positive.float().sum(),
+                    "a4a_keep_negative_valid_count": negative.float().sum(),
                     "a4a_yopo_top1_margin_mean": yopo_margin[valid & yopo_margin_valid].mean()
                     if bool((valid & yopo_margin_valid).any())
                     else zero,
@@ -1031,6 +1044,12 @@ class OARMTrainer:
                     "a4a_brake_target_rate": zero,
                     "a4a_brake_pred_rate": zero,
                     "a4a_brake_gate_acc": zero,
+                    "a4a_brake_recall": zero,
+                    "a4a_false_brake_rate": zero,
+                    "a4a_keep_recall": zero,
+                    "a4a_brake_precision": zero,
+                    "a4a_brake_positive_valid_count": zero,
+                    "a4a_keep_negative_valid_count": zero,
                     "a4a_yopo_top1_margin_mean": zero,
                 }
             )
