@@ -188,8 +188,15 @@ def candidate_reaction_margin_gt(row, candidate, line_of_sight, args, device, ma
             "gt_annotation_status": "no_nearby_gt_risk_points",
             "gt_risk_point_count": 0,
             "reaction_margin_gt": None,
+            "reaction_window_gt": None,
             "selected_rmvr_gt": None,
             "valid_reaction_margin_gt": False,
+            "rm_event_valid_gt": False,
+            "rm_right_censored_gt": False,
+            "rm_no_entry_gt": True,
+            "risk_visible_at_t0_gt": False,
+            "critical_risk_point_id": None,
+            "critical_risk_weight": None,
             "hidden_risk_gt": None,
         })
         return result
@@ -211,24 +218,39 @@ def candidate_reaction_margin_gt(row, candidate, line_of_sight, args, device, ma
     first_vis = components["first_visible_time"]
     arrival = components["first_entry_time"]
     margin = components["reaction_margin_points"]
+    window = components["observation_lead_time"]
+    visible_before_entry = components["visible_before_entry"].bool()
+    visible_at_t0 = torch.isfinite(first_vis) & (first_vis <= args.hidden_risk_eps)
     valid_mask = components["arrival_valid"].bool() & torch.isfinite(margin)
     if bool(valid_mask.any()):
         masked_margin = torch.where(valid_mask, margin, torch.full_like(margin, torch.inf))
         margin_flat = masked_margin.reshape(-1)
         first_flat = first_vis.reshape(-1)
         arrival_flat = arrival.reshape(-1)
+        window_flat = window.reshape(-1)
+        event_flat = visible_before_entry.reshape(-1)
+        visible_t0_flat = visible_at_t0.reshape(-1)
         crit_idx = int(torch.argmin(margin_flat).detach().cpu())
         crit_first = first_flat[crit_idx]
         crit_arrival = arrival_flat[crit_idx]
         reaction_margin_gt = float(margin_flat[crit_idx].detach().cpu())
+        reaction_window_gt = float(window_flat[crit_idx].detach().cpu())
+        event_valid = bool(event_flat[crit_idx].detach().cpu())
         result.update({
             "gt_annotation_status": "ok",
             "gt_risk_point_count": int(len(risk_points)),
             "critical_first_visible_time_gt": None if bool(torch.isinf(crit_first)) else float(crit_first.detach().cpu()),
             "critical_arrival_time_gt": None if bool(torch.isinf(crit_arrival)) else float(crit_arrival.detach().cpu()),
             "reaction_margin_gt": reaction_margin_gt,
+            "reaction_window_gt": reaction_window_gt,
             "selected_rmvr_gt": float(reaction_margin_gt < 0.0),
             "valid_reaction_margin_gt": True,
+            "rm_event_valid_gt": event_valid,
+            "rm_right_censored_gt": bool(not event_valid),
+            "rm_no_entry_gt": False,
+            "risk_visible_at_t0_gt": bool(visible_t0_flat[crit_idx].detach().cpu()),
+            "critical_risk_point_id": crit_idx,
+            "critical_risk_weight": 1.0,
             "hidden_risk_gt": bool(torch.isinf(crit_first) or crit_first > args.hidden_risk_eps),
         })
     else:
@@ -236,8 +258,15 @@ def candidate_reaction_margin_gt(row, candidate, line_of_sight, args, device, ma
             "gt_annotation_status": "censored",
             "gt_risk_point_count": int(len(risk_points)),
             "reaction_margin_gt": None,
+            "reaction_window_gt": None,
             "selected_rmvr_gt": None,
             "valid_reaction_margin_gt": False,
+            "rm_event_valid_gt": False,
+            "rm_right_censored_gt": False,
+            "rm_no_entry_gt": True,
+            "risk_visible_at_t0_gt": False,
+            "critical_risk_point_id": None,
+            "critical_risk_weight": None,
             "hidden_risk_gt": None,
         })
     return result

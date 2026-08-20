@@ -84,6 +84,85 @@ def corr(xs, ys):
     return num / (den_x * den_y)
 
 
+
+def sigmoid(value):
+    if value is None:
+        return None
+    if value >= 0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
+
+
+def first_float(row: Dict, *keys):
+    for key in keys:
+        value = parse_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def risk_probability(row: Dict):
+    prob = first_float(
+        row,
+        "calibrated_risk_prob",
+        "calibrated_risk",
+        "selected_risk_prob",
+        "risk_prob",
+        "risk_probability",
+    )
+    if prob is not None:
+        return min(max(prob, 0.0), 1.0)
+    logit = first_float(row, "selected_risk_logit", "risk_logit", "insufficient_margin_logit")
+    return sigmoid(logit)
+
+
+def risk_upper(row: Dict):
+    value = first_float(row, "selected_risk_upper_bound", "risk_upper_bound", "calibrated_risk_upper_bound")
+    return min(max(value, 0.0), 1.0) if value is not None else None
+
+
+def risk_label(row: Dict):
+    label = first_float(row, "selected_rmvr_gt", "rm_violation_gt", "insufficient_margin_gt")
+    if label is not None:
+        return 1.0 if label >= 0.5 else 0.0
+    margin = parse_float(row.get("reaction_margin_gt"))
+    if margin is not None:
+        return 1.0 if margin < 0.0 else 0.0
+    window = parse_float(row.get("reaction_window_gt"))
+    budget_ms = parse_float(row.get("reaction_budget_ms"))
+    if window is not None and budget_ms is not None:
+        return 1.0 if window < budget_ms / 1000.0 else 0.0
+    return None
+
+
+def binary_calibration(values, labels, n_bins=15):
+    pairs = [(p, y) for p, y in zip(values, labels) if p is not None and y is not None]
+    if not pairs:
+        return {"brier": None, "ece": None, "mce": None, "nll": None}
+    probs = [min(max(p, 1e-6), 1.0 - 1e-6) for p, _y in pairs]
+    ys = [1.0 if y >= 0.5 else 0.0 for _p, y in pairs]
+    brier = mean([(p - y) ** 2 for p, y in zip(probs, ys)])
+    nll = mean([-(y * math.log(p) + (1.0 - y) * math.log(1.0 - p)) for p, y in zip(probs, ys)])
+    ece = 0.0
+    mce = 0.0
+    for idx in range(n_bins):
+        lo = idx / n_bins
+        hi = (idx + 1) / n_bins
+        if idx == n_bins - 1:
+            mask = [(p, y) for p, y in zip(probs, ys) if lo <= p <= hi]
+        else:
+            mask = [(p, y) for p, y in zip(probs, ys) if lo <= p < hi]
+        if not mask:
+            continue
+        conf = mean([p for p, _y in mask])
+        acc = mean([y for _p, y in mask])
+        gap = abs(conf - acc)
+        ece += gap * (len(mask) / len(pairs))
+        mce = max(mce, gap)
+    return {"brier": brier, "ece": ece, "mce": mce, "nll": nll}
+
 def summarize(method: str, scenario: str, type_name: str, rows: List[Dict]) -> Dict:
     pred = [parse_float(row.get("selected_margin_pred", row.get("reaction_margin"))) for row in rows]
     gt = [parse_float(row.get("reaction_margin_gt")) for row in rows]
@@ -93,6 +172,11 @@ def summarize(method: str, scenario: str, type_name: str, rows: List[Dict]) -> D
     sign_matches = [float((p >= 0.0) == (g >= 0.0)) for p, g in valid_pairs]
     censored = [parse_bool(row.get("reaction_margin_censored_gt")) for row in rows if "reaction_margin_censored_gt" in row]
     valid_flags = [parse_bool(row.get("valid_reaction_margin_gt")) for row in rows if "valid_reaction_margin_gt" in row]
+    risk_probs = [risk_probability(row) for row in rows]
+    risk_uppers = [risk_upper(row) for row in rows]
+    risk_labels = [risk_label(row) for row in rows]
+    risk_pairs = [(p, y) for p, y in zip(risk_probs, risk_labels) if p is not None and y is not None]
+    cal = binary_calibration(risk_probs, risk_labels)
     return {
         "method": method,
         "scenario": scenario,
@@ -117,6 +201,13 @@ def summarize(method: str, scenario: str, type_name: str, rows: List[Dict]) -> D
                 if row.get("selected_traj_collision_gt", row.get("collision_gt")) not in (None, "")
             ]
         ),
+        "risk_pair_count": len(risk_pairs),
+        "calibrated_risk_mean": mean([p for p in risk_probs if p is not None]),
+        "risk_upper_bound_mean": mean([p for p in risk_uppers if p is not None]),
+        "risk_brier": cal["brier"],
+        "risk_ece": cal["ece"],
+        "risk_mce": cal["mce"],
+        "risk_nll": cal["nll"],
     }
 
 

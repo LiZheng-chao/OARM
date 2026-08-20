@@ -15,6 +15,71 @@ ensure_yopo_path()
 from config.config import cfg
 
 
+
+
+class CandidateRMCritic(nn.Module):
+    """Candidate-level probabilistic reaction-window critic.
+
+    This module is intentionally standalone: it can be trained on frozen YOPO/OARM
+    candidate features and queried by a calibrated selector without changing the
+    baseline YOPO source tree.
+    """
+
+    def __init__(
+        self,
+        candidate_feature_dim: int,
+        state_feature_dim: int = 0,
+        geometry_feature_dim: int = 0,
+        hidden_dim: int = 128,
+        hazard_bins: int = 0,
+    ):
+        super().__init__()
+        self.hazard_bins = int(hazard_bins)
+        input_dim = int(candidate_feature_dim) + int(state_feature_dim) + int(geometry_feature_dim) + 1
+        output_dim = 4 + max(self.hazard_bins, 0)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        final = self.mlp[-1]
+        nn.init.zeros_(final.weight)
+        nn.init.zeros_(final.bias)
+
+    def forward(
+        self,
+        candidate_feature: torch.Tensor,
+        state_feature: torch.Tensor = None,
+        yopo_cost: torch.Tensor = None,
+        candidate_geometry: torch.Tensor = None,
+    ):
+        if candidate_feature.dim() != 3:
+            raise ValueError("candidate_feature must have shape [B, N, C]")
+        b, n, _ = candidate_feature.shape
+        pieces = [candidate_feature]
+        if state_feature is not None:
+            pieces.append(state_feature.reshape(b, 1, -1).expand(-1, n, -1))
+        if yopo_cost is None:
+            yopo_cost = torch.zeros((b, n, 1), device=candidate_feature.device, dtype=candidate_feature.dtype)
+        else:
+            yopo_cost = yopo_cost.reshape(b, n, 1).to(device=candidate_feature.device, dtype=candidate_feature.dtype)
+        pieces.append(yopo_cost)
+        if candidate_geometry is not None:
+            pieces.append(candidate_geometry.reshape(b, n, -1).to(device=candidate_feature.device, dtype=candidate_feature.dtype))
+        raw = self.mlp(torch.cat(pieces, dim=-1))
+        out = {
+            "reaction_window_mean": raw[..., 0],
+            "reaction_window_logvar": raw[..., 1].clamp(min=-12.0, max=8.0),
+            "insufficient_margin_logit": raw[..., 2],
+            "validity_logit": raw[..., 3],
+        }
+        if self.hazard_bins > 0:
+            out["hazard_logits"] = raw[..., 4 : 4 + self.hazard_bins]
+        return out
+
+
 class OARMNetwork(nn.Module):
     """Occlusion-aware reaction-margin planner head.
 

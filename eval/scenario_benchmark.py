@@ -28,6 +28,20 @@ REQUIRED_RUN_FIELDS = (
 
 OPTIONAL_GT_FIELDS = (
     "reaction_margin_gt",
+    "reaction_window_gt",
+    "rm_event_valid_gt",
+    "rm_right_censored_gt",
+    "rm_no_entry_gt",
+    "risk_visible_at_t0_gt",
+    "critical_risk_point_id",
+    "critical_risk_weight",
+    "calibrated_risk",
+    "calibrated_risk_prob",
+    "risk_upper_bound",
+    "intervention_type",
+    "intervention_reason",
+    "reaction_budget_ms",
+    "latency_violation",
     "first_visible_time_gt",
     "arrival_time_to_risk_gt",
     "critical_first_visible_time_gt",
@@ -162,6 +176,59 @@ def candidate_type_name(value):
     return text
 
 
+
+def sigmoid(value):
+    if value is None:
+        return None
+    if value >= 0.0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
+
+
+def first_float(row, *keys):
+    for key in keys:
+        value = parse_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def risk_probability(row):
+    prob = first_float(row, "calibrated_risk_prob", "calibrated_risk", "selected_risk_prob", "risk_prob")
+    if prob is not None:
+        return min(max(prob, 0.0), 1.0)
+    return sigmoid(first_float(row, "selected_risk_logit", "risk_logit", "insufficient_margin_logit"))
+
+
+def risk_upper_bound(row):
+    value = first_float(row, "selected_risk_upper_bound", "risk_upper_bound", "calibrated_risk_upper_bound")
+    return min(max(value, 0.0), 1.0) if value is not None else None
+
+
+def intervention_type_name(row):
+    value = row.get("intervention_type") or row.get("selected_intervention_type")
+    if value not in (None, ""):
+        return str(value).strip().lower()
+    selected = candidate_type_name(row.get("candidate_type"))
+    if selected == "probe":
+        return "probe"
+    if selected in {"brake", "yield"} or parse_bool(row.get("emergency_brake")):
+        return "brake"
+    return "unknown"
+
+
+def latency_violation(row):
+    explicit = row.get("latency_violation")
+    if explicit not in (None, ""):
+        return parse_bool(explicit)
+    window = parse_float(row.get("reaction_window_gt"))
+    budget_ms = parse_float(row.get("reaction_budget_ms"))
+    if window is None or budget_ms is None:
+        return None
+    return window < budget_ms / 1000.0
+
 def first_present(rows, key):
     for row in rows:
         if key in row and row.get(key) not in (None, ""):
@@ -258,6 +325,26 @@ def summarize_run(rows: List[Dict]) -> Dict:
     collision_exec_values = bool_values(rows, "collision_exec")
     success_exec_values = bool_values(rows, "success_exec")
     selected_collision_values = bool_values(rows, "selected_traj_collision_gt") or bool_values(rows, "collision_gt")
+    risk_probs = [risk_probability(row) for row in rows]
+    risk_uppers = [risk_upper_bound(row) for row in rows]
+    intervention_types = [intervention_type_name(row) for row in rows]
+    intervention_known = [t for t in intervention_types if t != "unknown"]
+    latency_violations = [latency_violation(row) for row in rows]
+    latency_violations = [v for v in latency_violations if v is not None]
+    intervention_pairs = []
+    for row, intervention_type in zip(rows, intervention_types):
+        safe_value = row.get("yopo_top1_safe_gt", row.get("yopo_actually_safe_gt"))
+        if safe_value not in (None, ""):
+            safe = parse_bool(safe_value)
+        else:
+            margin = parse_float(row.get("reaction_margin_gt"))
+            if margin is None:
+                continue
+            safe = margin >= 0.0
+        intervention_pairs.append((intervention_type not in {"keep", "unknown"}, safe))
+    false_interventions = [float(intervened and safe) for intervened, safe in intervention_pairs]
+    missed_interventions = [float((not intervened) and (not safe)) for intervened, safe in intervention_pairs]
+    risk_covered = [parse_bool(row.get("risk_covered")) for row in rows if row.get("risk_covered") not in (None, "")]
     legacy_collision_values = bool_values(rows, "collision") or bool_values(rows, "collision_flag")
     legacy_success_values = bool_values(rows, "success") or bool_values(rows, "success_flag")
     collision_exec = any(collision_exec_values) if collision_exec_values else any(legacy_collision_values)
@@ -309,6 +396,17 @@ def summarize_run(rows: List[Dict]) -> Dict:
         "path_time_exec": path_time_exec,
         "sample_count": len(rows),
         "reaction_margin_violation_rate": mean([float(m < 0.0) for m in margins]),
+        "rm_violation_rate": mean([float(m < 0.0) for m in margins]),
+        "calibrated_risk_mean": mean([p for p in risk_probs if p is not None]),
+        "risk_upper_bound_mean": mean([p for p in risk_uppers if p is not None]),
+        "latency_violation_rate": mean([float(v) for v in latency_violations]),
+        "risk_coverage": mean([float(v) for v in risk_covered]),
+        "keep_rate": mean([float(t == "keep") for t in intervention_known]),
+        "rerank_rate": mean([float(t == "rerank") for t in intervention_known]),
+        "probe_rate": mean([float(t == "probe") for t in intervention_known]),
+        "brake_rate": mean([float(t == "brake") for t in intervention_known]),
+        "false_intervention_rate": mean(false_interventions),
+        "missed_intervention_rate": mean(missed_interventions),
         "rmvr_source": 1.0 if gt_margins else 0.0,
         "gt_rmvr_valid_count": len(gt_margins),
         "gt_rmvr_coverage": len(gt_margins) / max(len(rows), 1),
