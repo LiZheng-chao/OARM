@@ -170,7 +170,10 @@ class YOPOPreserveOARMNetwork(nn.Module):
         else:
             aux = margin_risk
         if self.append_brake_candidate:
-            brake_gate_raw = self.brake_gate_head(detached_features).mean(dim=(2, 3), keepdim=True)
+            gate_map = self.brake_gate_head(detached_features)
+            utility_base = -score_pred
+            top1_id = utility_base.flatten(1).argmax(dim=1)
+            brake_gate_raw = gate_map.flatten(1).gather(1, top1_id[:, None]).reshape(-1, 1, 1, 1)
             brake_gate_raw = brake_gate_raw.expand(-1, -1, margin_risk.shape[2], margin_risk.shape[3])
             aux = torch.cat((aux, brake_gate_raw), dim=1)
         return endstate_pred, score_pred, aux
@@ -182,7 +185,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
         direction = vel_b / speed.clamp_min(1e-3)
         brake_time_scalar = torch.clamp(1.5 * speed / acc_max, min=0.6, max=2.5)
         stopping_distance = torch.clamp(0.5 * speed * brake_time_scalar, min=0.0, max=6.0)
-        end_pos = torch.where(speed > 0.15, direction * stopping_distance, torch.zeros_like(vel_b))
+        end_pos = torch.where(speed > 1e-3, direction * stopping_distance, torch.zeros_like(vel_b))
         end_vel = torch.zeros_like(end_pos)
         end_acc = torch.zeros_like(end_pos)
         end_state = torch.cat((end_pos, end_vel, end_acc), dim=1).reshape(obs.shape[0], 9, 1, 1)

@@ -80,8 +80,38 @@ def selected_ids(candidate, batch):
     return candidate.flatten()["utility_score"].reshape(batch, n).argmax(dim=1)
 
 
+class _SpatialRampGate(torch.nn.Module):
+    def forward(self, features):
+        b, _c, v, h = features.shape
+        ramp = torch.arange(v * h, device=features.device, dtype=features.dtype).reshape(1, 1, v, h)
+        return ramp.expand(b, -1, -1, -1)
+
+
+def check_top1_gate_gather(policy, depth, obs, batch):
+    original_head = policy.preserve_network.brake_gate_head
+    try:
+        policy.preserve_network.brake_gate_head = _SpatialRampGate().to(depth.device)
+        with torch.inference_mode():
+            candidate = policy.inference(depth, obs)
+        n = candidate.utility_score.numel() // batch
+        flat = candidate.flatten()
+        utility_base = flat["utility_base"].reshape(batch, n)
+        top1_id = utility_base[:, : n - 1].argmax(dim=1)
+        brake_gate = flat["utility_delta"].reshape(batch, n)[:, -1]
+        expected = top1_id.to(device=brake_gate.device, dtype=brake_gate.dtype)
+        max_abs_error = float((brake_gate - expected).abs().max().detach().cpu())
+        return {
+            "passed": max_abs_error <= 1e-6,
+            "max_abs_error": max_abs_error,
+            "top1_id": top1_id.detach().cpu().tolist(),
+            "brake_gate": brake_gate.detach().cpu().tolist(),
+        }
+    finally:
+        policy.preserve_network.brake_gate_head = original_head
+
+
 def check_brake_physics(policy, device):
-    speeds = torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0], device=device)
+    speeds = torch.tensor([0.0, 0.05, 0.1, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0], device=device)
     obs = torch.zeros(speeds.numel(), 9, device=device)
     obs[:, 0] = speeds
     end_state, brake_time = policy.preserve_network.deterministic_brake_candidate(obs, torch.float32, device)
@@ -160,6 +190,8 @@ def main(args):
     positive_ids = selected_ids(gate_positive, batch)
     positive_chooses_brake = bool((positive_ids == n_aug - 1).all().item())
 
+    top1_gate_gather = check_top1_gate_gather(a4a, depth, obs, batch)
+
     optimizer = torch.optim.SGD(a4a.preserve_network.brake_gate_head.parameters(), lr=1e-3)
     optimizer.zero_grad(set_to_none=True)
     dummy_loss = torch.zeros((), device=device)
@@ -189,6 +221,7 @@ def main(args):
         "brake_time_max": float(aug_flat["traj_time"].reshape(batch, n_aug)[:, -1].max().detach().cpu()),
         "gate_negative_chooses_progress": negative_chooses_progress,
         "gate_positive_chooses_brake": positive_chooses_brake,
+        "top1_gate_gather": top1_gate_gather,
         "optimizer_step_progress_parity": optimizer_step_progress,
         "brake_physics": brake_physics,
     }
@@ -203,6 +236,7 @@ def main(args):
         and metrics["brake_terminal_acc_max"] <= args.atol
         and metrics["gate_negative_chooses_progress"]
         and metrics["gate_positive_chooses_brake"]
+        and metrics["top1_gate_gather"]["passed"]
         and all(value <= args.atol for value in metrics["optimizer_step_progress_parity"].values())
         and metrics["brake_physics"]["passed"]
     )
