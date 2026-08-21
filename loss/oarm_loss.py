@@ -428,10 +428,11 @@ class OARMLoss(nn.Module):
         if not self.enable_probabilistic_rm_critic:
             return out
         if labels is None or "reaction_window" not in labels:
-            return out
+            raise RuntimeError("Probabilistic RM critic training requires reaction_window labels; use the OARM3 S2 training route.")
         required = ("reaction_window_mean", "reaction_window_logvar", "validity_logit")
-        if any(key not in candidate_flat for key in required):
-            return out
+        missing = [key for key in required if key not in candidate_flat]
+        if missing:
+            raise RuntimeError("Probabilistic RM critic training requires critic outputs: " + ", ".join(missing))
 
         window = labels["reaction_window"].to(device=zero_ref.device).reshape_as(candidate_flat["reaction_window_mean"]).float()
         event_valid = labels.get("rm_event_valid", labels.get("reaction_margin_valid"))

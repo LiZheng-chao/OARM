@@ -23,6 +23,7 @@ def make_oarm_checkpoint(
     deployed_yaw_mode=None,
     risk_label_source=None,
     yopo_preserve_utility_delta_scale=None,
+    train_probabilistic_rm_critic=None,
 ):
     training_options = dict(training_options or {})
     if enable_yield_candidates is None:
@@ -33,6 +34,12 @@ def make_oarm_checkpoint(
         risk_label_source = training_options.get("risk_label_source")
     if yopo_preserve_utility_delta_scale is None:
         yopo_preserve_utility_delta_scale = training_options.get("yopo_preserve_utility_delta_scale")
+    if train_probabilistic_rm_critic is None:
+        train_probabilistic_rm_critic = training_options.get("train_probabilistic_rm_critic", False)
+    train_probabilistic_rm_critic = bool(train_probabilistic_rm_critic)
+    training_route = training_options.get("training_route") or training_options.get("stage")
+    if train_probabilistic_rm_critic:
+        training_route = "oarm3_s2_prob_rm"
     return {
         "state_dict": state_dict,
         "candidate_mode": candidate_mode,
@@ -42,10 +49,13 @@ def make_oarm_checkpoint(
         "risk_label_source": risk_label_source,
         "yopo_preserve_utility_delta_scale": yopo_preserve_utility_delta_scale,
         "stage": training_options.get("stage"),
+        "training_route": training_route,
+        "oarm_version": "oarm3" if train_probabilistic_rm_critic else "oarm2",
+        "train_probabilistic_rm_critic": train_probabilistic_rm_critic,
         "train_yaw_visibility": training_options.get("train_yaw_visibility"),
         "train_margin_ranking": training_options.get("train_margin_ranking"),
         "training_options": training_options,
-        "checkpoint_format": "oarm_policy_v2",
+        "checkpoint_format": "oarm_policy_v3" if train_probabilistic_rm_critic else "oarm_policy_v2",
     }
 
 
@@ -58,6 +68,7 @@ def validate_checkpoint_metadata(
     deployed_yaw_mode=None,
     risk_label_source=None,
     yopo_preserve_utility_delta_scale=None,
+    train_probabilistic_rm_critic=None,
 ):
     mismatches = []
     expected = {
@@ -72,12 +83,16 @@ def validate_checkpoint_metadata(
         expected["risk_label_source"] = risk_label_source
     if yopo_preserve_utility_delta_scale is not None:
         expected["yopo_preserve_utility_delta_scale"] = float(yopo_preserve_utility_delta_scale)
+    if train_probabilistic_rm_critic is not None:
+        expected["train_probabilistic_rm_critic"] = bool(train_probabilistic_rm_critic)
     for key, value in expected.items():
         stored = metadata.get(key)
         if stored is None:
             training_options = metadata.get("training_options") or {}
             stored = training_options.get(key)
         if stored is None:
+            if key == "train_probabilistic_rm_critic" and bool(value):
+                mismatches.append(f"{key}: checkpoint=<missing>, requested={value}")
             continue
         if key == "yopo_preserve_utility_delta_scale":
             try:

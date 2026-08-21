@@ -150,6 +150,17 @@ class OARMTrainer:
         self.train_probabilistic_rm_critic = bool(train_probabilistic_rm_critic)
         self.train_yaw_visibility = bool(train_yaw_visibility)
         self.deployed_yaw_mode = deployed_yaw_mode
+        if self.train_probabilistic_rm_critic:
+            if self.candidate_mode != "yopo_preserve" or self.backbone_mode != "yopo_original":
+                raise ValueError("OARM3 S2 probabilistic RM critic training requires candidate_mode=yopo_preserve and backbone_mode=yopo_original")
+            if train_occlusion_risk or train_margin_ranking or train_yaw_visibility or train_backup_feasibility or train_yield_feasibility:
+                raise ValueError("OARM3 S2 trains only preserve_network.rm_critic; disable old OARM2 auxiliary heads/ranking/yield losses")
+            if not train_risk_point_guidance:
+                raise ValueError("OARM3 S2 requires train_risk_point_guidance=True so reaction-window labels can be generated")
+            if risk_label_source != "gt_pointcloud":
+                raise ValueError("OARM3 S2 requires risk_label_source=gt_pointcloud for reaction-window supervision")
+            if not use_occlusion_aware_visibility:
+                raise ValueError("OARM3 S2 requires use_occlusion_aware_visibility=True for valid/censored labels")
         self.risk_label_source = risk_label_source
         self.gt_sampler_options = {
             "point_count": gt_risk_point_count,
@@ -250,6 +261,7 @@ class OARMTrainer:
                 deployed_yaw_mode=self.deployed_yaw_mode,
                 risk_label_source=self.risk_label_source,
                 yopo_preserve_utility_delta_scale=self.yopo_preserve_utility_delta_scale,
+                train_probabilistic_rm_critic=self.train_probabilistic_rm_critic,
             )
             self.policy.load_state_dict(state_dict)
         elif init_from_a1_checkpoint_path:
@@ -368,8 +380,8 @@ class OARMTrainer:
 
 
     def load_a1_initialization_checkpoint(self, checkpoint_path, allow_mismatch=False):
-        if self.candidate_mode != "yopo_preserve_rerank":
-            raise ValueError("--init-from-a1-checkpoint is only valid for candidate_mode=yopo_preserve_rerank")
+        if self.candidate_mode != "yopo_preserve_rerank" and not (self.candidate_mode == "yopo_preserve" and self.train_probabilistic_rm_critic):
+            raise ValueError("--init-from-a1-checkpoint is valid for A3h rerank or OARM3 S2 probabilistic RM critic training")
         if not os.path.isfile(checkpoint_path):
             raise FileNotFoundError(f"A1 initialization checkpoint not found: {checkpoint_path}")
         state_dict, metadata = load_oarm_checkpoint(checkpoint_path, map_location=self.device)
@@ -390,19 +402,27 @@ class OARMTrainer:
         if not has_preserve:
             raise ValueError("A1 initialization checkpoint does not contain preserve_network.* weights")
         missing, unexpected = self.policy.load_state_dict(state_dict, strict=True)
-        self.policy.preserve_network.reset_rerank_output()
+        reset_rerank_output = self.candidate_mode == "yopo_preserve_rerank"
+        if reset_rerank_output:
+            self.policy.preserve_network.reset_rerank_output()
         self.a1_initialization_report = {
             "path": checkpoint_path,
             "stored_candidate_mode": stored_candidate,
             "stored_backbone_mode": stored_backbone,
             "loaded_margin_risk_head": True,
-            "reset_rerank_output": True,
+            "reset_rerank_output": reset_rerank_output,
+            "initialized_rm_critic": bool(self.train_probabilistic_rm_critic),
             "missing": list(missing),
             "unexpected": list(unexpected),
         }
-        self.progress_log.console.log(
-            "Loaded A1 margin/risk weights for A3h warm-start; reset rerank output to zero."
-        )
+        if self.train_probabilistic_rm_critic:
+            self.progress_log.console.log(
+                "Loaded A1 YOPO-preserve weights for OARM3 S2; RM critic remains randomly initialized and is the only trainable module."
+            )
+        else:
+            self.progress_log.console.log(
+                "Loaded A1 margin/risk weights for A3h warm-start; reset rerank output to zero."
+            )
 
     def train(self, epoch=50):
         train_start = time.time()
@@ -536,7 +556,7 @@ class OARMTrainer:
         if self.train_occlusion_risk and "occlusion_risk" in labels:
             flat_labels["occlusion_risk"] = labels["occlusion_risk"].to(self.device).reshape(-1)
 
-        if self.train_risk_point_guidance and "risk_points_w" in labels:
+        if (self.train_risk_point_guidance or self.train_probabilistic_rm_critic) and "risk_points_w" in labels:
             flat_labels["risk_points_w"] = labels["risk_points_w"].to(self.device)
             if "risk_weight" in labels:
                 flat_labels["risk_weight"] = labels["risk_weight"].to(self.device)
@@ -574,7 +594,8 @@ class OARMTrainer:
             )
 
         map_id_expanded = map_id.to(self.device).repeat_interleave(traj_num, dim=0)
-        if self.train_reaction_margin:
+        needs_reaction_window_labels = self.train_reaction_margin or self.train_probabilistic_rm_critic
+        if needs_reaction_window_labels:
             flat_labels = generate_reaction_margin_labels(
                 flat_labels,
                 flat,
@@ -587,6 +608,15 @@ class OARMTrainer:
                 line_of_sight=self.oarm_loss.line_of_sight,
                 yaw_helper=self.oarm_loss,
             )
+        if self.train_probabilistic_rm_critic:
+            required_prediction_keys = ("reaction_window_mean", "reaction_window_logvar", "validity_logit")
+            missing_prediction_keys = [key for key in required_prediction_keys if key not in flat]
+            if missing_prediction_keys:
+                raise RuntimeError("OARM3 S2 policy did not return RM critic outputs: " + ", ".join(missing_prediction_keys))
+            required_label_keys = ("reaction_window", "rm_event_valid", "rm_right_censored", "rm_no_entry")
+            missing_label_keys = [key for key in required_label_keys if key not in flat_labels]
+            if missing_label_keys:
+                raise RuntimeError("OARM3 S2 labels were not generated: " + ", ".join(missing_label_keys))
         loss_dict = self.oarm_loss(start_state_w, end_state_w, flat, goal_w, flat_labels, map_id_expanded)
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             aux_loss = torch.zeros((), device=self.device)
@@ -906,6 +936,7 @@ class OARMTrainer:
             loss_dict["geometry_ce_suppressed_by_oracle_rate"] = geometry_ce_suppressed_by_oracle_rate
 
             loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
+            loss_dict["oarm3_s2_critic_only"] = torch.tensor(bool(self.train_probabilistic_rm_critic), device=self.device, dtype=torch.float32)
             loss_dict["total_loss"] = (
                 aux_loss
                 + rerank_loss
@@ -1151,6 +1182,7 @@ class OARMTrainer:
                 enable_yield_candidates=self.enable_yield_candidates,
                 deployed_yaw_mode=self.deployed_yaw_mode,
                 risk_label_source=self.risk_label_source,
+                yopo_preserve_utility_delta_scale=self.yopo_preserve_utility_delta_scale,
             ),
             policy_path,
         )
@@ -1274,6 +1306,8 @@ class OARMTrainer:
                 "margin_risk_head_training": bool(preserve.margin_risk_head.training),
                 "rerank_head_training": bool(preserve.rerank_head.training),
                 "enable_utility_delta": bool(getattr(preserve, "enable_utility_delta", False)),
+                "enable_rm_critic": bool(getattr(preserve, "enable_rm_critic", False)),
+                "rm_critic_training": bool(getattr(getattr(preserve, "rm_critic", None), "training", False)),
             }
         artifact = {
             "candidate_mode": self.candidate_mode,
@@ -1304,6 +1338,9 @@ class OARMTrainer:
             "mapless_online_inference": True,
             "backbone_policy": experiment_options.get("backbone_mode", self.backbone_mode),
             "training_options": experiment_options,
+            "training_route": "oarm3_s2_prob_rm" if self.train_probabilistic_rm_critic else experiment_options.get("stage"),
+            "oarm_version": "oarm3" if self.train_probabilistic_rm_critic else "oarm2",
+            "train_probabilistic_rm_critic": bool(self.train_probabilistic_rm_critic),
         }
         options_path = os.path.join(self.tensorboard_path, "options.json")
         with open(options_path, "w", encoding="utf-8") as f:

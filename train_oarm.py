@@ -109,7 +109,7 @@ def parser():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=1.5e-4)
     p.add_argument("--checkpoint", type=str, default="")
-    p.add_argument("--init-from-a1-checkpoint", type=str, default="", help="A1 yopo_preserve checkpoint used to initialize A3h split-head reranker")
+    p.add_argument("--init-from-a1-checkpoint", type=str, default="", help="A1 yopo_preserve checkpoint used to initialize A3h reranker or OARM3 S2 RM critic training")
     p.add_argument("--yopo-checkpoint", type=str, default="", help="official YOPO checkpoint used to initialize candidate_mode=yopo_preserve")
     p.add_argument("--allow-checkpoint-mismatch", action="store_true")
     p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"], default="")
@@ -261,6 +261,20 @@ def resolve_training_options(args):
     if options["train_yield_feasibility"]:
         options["train_backup_feasibility"] = True
         options["enable_yield_candidates"] = True
+    if options["train_probabilistic_rm_critic"]:
+        if options["candidate_mode"] != "yopo_preserve" or options["backbone_mode"] != "yopo_original":
+            raise ValueError("OARM3 S2 requires candidate_mode=yopo_preserve and backbone_mode=yopo_original")
+        if options["train_occlusion_risk"] or options["train_margin_ranking"] or options["train_yaw_visibility"]:
+            raise ValueError("OARM3 S2 trains only the probabilistic RM critic; disable old OARM2 auxiliary objectives")
+        if options["train_backup_feasibility"] or options["train_yield_feasibility"] or options["enable_yield_candidates"]:
+            raise ValueError("OARM3 S2 does not train yield/brake heads; use a separate stage for intervention policies")
+        if not options["train_risk_point_guidance"]:
+            raise ValueError("OARM3 S2 requires train_risk_point_guidance=True for reaction-window label generation")
+        if options["risk_label_source"] != "gt_pointcloud":
+            raise ValueError("OARM3 S2 requires risk_label_source=gt_pointcloud")
+        if not options["use_occlusion_aware_visibility"]:
+            raise ValueError("OARM3 S2 requires use_occlusion_aware_visibility=True")
+        options["train_reaction_margin"] = False
     if options["train_margin_ranking"] and not options["train_reaction_margin"]:
         raise ValueError("train_margin_ranking requires train_reaction_margin=True")
     if options["use_occlusion_aware_visibility"] and not options["train_risk_point_guidance"]:
@@ -296,6 +310,7 @@ if __name__ == "__main__":
         **training_options,
         experiment_options={
             "stage": args.stage,
+            "training_route": "oarm3_s2_prob_rm" if training_options["train_probabilistic_rm_critic"] else args.stage,
             "config": args.config,
             "source_yopo_checkpoint": args.yopo_checkpoint,
             "init_from_a1_checkpoint": args.init_from_a1_checkpoint,
