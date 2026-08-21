@@ -221,6 +221,7 @@ class OARMTrainer:
                 raise ValueError("YOPO-preserve modes keep yaw policy fixed; disable yaw visibility training")
         self.experiment_options = dict(experiment_options or {})
         self.best_val_loss = float("inf")
+        self.validation_metric_name = "rm_critic_selection_metric" if self.train_probabilistic_rm_critic else "total_loss"
         if save_on_exit:
             self._exit_func = atexit.register(self.save_model)
 
@@ -437,7 +438,7 @@ class OARMTrainer:
                     val_loss = self.eval_one_epoch(self.epoch_i)
                 self.progress_log.console.log(
                     f"Epoch: {self.epoch_i}, Train Loss: {train_loss:.4g}, "
-                    f"Valid Loss: {val_loss:.4g}"
+                    f"Valid {self.validation_metric_name}: {val_loss:.4g}"
                 )
                 self.save_checkpoint("last.pth")
                 if val_loss < self.best_val_loss:
@@ -514,7 +515,8 @@ class OARMTrainer:
                 self.progress_log.console.log(f"Eval: skipped non-finite loss at epoch {epoch}, step {step}")
                 self.progress_log.update(one_epoch_progress, advance=1)
                 continue
-            losses.append(total_loss.item())
+            metric = self.validation_metric(loss_dict)
+            losses.append(float(metric.detach().cpu() if torch.is_tensor(metric) else metric))
             self.log_losses("Eval", loss_dict, epoch, step)
             self.log_progress("Eval", epoch, step, total_steps, losses, epoch_start)
             self.progress_log.update(one_epoch_progress, advance=1)
@@ -937,6 +939,10 @@ class OARMTrainer:
 
             loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
             loss_dict["oarm3_s2_critic_only"] = torch.tensor(bool(self.train_probabilistic_rm_critic), device=self.device, dtype=torch.float32)
+            loss_dict["rm_critic_selection_metric"] = (
+                loss_dict.get("rm_critic_window_nll", torch.zeros((), device=self.device))
+                + oarm_cfg.rm_critic_validity_bce_weight * loss_dict.get("rm_critic_validity_bce", torch.zeros((), device=self.device))
+            )
             loss_dict["total_loss"] = (
                 aux_loss
                 + rerank_loss
@@ -1091,6 +1097,14 @@ class OARMTrainer:
                 }
             )
         return metrics
+
+    def validation_metric(self, loss_dict):
+        if self.train_probabilistic_rm_critic:
+            metric = loss_dict.get("rm_critic_selection_metric")
+            if metric is not None:
+                return metric
+            return loss_dict.get("rm_critic_loss", loss_dict["total_loss"])
+        return loss_dict["total_loss"]
 
     def update_oracle_ce_sanity(self, loss_dict, epoch, step):
         if self._oracle_ce_sanity_reported:

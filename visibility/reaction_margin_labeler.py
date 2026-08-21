@@ -74,6 +74,8 @@ class ReactionMarginLabeler:
         gathered_idx = critical_idx.clamp(min=0).unsqueeze(-1)
         critical_weight = risk_weight.gather(dim=-1, index=gathered_idx).squeeze(-1)
         critical_weight = torch.where(candidate_valid, critical_weight, torch.zeros_like(critical_weight))
+        critical_timely_visible = weighted_event_valid.gather(dim=-1, index=gathered_idx).squeeze(-1) & candidate_valid
+        candidate_event_valid = critical_timely_visible
 
         weighted_window = torch.where(weighted_valid, point_window, inf)
         window_min = weighted_window.amin(dim=-1)
@@ -97,10 +99,12 @@ class ReactionMarginLabeler:
         point_no_entry = (risk_weight > 1e-6) & ~entry_valid
         point_right_censored = weighted_valid & ~visible_before_entry
         point_censored = point_no_entry | point_right_censored
-        candidate_right_censored = point_right_censored.any(dim=-1)
+        candidate_right_censored = candidate_valid & ~candidate_event_valid
         candidate_no_entry = point_no_entry.any(dim=-1) & ~candidate_valid
         candidate_censored = candidate_right_censored | candidate_no_entry
         candidate_visible_at_t0 = (visible_at_t0 & (risk_weight > 1e-6)).any(dim=-1)
+        candidate_interaction_valid = candidate_valid
+        candidate_timely_visible = candidate_event_valid
         return {
             'reaction_margin_points': point_margin,
             'reaction_margin_min': margin_min,
@@ -115,6 +119,8 @@ class ReactionMarginLabeler:
             'reaction_window_gt': window_softmin,
             'reaction_margin_gt': margin_softmin,
             'rm_event_valid_gt': candidate_event_valid,
+            'rm_interaction_valid_gt': candidate_interaction_valid,
+            'rm_timely_visible_gt': candidate_timely_visible,
             'rm_right_censored_gt': candidate_right_censored,
             'rm_no_entry_gt': candidate_no_entry,
             'risk_visible_at_t0_gt': candidate_visible_at_t0,

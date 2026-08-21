@@ -31,7 +31,9 @@ if YOPO_DIR not in sys.path:
     sys.path.insert(0, YOPO_DIR)
 
 from OARM.policy.oarm_network import OARMNetwork
+from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
 from OARM.policy.oarm_latency_model import OARMLatencyModel
+from OARM.policy.oarm_risk_calibrator import TemperatureCalibration, calibrated_probability, risk_upper_bound
 from OARM.policy.oarm_rm_critic import risk_probability_from_window
 from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
 from OARM.policy.oarm_state_transform import OARMStateTransform
@@ -179,6 +181,26 @@ class OARMNet:
         )
         self.last_latency_budget = None
         self.warned_latency_risk_unavailable = False
+        validity_fusion_cfg = self.config.get("use_validity_risk_fusion", None)
+        self.use_validity_risk_fusion = self.enable_rm_critic if validity_fusion_cfg is None else bool(validity_fusion_cfg)
+        self.validity_unknown_risk = float(self.config.get("validity_unknown_risk", 0.5))
+        self.use_calibrated_risk = bool(self.config.get("use_calibrated_risk", False))
+        calibration_file = self.config.get("calibration_file", "") or ""
+        if calibration_file:
+            self.risk_calibration = TemperatureCalibration.from_file(calibration_file)
+            self.calibration_version = os.path.basename(calibration_file)
+        else:
+            self.risk_calibration = TemperatureCalibration()
+            self.calibration_version = "identity"
+        if self.config.get("risk_conformal_slack", None) is not None:
+            self.risk_calibration.conformal_slack = float(self.config.get("risk_conformal_slack"))
+        self.enable_intervention_selector = bool(self.config.get("enable_intervention_selector", False))
+        self.intervention_selector = OARMInterventionSelector(
+            InterventionSelectorConfig(
+                delta_keep=float(self.config.get("risk_threshold_keep", 0.10)),
+                delta_safe=float(self.config.get("risk_threshold_safe", 0.20)),
+            )
+        )
         agile_bonus_enabled = any(
             abs(float(value)) > 1e-9
             for value in (
@@ -524,11 +546,28 @@ class OARMNet:
                 "falling back to risk_logit."
             )
             self.warned_latency_risk_unavailable = True
+        raw_risk_prob_t = risk_prob_t.clamp(1e-6, 1.0 - 1e-6)
+        validity_prob_t = None if validity_logit_t is None else torch.sigmoid(validity_logit_t)
+        validity_fused_risk_t = raw_risk_prob_t
+        if self.use_validity_risk_fusion and validity_prob_t is not None:
+            unknown = torch.full_like(raw_risk_prob_t, self.validity_unknown_risk)
+            validity_fused_risk_t = validity_prob_t * raw_risk_prob_t + (1.0 - validity_prob_t) * unknown
+            risk_source = risk_source + "+validity"
+        if self.use_calibrated_risk:
+            calibrated_risk_t = calibrated_probability(torch.logit(validity_fused_risk_t.clamp(1e-6, 1.0 - 1e-6)), self.risk_calibration).to(device=validity_fused_risk_t.device)
+            risk_source = risk_source + "+calibrated"
+        else:
+            calibrated_risk_t = validity_fused_risk_t
+        risk_upper_t = risk_upper_bound(calibrated_risk_t, self.risk_calibration).to(device=validity_fused_risk_t.device)
         margin_pred = margin_pred_t.detach().cpu().numpy()
-        risk_prob = risk_prob_t.detach().cpu().numpy()
+        raw_risk_prob = raw_risk_prob_t.detach().cpu().numpy()
+        validity_fused_risk_prob = validity_fused_risk_t.detach().cpu().numpy()
+        calibrated_risk_prob = calibrated_risk_t.detach().cpu().numpy()
+        risk_upper = risk_upper_t.detach().cpu().numpy()
+        risk_prob = risk_upper if (self.enable_intervention_selector or self.use_calibrated_risk) else validity_fused_risk_prob
         reaction_window_mean = None if reaction_window_mean_t is None else reaction_window_mean_t.detach().cpu().numpy()
         reaction_window_logvar = None if reaction_window_logvar_t is None else reaction_window_logvar_t.detach().cpu().numpy()
-        validity_prob = None if validity_logit_t is None else torch.sigmoid(validity_logit_t).detach().cpu().numpy()
+        validity_prob = None if validity_prob_t is None else validity_prob_t.detach().cpu().numpy()
         yield_logit = flat["yield_logit"] if "yield_logit" in flat else flat["backup_logit"]
         yield_prob = torch.sigmoid(yield_logit).detach().cpu().numpy()
         yaw_terminal = flat["yaw_terminal"].detach().cpu().numpy()
@@ -548,8 +587,23 @@ class OARMNet:
             depth_clearance=depth_clearance,
             altitude_violation=altitude_violation,
         )
+        original_yopo_top1 = int(np.argmax(utility))
+        intervention = None
+        intervention_brake = False
+        if self.enable_intervention_selector:
+            action_id, selection_score, intervention = self.apply_intervention_selector(
+                utility,
+                endstate_w,
+                traj_time,
+                candidate_type,
+                risk_upper,
+                depth_clearance,
+                altitude_violation,
+                original_yopo_top1,
+            )
+            intervention_brake = intervention is not None and intervention.intervention_type == "BRAKE"
         selected_time = float(np.clip(traj_time[action_id], 0.1, 10.0))
-        emergency_stop = self.should_depth_emergency_stop(depth_clearance, action_id)
+        emergency_stop = self.should_depth_emergency_stop(depth_clearance, action_id) or intervention_brake
 
         with self.lock:
             start_pos = self.get_start_pos()
@@ -630,6 +684,12 @@ class OARMNet:
             altitude_violation,
             risk_source=risk_source,
             risk_logit_prob=risk_logit_prob,
+            raw_risk_prob=raw_risk_prob,
+            validity_fused_risk_prob=validity_fused_risk_prob,
+            calibrated_risk_prob=calibrated_risk_prob,
+            risk_upper_bound=risk_upper,
+            intervention=intervention,
+            original_yopo_top1=original_yopo_top1,
             reaction_window_mean=reaction_window_mean,
             reaction_window_logvar=reaction_window_logvar,
             validity_prob=validity_prob,
@@ -1040,6 +1100,50 @@ class OARMNet:
             score = score - self.agile_stop_penalty * stop_mask * (~hazard)
         return int(np.argmax(score)), score
 
+    def apply_intervention_selector(
+        self,
+        utility,
+        endstate_w,
+        traj_time,
+        candidate_type,
+        risk_upper,
+        depth_clearance,
+        altitude_violation,
+        original_yopo_top1,
+    ):
+        geometry_admissible = np.ones_like(utility, dtype=bool)
+        if candidate_type is not None:
+            geometry_admissible &= (candidate_type != 2) & (candidate_type != 3)
+        if depth_clearance is not None:
+            geometry_admissible &= np.isfinite(depth_clearance) & (depth_clearance >= self.depth_clearance_min)
+        if altitude_violation is not None:
+            geometry_admissible &= altitude_violation <= 1e-6
+        top_endpoint = endstate_w[original_yopo_top1, :, 0]
+        deviation = np.linalg.norm(endstate_w[:, :, 0] - top_endpoint[None, :], axis=1)
+        decision = self.intervention_selector.select(
+            risk_upper_bound=risk_upper,
+            yopo_cost=-utility,
+            geometry_admissible=geometry_admissible,
+            deviation_from_top1=deviation,
+            brake_feasible=True,
+            brake_risk_upper_bound=None,
+            top1_index=original_yopo_top1,
+        )
+        selection_score = utility.astype(np.float32).copy()
+        selected = decision.selected_index
+        if decision.intervention_type == "BRAKE":
+            brake_idx = None
+            if candidate_type is not None:
+                brake_candidates = np.flatnonzero(candidate_type == 2)
+                if brake_candidates.size > 0:
+                    brake_idx = int(brake_candidates[np.argmax(utility[brake_candidates])])
+            selected = original_yopo_top1 if brake_idx is None else brake_idx
+            self.last_selector_force_emergency_stop = True
+            self.last_selector_force_emergency_reason = decision.intervention_reason
+        elif selected is None:
+            selected = original_yopo_top1
+        return int(selected), selection_score, decision
+
     def visualize_trajectory(self, utility, pred_endstate, traj_time, action_id, candidate_type=None):
         start_pos = self.get_start_pos()
         start_vel = self.get_start_vel()
@@ -1382,6 +1486,12 @@ class OARMNet:
         altitude_violation,
         risk_source="risk_logit",
         risk_logit_prob=None,
+        raw_risk_prob=None,
+        validity_fused_risk_prob=None,
+        calibrated_risk_prob=None,
+        risk_upper_bound=None,
+        intervention=None,
+        original_yopo_top1=None,
         reaction_window_mean=None,
         reaction_window_logvar=None,
         validity_prob=None,
@@ -1457,6 +1567,13 @@ class OARMNet:
             "enable_rm_critic": bool(self.enable_rm_critic),
             "enable_latency_aware_risk": bool(self.enable_latency_aware_risk),
             "risk_source": risk_source,
+            "use_calibrated_risk": bool(self.use_calibrated_risk),
+            "use_validity_risk_fusion": bool(self.use_validity_risk_fusion),
+            "validity_unknown_risk": float(self.validity_unknown_risk),
+            "calibration_temperature": float(self.risk_calibration.temperature),
+            "calibration_conformal_slack": float(self.risk_calibration.conformal_slack),
+            "calibration_version": self.calibration_version,
+            "enable_intervention_selector": bool(self.enable_intervention_selector),
             "oarm_margin_alpha": float(self.oarm_margin_alpha),
             "oarm_risk_beta": float(self.oarm_risk_beta),
             "agile_progress_weight": float(self.agile_progress_weight),
@@ -1520,6 +1637,10 @@ class OARMNet:
             "selected_margin_pred": float(margin_pred[action_id]),
             "reaction_margin": float(margin_pred[action_id]),
             "selected_risk_prob": float(risk_prob[action_id]),
+            "selected_raw_risk_prob": None if raw_risk_prob is None else float(raw_risk_prob[action_id]),
+            "selected_validity_fused_risk_prob": None if validity_fused_risk_prob is None else float(validity_fused_risk_prob[action_id]),
+            "selected_calibrated_risk_prob": None if calibrated_risk_prob is None else float(calibrated_risk_prob[action_id]),
+            "selected_risk_upper_bound": None if risk_upper_bound is None else float(risk_upper_bound[action_id]),
             "selected_risk_logit_prob": None if risk_logit_prob is None else float(risk_logit_prob[action_id]),
             "selected_reaction_window_pred": None if reaction_window_mean is None else float(reaction_window_mean[action_id]),
             "selected_reaction_window_logvar": None if reaction_window_logvar is None else float(reaction_window_logvar[action_id]),
@@ -1567,6 +1688,13 @@ class OARMNet:
             "online_inputs": ["depth", "state", "goal"],
             "uses_privileged_online": False,
             "mapless_online_inference": True,
+            "original_yopo_top1": None if original_yopo_top1 is None else int(original_yopo_top1),
+            "intervention_type": None if intervention is None else intervention.intervention_type,
+            "intervention_reason": None if intervention is None else intervention.intervention_reason,
+            "risk_before": None if intervention is None or intervention.risk_before is None else float(intervention.risk_before),
+            "risk_after": None if intervention is None or intervention.risk_after is None else float(intervention.risk_after),
+            "intervention_score": None if intervention is None or intervention.score is None else float(intervention.score),
+            "intervention_metadata": None if intervention is None else intervention.metadata,
         }
         if latency_budget is not None:
             for key, value in latency_budget.to_dict().items():
@@ -1588,6 +1716,10 @@ class OARMNet:
                     "selection_score": float(selection_score[i]),
                     "margin_pred": float(margin_pred[i]),
                     "risk_prob": float(risk_prob[i]),
+                    "raw_risk_prob": None if raw_risk_prob is None else float(raw_risk_prob[i]),
+                    "validity_fused_risk_prob": None if validity_fused_risk_prob is None else float(validity_fused_risk_prob[i]),
+                    "calibrated_risk_prob": None if calibrated_risk_prob is None else float(calibrated_risk_prob[i]),
+                    "risk_upper_bound": None if risk_upper_bound is None else float(risk_upper_bound[i]),
                     "risk_logit_prob": None if risk_logit_prob is None else float(risk_logit_prob[i]),
                     "reaction_window_pred": None if reaction_window_mean is None else float(reaction_window_mean[i]),
                     "reaction_window_logvar": None if reaction_window_logvar is None else float(reaction_window_logvar[i]),
@@ -1728,6 +1860,14 @@ def parser():
     parser.add_argument("--selector-latency-ms", type=float, default=0.0)
     parser.add_argument("--control-latency-ms", type=float, default=20.0)
     parser.add_argument("--actuation-latency-ms", type=float, default=30.0)
+    parser.add_argument("--calibration-file", type=str, default="")
+    parser.add_argument("--use-calibrated-risk", action="store_true")
+    parser.add_argument("--risk-conformal-slack", type=float, default=None)
+    parser.add_argument("--use-validity-risk-fusion", action="store_true", default=None)
+    parser.add_argument("--validity-unknown-risk", type=float, default=0.5)
+    parser.add_argument("--enable-intervention-selector", action="store_true")
+    parser.add_argument("--risk-threshold-keep", type=float, default=0.10)
+    parser.add_argument("--risk-threshold-safe", type=float, default=0.20)
     parser.add_argument("--progress-bonus-weight", type=float, default=0.0)
     parser.add_argument("--agile-progress-weight", type=float, default=0.0)
     parser.add_argument("--agile-goal-distance-weight", type=float, default=0.0)
@@ -1828,6 +1968,14 @@ if __name__ == "__main__":
         "selector_latency_ms": args.selector_latency_ms,
         "control_latency_ms": args.control_latency_ms,
         "actuation_latency_ms": args.actuation_latency_ms,
+        "calibration_file": args.calibration_file,
+        "use_calibrated_risk": args.use_calibrated_risk,
+        "risk_conformal_slack": args.risk_conformal_slack,
+        "use_validity_risk_fusion": args.use_validity_risk_fusion,
+        "validity_unknown_risk": args.validity_unknown_risk,
+        "enable_intervention_selector": args.enable_intervention_selector,
+        "risk_threshold_keep": args.risk_threshold_keep,
+        "risk_threshold_safe": args.risk_threshold_safe,
         "progress_bonus_weight": args.progress_bonus_weight,
         "agile_progress_weight": args.agile_progress_weight,
         "agile_goal_distance_weight": args.agile_goal_distance_weight,

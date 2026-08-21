@@ -291,8 +291,8 @@ class YOPOPreserveOARMNetwork(nn.Module):
 
         brake_end, brake_time = self.deterministic_brake_candidate(obs, depth.dtype, depth.device)
         brake_yaw = torch.zeros((b, 1, 1, 1), device=depth.device, dtype=depth.dtype)
-        brake_margin = margin_flat.mean(dim=3, keepdim=True)
-        brake_risk = risk_flat.mean(dim=3, keepdim=True)
+        brake_margin = torch.full_like(margin_flat[:, :, :, :1], -float(oarm_cfg.reaction_time))
+        brake_risk = torch.zeros_like(risk_flat[:, :, :, :1])
         brake_backup = torch.ones_like(brake_risk) * 5.0
         brake_type = torch.full((b, 1, 1), self.candidate_generator.BRAKE, device=depth.device, dtype=torch.long)
         brake_frontier = torch.zeros((b, 1, 1), device=depth.device, dtype=depth.dtype)
@@ -304,10 +304,10 @@ class YOPOPreserveOARMNetwork(nn.Module):
             logvar_flat = reaction_window_logvar.reshape(b, 1, 1, yopo_n)
             validity_flat = validity_logit.reshape(b, 1, 1, yopo_n)
             insufficient_flat = rm_insufficient_logit.reshape(b, 1, 1, yopo_n)
-            brake_window = window_flat.mean(dim=3, keepdim=True)
-            brake_logvar = logvar_flat.max(dim=3, keepdim=True).values
+            brake_window = torch.zeros_like(window_flat[:, :, :, :1])
+            brake_logvar = torch.full_like(brake_window, 8.0)
             brake_validity = torch.full_like(brake_window, -10.0)
-            brake_insufficient = torch.full_like(brake_window, 10.0)
+            brake_insufficient = torch.zeros_like(brake_window)
         else:
             window_flat = logvar_flat = validity_flat = insufficient_flat = None
             brake_window = brake_logvar = brake_validity = brake_insufficient = None

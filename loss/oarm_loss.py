@@ -424,6 +424,9 @@ class OARMLoss(nn.Module):
             "rm_right_censored_rate": zero,
             "rm_no_entry_rate": zero,
             "risk_visible_at_t0_rate": zero,
+            "rm_critic_validity_recall": zero,
+            "rm_critic_validity_false_negative_rate": zero,
+            "rm_critic_validity_balanced_acc": zero,
         }
         if not self.enable_probabilistic_rm_critic:
             return out
@@ -435,18 +438,28 @@ class OARMLoss(nn.Module):
             raise RuntimeError("Probabilistic RM critic training requires critic outputs: " + ", ".join(missing))
 
         window = labels["reaction_window"].to(device=zero_ref.device).reshape_as(candidate_flat["reaction_window_mean"]).float()
-        event_valid = labels.get("rm_event_valid", labels.get("reaction_margin_valid"))
-        if event_valid is None:
-            event_valid = torch.ones_like(window, dtype=torch.bool)
+        timely_visible = labels.get("rm_timely_visible", labels.get("rm_event_valid"))
+        if timely_visible is None:
+            timely_visible = torch.ones_like(window, dtype=torch.bool)
         else:
-            event_valid = event_valid.to(device=window.device).reshape_as(window).bool()
-        progress_mask = torch.ones_like(event_valid, dtype=torch.bool)
+            timely_visible = timely_visible.to(device=window.device).reshape_as(window).bool()
+        interaction_valid = labels.get("rm_interaction_valid", labels.get("reaction_margin_valid"))
+        if interaction_valid is None:
+            interaction_valid = timely_visible
+        else:
+            interaction_valid = interaction_valid.to(device=window.device).reshape_as(window).bool()
+        no_entry = labels.get("rm_no_entry")
+        if no_entry is None:
+            no_entry = torch.zeros_like(interaction_valid, dtype=torch.bool)
+        else:
+            no_entry = no_entry.to(device=window.device).reshape_as(window).bool()
+        progress_mask = torch.ones_like(interaction_valid, dtype=torch.bool)
         candidate_type = candidate_flat.get("candidate_type")
         if candidate_type is not None:
             candidate_type = candidate_type.to(device=window.device).reshape_as(window)
             progress_mask = candidate_type == OARMCandidateGenerator.PROGRESS
         finite = torch.isfinite(window) & torch.isfinite(candidate_flat["reaction_window_mean"])
-        valid_mask = event_valid & progress_mask & finite
+        valid_mask = interaction_valid & (~no_entry) & progress_mask & finite
 
         logvar = candidate_flat["reaction_window_logvar"].reshape_as(window).float().clamp(min=-12.0, max=8.0)
         mean = candidate_flat["reaction_window_mean"].reshape_as(window).float()
@@ -463,12 +476,28 @@ class OARMLoss(nn.Module):
         validity_logit = candidate_flat["validity_logit"].reshape_as(window).float()
         validity_mask = progress_mask & torch.isfinite(validity_logit)
         if bool(validity_mask.any()):
-            validity_target = event_valid.float()
+            validity_target = (interaction_valid & (~no_entry)).float()
+            target_valid = validity_target[validity_mask]
+            logits_valid = validity_logit[validity_mask]
+            pos = target_valid.sum()
+            neg = target_valid.numel() - pos
+            pos_weight = (neg / pos.clamp(min=1.0)).clamp(min=1.0, max=50.0)
             validity_bce = F.binary_cross_entropy_with_logits(
-                validity_logit[validity_mask],
-                validity_target[validity_mask],
+                logits_valid,
+                target_valid,
+                pos_weight=pos_weight,
             )
             out["rm_critic_validity_bce"] = validity_bce
+            pred_valid = logits_valid > 0.0
+            positive = target_valid > 0.5
+            negative = ~positive
+            if bool(positive.any()):
+                recall = pred_valid[positive].float().mean()
+                out["rm_critic_validity_recall"] = recall
+                out["rm_critic_validity_false_negative_rate"] = 1.0 - recall
+            if bool(negative.any()):
+                specificity = (~pred_valid[negative]).float().mean()
+                out["rm_critic_validity_balanced_acc"] = 0.5 * (out["rm_critic_validity_recall"] + specificity)
         else:
             validity_bce = zero
 
@@ -478,7 +507,10 @@ class OARMLoss(nn.Module):
         )
         out["rm_critic_valid_rate"] = valid_mask.float().mean()
         out["rm_critic_progress_mask_rate"] = progress_mask.float().mean()
-        out["rm_event_valid_rate"] = event_valid.float().mean()
+        out["rm_event_valid_rate"] = timely_visible.float().mean()
+        out["rm_timely_visible_rate"] = timely_visible.float().mean()
+        out["rm_interaction_valid_rate"] = interaction_valid.float().mean()
+        out["rm_zero_window_rate"] = ((window <= 1e-6) & valid_mask).float().mean()
         for src, dst in (
             ("rm_right_censored", "rm_right_censored_rate"),
             ("rm_no_entry", "rm_no_entry_rate"),
