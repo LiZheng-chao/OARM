@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from OARM.config import get_oarm_training_preset
+from OARM.eval.check_episode_splits import check_episode_splits
 from OARM.eval.fit_risk_calibration import fit_calibration_from_jsonl
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_brake import constrained_brake_command, deterministic_brake_endpoint, evaluate_brake_trajectory
@@ -176,6 +177,19 @@ def check_intervention_selector_excludes_top1_rerank():
     assert decision.selected_index == 2
     assert decision.risk_after < decision.risk_before
 
+    decision = selector.select(
+        risk_upper_bound=[0.70, 0.55, 0.60],
+        yopo_cost=[0.0, 0.2, 0.1],
+        geometry_admissible=[True, True, True],
+        brake_feasible=False,
+        brake_risk_upper_bound=1.0,
+        top1_index=0,
+    )
+    assert decision.intervention_type == "DEGRADED"
+    assert decision.intervention_reason == "NO_VERIFIED_SAFE_ACTION"
+    assert decision.selected_index == 1
+    assert decision.metadata["brake_feasible"] is False
+
 
 def check_deterministic_brake_endpoint():
     end_pos, end_vel, end_acc = deterministic_brake_endpoint(
@@ -243,6 +257,7 @@ def check_constrained_brake_trajectory():
     assert metrics["feasible"]
     assert fast.diagnostics.peak_accel <= fast.diagnostics.max_accel + 1e-6
     assert fast.diagnostics.peak_jerk <= fast.diagnostics.max_jerk + 1e-6
+    assert fast.diagnostics.max_jerk == 80.0
 
 
 def check_fit_risk_calibration_cli_core():
@@ -300,6 +315,34 @@ def check_fit_risk_calibration_cli_core():
             assert "split" in str(exc)
         else:
             raise AssertionError("formal calibration should require split metadata")
+
+
+def check_episode_split_manifest_guard():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manifests = {}
+        split_rows = {
+            "train": [{"episode_id": "train_ep", "map_id": "map_train"}],
+            "val": [{"episode_id": "val_ep", "map_id": "map_val"}],
+            "calibration": [{"episode_id": "cal_ep", "map_id": "map_cal"}],
+            "test": [{"episode_id": "test_ep", "map_id": "map_test"}],
+        }
+        for split, rows in split_rows.items():
+            path = os.path.join(tmpdir, f"{split}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"episodes": rows}, f)
+            manifests[split] = path
+        result = check_episode_splits(manifests)
+        assert result["ok"] is True
+        assert result["splits"]["calibration"]["episode_count"] == 1
+
+        with open(manifests["test"], "w", encoding="utf-8") as f:
+            json.dump({"episodes": [{"episode_id": "test_ep", "map_id": "map_cal"}]}, f)
+        try:
+            check_episode_splits(manifests)
+        except ValueError as exc:
+            assert "leakage" in str(exc)
+        else:
+            raise AssertionError("split checker should reject map overlap between calibration and test")
 
 
 def check_trainable_contract():
@@ -437,6 +480,7 @@ def main():
     check_deterministic_brake_endpoint()
     check_constrained_brake_trajectory()
     check_fit_risk_calibration_cli_core()
+    check_episode_split_manifest_guard()
     check_trainable_contract()
     check_end_to_end_mini_batch()
     print("oarm3_s2_smoke ok")

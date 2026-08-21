@@ -9,6 +9,7 @@ PROBE_VISIBILITY_GAIN = "PROBE_VISIBILITY_GAIN"
 BRAKE_NO_SAFE_CANDIDATE = "BRAKE_NO_SAFE_CANDIDATE"
 BRAKE_HIGH_UNCERTAINTY = "BRAKE_HIGH_UNCERTAINTY"
 BRAKE_LATENCY_SPIKE = "BRAKE_LATENCY_SPIKE"
+NO_VERIFIED_SAFE_ACTION = "NO_VERIFIED_SAFE_ACTION"
 
 
 @dataclass
@@ -119,6 +120,39 @@ class OARMInterventionSelector:
         probe = self._select_probe(probe_candidates or [], risk_before)
         if probe is not None:
             return probe
+        if not brake_feasible:
+            feasible = [idx for idx in range(n) if admissible[idx]]
+            if feasible:
+                best = min(
+                    feasible,
+                    key=lambda idx: risks[idx] + 0.01 * costs[idx] + 0.01 * self.config.lambda_deviation * deviation[idx],
+                )
+                score = risks[best] + 0.01 * costs[best] + 0.01 * self.config.lambda_deviation * deviation[best]
+                return InterventionSelection(
+                    best,
+                    "DEGRADED",
+                    NO_VERIFIED_SAFE_ACTION,
+                    risk_before,
+                    risks[best],
+                    score,
+                    metadata={
+                        "brake_feasible": False,
+                        "brake_risk_upper_bound": None if brake_risk_upper_bound is None else float(brake_risk_upper_bound),
+                        "fallback": "lowest_risk_admissible_candidate",
+                    },
+                )
+            return InterventionSelection(
+                top1_index,
+                "DEGRADED",
+                NO_VERIFIED_SAFE_ACTION,
+                risk_before,
+                risk_before,
+                metadata={
+                    "brake_feasible": False,
+                    "brake_risk_upper_bound": None if brake_risk_upper_bound is None else float(brake_risk_upper_bound),
+                    "fallback": "top1_no_admissible_candidate",
+                },
+            )
         return self._brake(top1_index, risk_before, BRAKE_NO_SAFE_CANDIDATE, brake_feasible, brake_risk_upper_bound)
 
     def _select_probe(self, probe_candidates: List[Dict[str, Any]], risk_before: Optional[float]):
@@ -147,15 +181,6 @@ class OARMInterventionSelector:
         brake_feasible: bool,
         brake_risk_upper_bound: Optional[float] = None,
     ) -> InterventionSelection:
-        if not brake_feasible and top1_index is not None and risk_before is not None:
-            return InterventionSelection(
-                top1_index,
-                "KEEP",
-                "BRAKE_INFEASIBLE_KEEP_TOP1",
-                risk_before,
-                risk_before,
-                metadata={"brake_feasible": False, "top1_index": top1_index, "fallback_reason": reason},
-            )
         return InterventionSelection(
             None,
             "BRAKE",

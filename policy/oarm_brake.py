@@ -54,7 +54,7 @@ def _quintic_coefficients(pos0, vel0, acc0, pos1, vel1, acc1, duration: float) -
     return coef_inv @ state
 
 
-def sample_quintic_trajectory(start_pos, start_vel, start_acc, end_pos, end_vel, end_acc, duration: float, sample_count: int = 41):
+def sample_quintic_trajectory(start_pos, start_vel, start_acc, end_pos, end_vel, end_acc, duration: float, sample_count: int = 81):
     coeff = _quintic_coefficients(
         _as_vec3(start_pos),
         _as_vec3(start_vel),
@@ -80,7 +80,7 @@ def evaluate_brake_trajectory(
     end_vel,
     end_acc,
     duration: float,
-    sample_count: int = 41,
+    sample_count: int = 81,
     max_accel: float = 6.0,
     max_jerk: float = 30.0,
     max_thrust_accel: float = 18.0,
@@ -126,7 +126,7 @@ def constrained_brake_command(
     max_jerk: float = 30.0,
     max_thrust_accel: float = 18.0,
     max_tilt_deg: float = 50.0,
-    sample_count: int = 41,
+    sample_count: int = 81,
     time_growth: float = 1.25,
     target_z=None,
     z_rate: float = 0.8,

@@ -114,8 +114,9 @@ class OARMNet:
         self.brake_max_jerk_mps3 = float(self.config.get("brake_max_jerk_mps3", 30.0))
         self.brake_max_thrust_accel_mps2 = float(self.config.get("brake_max_thrust_accel_mps2", 18.0))
         self.brake_max_tilt_deg = float(self.config.get("brake_max_tilt_deg", 50.0))
-        self.brake_sample_count = int(self.config.get("brake_sample_count", 41))
+        self.brake_sample_count = int(self.config.get("brake_sample_count", 81))
         self.brake_time_growth = float(self.config.get("brake_time_growth", 1.25))
+        self.brake_verified_risk_upper = float(self.config.get("brake_verified_risk_upper", self.config.get("risk_threshold_keep", 0.10)))
         self.last_depth_emergency_stop = False
         self.last_depth_emergency_reason = None
         self.last_depth_emergency_target = None
@@ -124,6 +125,8 @@ class OARMNet:
         self.last_deterministic_brake_terminal_speed = None
         self.last_deterministic_brake_terminal_acc_norm = None
         self.last_deterministic_brake_diagnostics = None
+        self.last_brake_candidate_info = None
+        self.last_brake_command = None
         self.last_selector_force_emergency_stop = False
         self.last_selector_force_emergency_reason = None
         self.last_stop_fallback_count = None
@@ -606,7 +609,9 @@ class OARMNet:
         original_yopo_top1 = int(np.argmax(utility))
         intervention = None
         intervention_brake = False
+        brake_candidate = None
         if self.enable_intervention_selector:
+            brake_candidate = self.build_and_evaluate_brake_candidate(depth_m)
             action_id, selection_score, intervention = self.apply_intervention_selector(
                 utility,
                 endstate_w,
@@ -616,8 +621,12 @@ class OARMNet:
                 depth_clearance,
                 altitude_violation,
                 original_yopo_top1,
+                brake_candidate=brake_candidate,
             )
             intervention_brake = intervention is not None and intervention.intervention_type == "BRAKE"
+        else:
+            self.last_brake_candidate_info = None
+            self.last_brake_command = None
         selected_time = float(np.clip(traj_time[action_id], 0.1, 10.0))
         emergency_stop = self.should_depth_emergency_stop(depth_clearance, action_id) or intervention_brake
 
@@ -626,26 +635,29 @@ class OARMNet:
             start_vel = self.get_start_vel()
             start_acc = self.desire_acc
             if emergency_stop:
-                min_brake_time = float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time))
-                brake_command = constrained_brake_command(
-                    start_pos,
-                    start_vel,
-                    start_acc=start_acc,
-                    goal=self.goal,
-                    min_time=min_brake_time,
-                    brake_accel=self.brake_decel_mps2,
-                    max_time=self.brake_max_time,
-                    max_accel=self.brake_max_accel_mps2,
-                    max_jerk=self.brake_max_jerk_mps3,
-                    max_thrust_accel=self.brake_max_thrust_accel_mps2,
-                    max_tilt_deg=self.brake_max_tilt_deg,
-                    sample_count=self.brake_sample_count,
-                    time_growth=self.brake_time_growth,
-                    target_z=self.depth_emergency_target_z,
-                    z_rate=self.depth_emergency_z_rate,
-                    min_command_z=self.min_command_z,
-                    max_command_z=self.max_command_z,
-                )
+                if intervention_brake and brake_candidate is not None:
+                    brake_command = brake_candidate["command"]
+                else:
+                    min_brake_time = float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time))
+                    brake_command = constrained_brake_command(
+                        start_pos,
+                        start_vel,
+                        start_acc=start_acc,
+                        goal=self.goal,
+                        min_time=min_brake_time,
+                        brake_accel=self.brake_decel_mps2,
+                        max_time=self.brake_max_time,
+                        max_accel=self.brake_max_accel_mps2,
+                        max_jerk=self.brake_max_jerk_mps3,
+                        max_thrust_accel=self.brake_max_thrust_accel_mps2,
+                        max_tilt_deg=self.brake_max_tilt_deg,
+                        sample_count=self.brake_sample_count,
+                        time_growth=self.brake_time_growth,
+                        target_z=self.depth_emergency_target_z,
+                        z_rate=self.depth_emergency_z_rate,
+                        min_command_z=self.min_command_z,
+                        max_command_z=self.max_command_z,
+                    )
                 selected_time = brake_command.duration
                 end_pos = brake_command.end_pos
                 end_vel = brake_command.end_vel
@@ -964,6 +976,85 @@ class OARMNet:
         self.last_depth_clearance_total_count = int(clearances.size)
         return clearances
 
+    def _evaluate_single_candidate_geometry(self, depth_m, endstate_w, traj_time):
+        saved = {
+            "last_depth_clearance_selected": self.last_depth_clearance_selected,
+            "last_depth_clearance_min": self.last_depth_clearance_min,
+            "last_depth_clearance_valid_count": self.last_depth_clearance_valid_count,
+            "last_depth_clearance_total_count": self.last_depth_clearance_total_count,
+            "last_altitude_valid_count": self.last_altitude_valid_count,
+            "last_altitude_total_count": self.last_altitude_total_count,
+            "last_candidate_min_z": self.last_candidate_min_z,
+            "last_candidate_max_z": self.last_candidate_max_z,
+        }
+        try:
+            depth_clearance = self.compute_candidate_depth_clearance(depth_m, endstate_w, traj_time)
+            altitude_violation = self.compute_candidate_altitude_violation(endstate_w, traj_time)
+        finally:
+            for key, value in saved.items():
+                setattr(self, key, value)
+        clearance_value = None if depth_clearance is None else float(depth_clearance[0])
+        altitude_value = None if altitude_violation is None else float(altitude_violation[0])
+        depth_ok = True if depth_clearance is None else bool(np.isfinite(depth_clearance[0]) and depth_clearance[0] >= self.depth_clearance_min)
+        altitude_ok = True if altitude_violation is None else bool(altitude_violation[0] <= 1e-6)
+        return {
+            "depth_clearance": clearance_value,
+            "altitude_violation": altitude_value,
+            "depth_admissible": depth_ok,
+            "altitude_admissible": altitude_ok,
+            "geometry_admissible": bool(depth_ok and altitude_ok),
+        }
+
+    def build_and_evaluate_brake_candidate(self, depth_m):
+        start_pos = self.get_start_pos()
+        start_vel = self.get_start_vel()
+        start_acc = self.desire_acc if self.desire_acc is not None else np.zeros(3, dtype=np.float32)
+        min_brake_time = float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time))
+        command = constrained_brake_command(
+            start_pos,
+            start_vel,
+            start_acc=start_acc,
+            goal=self.goal,
+            min_time=min_brake_time,
+            brake_accel=self.brake_decel_mps2,
+            max_time=self.brake_max_time,
+            max_accel=self.brake_max_accel_mps2,
+            max_jerk=self.brake_max_jerk_mps3,
+            max_thrust_accel=self.brake_max_thrust_accel_mps2,
+            max_tilt_deg=self.brake_max_tilt_deg,
+            sample_count=self.brake_sample_count,
+            time_growth=self.brake_time_growth,
+            target_z=self.depth_emergency_target_z,
+            z_rate=self.depth_emergency_z_rate,
+            min_command_z=self.min_command_z,
+            max_command_z=self.max_command_z,
+        )
+        endstate_w = np.zeros((1, 3, 3), dtype=np.float32)
+        endstate_w[0, :, 0] = command.end_pos - start_pos
+        endstate_w[0, :, 1] = command.end_vel
+        endstate_w[0, :, 2] = command.end_acc
+        traj_time = np.array([command.duration], dtype=np.float32)
+        geometry = self._evaluate_single_candidate_geometry(depth_m, endstate_w, traj_time)
+        diagnostics = command.diagnostics.to_dict()
+        dynamic_feasible = bool(diagnostics.get("feasible", False))
+        geometry_admissible = bool(geometry["geometry_admissible"])
+        risk_upper = float(self.brake_verified_risk_upper) if dynamic_feasible and geometry_admissible else 1.0
+        info = {
+            "command": command,
+            "endstate_w": endstate_w,
+            "traj_time": traj_time,
+            "dynamic_feasible": dynamic_feasible,
+            "geometry_admissible": geometry_admissible,
+            "feasible": bool(dynamic_feasible and geometry_admissible),
+            "risk_upper_bound": risk_upper,
+            "risk_source": "geometry_dynamic_proxy",
+            **geometry,
+            **diagnostics,
+        }
+        self.last_brake_candidate_info = {key: value for key, value in info.items() if key not in {"command", "endstate_w", "traj_time"}}
+        self.last_brake_command = command
+        return info
+
     def should_depth_emergency_stop(self, depth_clearance, action_id):
         self.last_depth_emergency_stop = False
         self.last_depth_emergency_reason = None
@@ -1151,6 +1242,7 @@ class OARMNet:
         depth_clearance,
         altitude_violation,
         original_yopo_top1,
+        brake_candidate=None,
     ):
         geometry_admissible = np.ones_like(utility, dtype=bool)
         if candidate_type is not None:
@@ -1161,13 +1253,20 @@ class OARMNet:
             geometry_admissible &= altitude_violation <= 1e-6
         top_endpoint = endstate_w[original_yopo_top1, :, 0]
         deviation = np.linalg.norm(endstate_w[:, :, 0] - top_endpoint[None, :], axis=1)
+        brake_risk_upper = None if brake_candidate is None else float(brake_candidate.get("risk_upper_bound", 1.0))
+        brake_feasible = bool(
+            brake_candidate is not None
+            and brake_candidate.get("feasible", False)
+            and brake_risk_upper is not None
+            and brake_risk_upper <= float(self.config.get("risk_threshold_safe", 0.20))
+        )
         decision = self.intervention_selector.select(
             risk_upper_bound=risk_upper,
             yopo_cost=-utility,
             geometry_admissible=geometry_admissible,
             deviation_from_top1=deviation,
-            brake_feasible=True,
-            brake_risk_upper_bound=None,
+            brake_feasible=brake_feasible,
+            brake_risk_upper_bound=brake_risk_upper,
             top1_index=original_yopo_top1,
         )
         selection_score = utility.astype(np.float32).copy()
@@ -1646,6 +1745,16 @@ class OARMNet:
             "brake_max_jerk_mps3": float(self.brake_max_jerk_mps3),
             "brake_max_thrust_accel_mps2": float(self.brake_max_thrust_accel_mps2),
             "brake_max_tilt_deg": float(self.brake_max_tilt_deg),
+            "brake_sample_count": int(self.brake_sample_count),
+            "brake_verified_risk_upper": float(self.brake_verified_risk_upper),
+            "brake_candidate_info": self.last_brake_candidate_info,
+            "brake_dynamic_feasible": None if self.last_brake_candidate_info is None else bool(self.last_brake_candidate_info.get("dynamic_feasible", False)),
+            "brake_geometry_admissible": None if self.last_brake_candidate_info is None else bool(self.last_brake_candidate_info.get("geometry_admissible", False)),
+            "brake_risk_upper": None if self.last_brake_candidate_info is None else float(self.last_brake_candidate_info.get("risk_upper_bound", 1.0)),
+            "brake_stop_distance": None if self.last_brake_candidate_info is None else float(self.last_brake_candidate_info.get("stop_distance", 0.0)),
+            "brake_peak_accel": None if self.last_brake_candidate_info is None else float(self.last_brake_candidate_info.get("peak_accel", 0.0)),
+            "brake_peak_jerk": None if self.last_brake_candidate_info is None else float(self.last_brake_candidate_info.get("peak_jerk", 0.0)),
+            "brake_peak_tilt": None if self.last_brake_candidate_info is None else float(self.last_brake_candidate_info.get("peak_tilt_deg", 0.0)),
             "depth_emergency_stop": bool(self.last_depth_emergency_stop),
             "depth_emergency_reason": self.last_depth_emergency_reason,
             "depth_emergency_target_w": self.last_depth_emergency_target,
@@ -1966,7 +2075,8 @@ def parser():
     parser.add_argument("--brake-max-jerk-mps3", type=float, default=30.0)
     parser.add_argument("--brake-max-thrust-accel-mps2", type=float, default=18.0)
     parser.add_argument("--brake-max-tilt-deg", type=float, default=50.0)
-    parser.add_argument("--brake-sample-count", type=int, default=41)
+    parser.add_argument("--brake-sample-count", type=int, default=81)
+    parser.add_argument("--brake-verified-risk-upper", type=float, default=0.10)
     parser.add_argument("--brake-time-growth", type=float, default=1.25)
     parser.add_argument("--selector-min-traj-z", type=float, default=None)
     parser.add_argument("--selector-max-traj-z", type=float, default=None)
@@ -2085,6 +2195,7 @@ if __name__ == "__main__":
         "brake_max_thrust_accel_mps2": args.brake_max_thrust_accel_mps2,
         "brake_max_tilt_deg": args.brake_max_tilt_deg,
         "brake_sample_count": args.brake_sample_count,
+        "brake_verified_risk_upper": args.brake_verified_risk_upper,
         "brake_time_growth": args.brake_time_growth,
         "selector_min_traj_z": args.selector_min_traj_z,
         "selector_max_traj_z": args.selector_max_traj_z,
