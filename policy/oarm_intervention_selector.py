@@ -3,6 +3,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 KEEP_LOW_RISK = "KEEP_LOW_RISK"
+KEEP_GRAY_NO_RISK_IMPROVEMENT = "KEEP_GRAY_NO_RISK_IMPROVEMENT"
 RERANK_TOP1_UNSAFE = "RERANK_TOP1_UNSAFE"
 PROBE_VISIBILITY_GAIN = "PROBE_VISIBILITY_GAIN"
 BRAKE_NO_SAFE_CANDIDATE = "BRAKE_NO_SAFE_CANDIDATE"
@@ -16,6 +17,8 @@ class InterventionSelectorConfig:
     delta_safe: float = 0.20
     delta_probe: float = 0.25
     lambda_deviation: float = 0.25
+    lambda_risk: float = 1.0
+    risk_improvement_min: float = 0.02
     lambda_probe_risk: float = 1.0
     lambda_probe_margin_gain: float = 0.5
     lambda_probe_time: float = 0.05
@@ -77,15 +80,42 @@ class OARMInterventionSelector:
             return self._brake(top1_index, risk_before, BRAKE_HIGH_UNCERTAINTY, brake_feasible, brake_risk_upper_bound)
         if admissible[top1_index] and risk_before <= self.config.delta_keep:
             return InterventionSelection(top1_index, "KEEP", KEEP_LOW_RISK, risk_before, risk_before, costs[top1_index])
+        improvement_min = max(float(self.config.risk_improvement_min), 0.0)
         safe = [
             idx
             for idx, risk in enumerate(risks)
-            if idx != top1_index and admissible[idx] and risk <= self.config.delta_safe
+            if idx != top1_index
+            and admissible[idx]
+            and risk <= self.config.delta_safe
+            and risk <= risk_before - improvement_min
         ]
         if safe:
-            best = min(safe, key=lambda idx: costs[idx] + self.config.lambda_deviation * deviation[idx])
-            score = costs[best] + self.config.lambda_deviation * deviation[best]
-            return InterventionSelection(best, "RERANK", RERANK_TOP1_UNSAFE, risk_before, risks[best], score)
+            best = min(
+                safe,
+                key=lambda idx: costs[idx]
+                + self.config.lambda_deviation * deviation[idx]
+                + self.config.lambda_risk * risks[idx],
+            )
+            score = costs[best] + self.config.lambda_deviation * deviation[best] + self.config.lambda_risk * risks[best]
+            return InterventionSelection(
+                best,
+                "RERANK",
+                RERANK_TOP1_UNSAFE,
+                risk_before,
+                risks[best],
+                score,
+                metadata={"risk_improvement_min": improvement_min},
+            )
+        if admissible[top1_index] and risk_before <= self.config.delta_safe:
+            return InterventionSelection(
+                top1_index,
+                "KEEP",
+                KEEP_GRAY_NO_RISK_IMPROVEMENT,
+                risk_before,
+                risk_before,
+                costs[top1_index] + self.config.lambda_risk * risk_before,
+                metadata={"risk_improvement_min": improvement_min},
+            )
         probe = self._select_probe(probe_candidates or [], risk_before)
         if probe is not None:
             return probe
@@ -117,6 +147,15 @@ class OARMInterventionSelector:
         brake_feasible: bool,
         brake_risk_upper_bound: Optional[float] = None,
     ) -> InterventionSelection:
+        if not brake_feasible and top1_index is not None and risk_before is not None:
+            return InterventionSelection(
+                top1_index,
+                "KEEP",
+                "BRAKE_INFEASIBLE_KEEP_TOP1",
+                risk_before,
+                risk_before,
+                metadata={"brake_feasible": False, "top1_index": top1_index, "fallback_reason": reason},
+            )
         return InterventionSelection(
             None,
             "BRAKE",

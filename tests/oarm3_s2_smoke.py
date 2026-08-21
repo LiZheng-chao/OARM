@@ -9,7 +9,7 @@ import torch
 from OARM.config import get_oarm_training_preset
 from OARM.eval.fit_risk_calibration import fit_calibration_from_jsonl
 from OARM.loss import OARMLoss
-from OARM.policy.oarm_brake import deterministic_brake_endpoint
+from OARM.policy.oarm_brake import constrained_brake_command, deterministic_brake_endpoint, evaluate_brake_trajectory
 from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration
@@ -133,24 +133,48 @@ def check_loss_fail_fast():
 
 
 def check_intervention_selector_excludes_top1_rerank():
-    selector = OARMInterventionSelector(InterventionSelectorConfig(delta_keep=0.10, delta_safe=0.20))
+    selector = OARMInterventionSelector(InterventionSelectorConfig(delta_keep=0.10, delta_safe=0.20, risk_improvement_min=0.02))
     decision = selector.select(
         risk_upper_bound=[0.15, 0.35, 0.40],
         yopo_cost=[0.0, 0.1, 0.2],
         geometry_admissible=[True, True, True],
         top1_index=0,
     )
-    assert decision.intervention_type == "BRAKE"
-    assert decision.intervention_reason == "BRAKE_NO_SAFE_CANDIDATE"
+    assert decision.intervention_type == "KEEP"
+    assert decision.intervention_reason == "KEEP_GRAY_NO_RISK_IMPROVEMENT"
+    assert decision.risk_after <= decision.risk_before
 
     decision = selector.select(
-        risk_upper_bound=[0.15, 0.18, 0.40],
+        risk_upper_bound=[0.15, 0.19, 0.40],
+        yopo_cost=[0.0, -10.0, 0.2],
+        geometry_admissible=[True, True, True],
+        top1_index=0,
+    )
+    assert decision.intervention_type == "KEEP"
+    assert decision.risk_after <= decision.risk_before
+
+    decision = selector.select(
+        risk_upper_bound=[0.15, 0.12, 0.40],
         yopo_cost=[0.0, 0.3, 0.2],
         geometry_admissible=[True, True, True],
         top1_index=0,
     )
     assert decision.intervention_type == "RERANK"
     assert decision.selected_index == 1
+    assert decision.risk_after <= decision.risk_before - 0.02
+
+    risk_weighted = OARMInterventionSelector(
+        InterventionSelectorConfig(delta_keep=0.10, delta_safe=0.20, risk_improvement_min=0.02, lambda_risk=10.0)
+    )
+    decision = risk_weighted.select(
+        risk_upper_bound=[0.18, 0.14, 0.05],
+        yopo_cost=[0.0, 0.0, 0.5],
+        geometry_admissible=[True, True, True],
+        top1_index=0,
+    )
+    assert decision.intervention_type == "RERANK"
+    assert decision.selected_index == 2
+    assert decision.risk_after < decision.risk_before
 
 
 def check_deterministic_brake_endpoint():
@@ -172,18 +196,71 @@ def check_deterministic_brake_endpoint():
     assert 1.0 <= float(end_pos[2]) <= 2.0
 
 
+def check_constrained_brake_trajectory():
+    slow = constrained_brake_command(
+        start_pos=np.array([0.0, 0.0, 1.5], dtype=np.float32),
+        start_vel=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        start_acc=np.zeros(3, dtype=np.float32),
+        goal=np.array([10.0, 0.0, 1.5], dtype=np.float32),
+        min_time=0.3,
+        brake_accel=2.0,
+        max_time=4.0,
+        max_accel=10.0,
+        max_jerk=80.0,
+        max_thrust_accel=25.0,
+        max_tilt_deg=80.0,
+    )
+    fast = constrained_brake_command(
+        start_pos=np.array([0.0, 0.0, 1.5], dtype=np.float32),
+        start_vel=np.array([3.0, 0.0, 0.0], dtype=np.float32),
+        start_acc=np.zeros(3, dtype=np.float32),
+        goal=np.array([10.0, 0.0, 1.5], dtype=np.float32),
+        min_time=0.3,
+        brake_accel=2.0,
+        max_time=6.0,
+        max_accel=10.0,
+        max_jerk=80.0,
+        max_thrust_accel=25.0,
+        max_tilt_deg=80.0,
+    )
+    assert fast.diagnostics.stop_distance > slow.diagnostics.stop_distance
+    assert fast.duration >= slow.duration
+    assert np.allclose(fast.end_vel, np.zeros(3), atol=1e-6)
+    assert np.allclose(fast.end_acc, np.zeros(3), atol=1e-6)
+    metrics = evaluate_brake_trajectory(
+        np.array([0.0, 0.0, 1.5], dtype=np.float32),
+        np.array([3.0, 0.0, 0.0], dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+        fast.end_pos,
+        fast.end_vel,
+        fast.end_acc,
+        fast.duration,
+        max_accel=10.0,
+        max_jerk=80.0,
+        max_thrust_accel=25.0,
+        max_tilt_deg=80.0,
+    )
+    assert metrics["feasible"]
+    assert fast.diagnostics.peak_accel <= fast.diagnostics.max_accel + 1e-6
+    assert fast.diagnostics.peak_jerk <= fast.diagnostics.max_jerk + 1e-6
+
+
 def check_fit_risk_calibration_cli_core():
     rows = [
         {
+            "split": "calibration",
+            "episode_id": "ep0",
             "candidates": [
-                {"raw_risk_prob": 0.05, "validity_prob": 0.9, "risk_label": 0},
-                {"raw_risk_prob": 0.80, "validity_prob": 0.8, "risk_label": 1},
+                {"raw_risk_prob": 0.05, "validity_prob": 0.9, "insufficient_reaction_gt": 0},
+                {"raw_risk_prob": 0.80, "validity_prob": 0.8, "insufficient_reaction_gt": 1},
             ]
         },
         {
+            "split": "calibration",
+            "episode_id": "ep1",
             "candidates": [
-                {"raw_risk_prob": 0.20, "validity_prob": 0.7, "risk_label": 0},
-                {"raw_risk_prob": 0.65, "validity_prob": 0.9, "risk_label": 1},
+                {"raw_risk_prob": 0.20, "validity_prob": 0.7, "insufficient_reaction_gt": 0},
+                {"raw_risk_prob": 0.65, "validity_prob": 0.9, "insufficient_reaction_gt": 1},
             ]
         },
     ]
@@ -193,14 +270,36 @@ def check_fit_risk_calibration_cli_core():
         with open(in_path, "w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
-        payload = fit_calibration_from_jsonl([in_path], out_path, empirical_upper_alpha=0.25, max_iter=10)
+        payload = fit_calibration_from_jsonl([in_path], out_path, label_key="insufficient_reaction_gt", empirical_upper_alpha=0.25, max_iter=10)
         assert payload["sample_count"] == 4
         assert payload["validity_fusion"] is True
+        assert payload["label_key"] == "insufficient_reaction_gt"
+        assert payload["input_stats"]["episode_count"] == 2
         assert payload["conformal_slack"] >= 0.0
         loaded = TemperatureCalibration.from_file(out_path)
         assert loaded.temperature == payload["temperature"]
         assert loaded.conformal_slack == payload["conformal_slack"]
         assert os.path.exists(out_path)
+
+        bad_path = os.path.join(tmpdir, "bad_collision.jsonl")
+        with open(bad_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"split": "calibration", "episode_id": "ep_bad", "candidates": [{"raw_risk_prob": 0.4, "validity_prob": 1.0, "collision": True}]}) + "\n")
+        try:
+            fit_calibration_from_jsonl([bad_path], os.path.join(tmpdir, "bad.json"), label_key="collision")
+        except ValueError as exc:
+            assert "episode-level" in str(exc) or "candidate-level" in str(exc)
+        else:
+            raise AssertionError("candidate-level calibration must reject episode collision labels")
+
+        missing_split = os.path.join(tmpdir, "missing_split.jsonl")
+        with open(missing_split, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"episode_id": "ep2", "candidates": [{"raw_risk_prob": 0.4, "validity_prob": 1.0, "insufficient_reaction_gt": 0}]}) + "\n")
+        try:
+            fit_calibration_from_jsonl([missing_split], os.path.join(tmpdir, "missing.json"), label_key="insufficient_reaction_gt")
+        except ValueError as exc:
+            assert "split" in str(exc)
+        else:
+            raise AssertionError("formal calibration should require split metadata")
 
 
 def check_trainable_contract():
@@ -336,6 +435,7 @@ def main():
     check_loss_fail_fast()
     check_intervention_selector_excludes_top1_rerank()
     check_deterministic_brake_endpoint()
+    check_constrained_brake_trajectory()
     check_fit_risk_calibration_cli_core()
     check_trainable_contract()
     check_end_to_end_mini_batch()

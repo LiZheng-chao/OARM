@@ -15,17 +15,15 @@ from OARM.policy.oarm_risk_calibrator import (
 )
 
 
-AUTO_LABEL_KEYS = (
+CANDIDATE_LABEL_KEYS = (
+    "insufficient_reaction_gt",
+    "rm_violation_gt",
     "risk_label",
     "label",
-    "rm_violation_gt",
-    "insufficient_reaction_gt",
-    "collision",
-    "collision_flag",
     "selected_risk_label",
     "selected_rm_violation_gt",
-    "selected_collision",
 )
+EPISODE_LEVEL_LABEL_KEYS = {"collision", "collision_flag", "success", "success_flag", "arrive"}
 AUTO_RAW_RISK_KEYS = (
     "raw_risk_prob",
     "selected_raw_risk_prob",
@@ -100,24 +98,59 @@ def _iter_records(row: Dict, include_candidates: bool) -> Iterator[Dict]:
 
 def _extract_arrays(
     paths: Iterable[Path],
-    label_key: Optional[str],
+    label_key: str,
     risk_key: Optional[str],
     validity_key: Optional[str],
     use_validity_fusion: bool,
     validity_unknown_risk: float,
     include_candidates: bool,
+    split_key: str,
+    calibration_split: str,
+    episode_key: str,
+    require_split: bool,
+    require_episode_id: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, int]]:
     labels: List[float] = []
     risks: List[float] = []
-    stats = {"records_seen": 0, "records_used": 0, "missing_label": 0, "missing_risk": 0, "missing_validity": 0}
-    label_keys = (label_key,) if label_key else AUTO_LABEL_KEYS
+    if not label_key:
+        raise ValueError("risk calibration requires an explicit candidate-level --label-key, e.g. insufficient_reaction_gt")
+    if include_candidates and label_key in EPISODE_LEVEL_LABEL_KEYS:
+        raise ValueError(f"{label_key!r} is episode-level and cannot be used for candidate-level calibration")
+    stats = {
+        "records_seen": 0,
+        "records_used": 0,
+        "missing_label": 0,
+        "missing_risk": 0,
+        "missing_validity": 0,
+        "missing_split": 0,
+        "non_calibration_split": 0,
+        "missing_episode_id": 0,
+        "episode_count": 0,
+    }
     risk_keys = (risk_key,) if risk_key else (AUTO_RAW_RISK_KEYS if use_validity_fusion else AUTO_FUSED_RISK_KEYS)
     validity_keys = (validity_key,) if validity_key else AUTO_VALIDITY_KEYS
+    episode_ids = set()
 
     for row in _iter_rows(paths):
         for record in _iter_records(row, include_candidates):
             stats["records_seen"] += 1
-            label = _first_label(record, label_keys)
+            split_value = record.get(split_key)
+            if split_value is None:
+                stats["missing_split"] += 1
+                if require_split:
+                    continue
+            elif str(split_value) != str(calibration_split):
+                stats["non_calibration_split"] += 1
+                if require_split:
+                    continue
+            episode_id = record.get(episode_key)
+            if episode_id is None:
+                stats["missing_episode_id"] += 1
+                if require_episode_id:
+                    continue
+            else:
+                episode_ids.add(str(episode_id))
+            label = _first_label(record, (label_key,))
             if label is None:
                 stats["missing_label"] += 1
                 continue
@@ -137,6 +170,13 @@ def _extract_arrays(
             risks.append(risk)
             stats["records_used"] += 1
 
+    stats["episode_count"] = len(episode_ids)
+    if require_split and stats["missing_split"] > 0:
+        raise ValueError(f"calibration rows missing split key {split_key!r}; pass --allow-missing-split only for ad-hoc smoke checks; stats={stats}")
+    if require_split and stats["non_calibration_split"] > 0:
+        raise ValueError(f"input contains non-calibration split rows; provide a clean calibration split; stats={stats}")
+    if require_episode_id and stats["missing_episode_id"] > 0:
+        raise ValueError(f"calibration rows missing episode id key {episode_key!r}; stats={stats}")
     if not risks:
         raise ValueError(f"no usable calibration records found; stats={stats}")
     probs = torch.tensor(risks, dtype=torch.float32)
@@ -161,6 +201,11 @@ def fit_calibration_from_jsonl(
     n_bins: int = 15,
     max_iter: int = 100,
     include_candidates: bool = True,
+    split_key: str = "split",
+    calibration_split: str = "calibration",
+    episode_key: str = "episode_id",
+    require_split: bool = True,
+    require_episode_id: bool = True,
 ) -> Dict:
     paths = [Path(p) for p in inputs]
     probs, labels, stats = _extract_arrays(
@@ -171,6 +216,11 @@ def fit_calibration_from_jsonl(
         use_validity_fusion=use_validity_fusion,
         validity_unknown_risk=validity_unknown_risk,
         include_candidates=include_candidates,
+        split_key=split_key,
+        calibration_split=calibration_split,
+        episode_key=episode_key,
+        require_split=require_split,
+        require_episode_id=require_episode_id,
     )
     logits = _logit_from_prob(probs)
     before = binary_calibration_metrics(probs, labels, n_bins=n_bins)
@@ -190,6 +240,12 @@ def fit_calibration_from_jsonl(
             "empirical_upper_alpha": float(empirical_upper_alpha),
             "validity_fusion": bool(use_validity_fusion),
             "validity_unknown_risk": float(validity_unknown_risk),
+            "label_key": label_key,
+            "split_key": split_key,
+            "calibration_split": calibration_split,
+            "episode_key": episode_key,
+            "require_split": bool(require_split),
+            "require_episode_id": bool(require_episode_id),
             "sample_count": int(labels.numel()),
             "metrics_before": before.__dict__,
             "metrics_after_temperature": after.__dict__,
@@ -210,7 +266,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Fit OARM risk temperature calibration and empirical conservative upper slack from JSONL logs.")
     p.add_argument("--input", nargs="+", required=True, help="calibration JSONL file(s); rows may contain a candidates array")
     p.add_argument("--output", required=True, help="output calibration JSON path")
-    p.add_argument("--label-key", default=None, help="override label key; default auto-detects common GT label fields")
+    p.add_argument("--label-key", required=True, choices=CANDIDATE_LABEL_KEYS, help="candidate-level calibration label, e.g. insufficient_reaction_gt; episode-level collision labels are intentionally rejected")
     p.add_argument("--risk-key", default=None, help="override risk probability key; default uses raw risk when validity fusion is enabled")
     p.add_argument("--validity-key", default=None, help="override validity probability key")
     validity = p.add_mutually_exclusive_group()
@@ -221,6 +277,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--n-bins", type=int, default=15)
     p.add_argument("--max-iter", type=int, default=100)
     p.add_argument("--selected-only", action="store_true", help="fit on top-level selected row fields instead of per-candidate table")
+    p.add_argument("--split-key", default="split")
+    p.add_argument("--calibration-split", default="calibration")
+    p.add_argument("--episode-key", default="episode_id")
+    p.add_argument("--allow-missing-split", action="store_true", help="ad-hoc smoke only; formal calibration should keep split metadata")
+    p.add_argument("--allow-missing-episode-id", action="store_true", help="ad-hoc smoke only; formal calibration should keep episode metadata")
     return p
 
 
@@ -238,6 +299,11 @@ def main() -> None:
         n_bins=args.n_bins,
         max_iter=args.max_iter,
         include_candidates=not args.selected_only,
+        split_key=args.split_key,
+        calibration_split=args.calibration_split,
+        episode_key=args.episode_key,
+        require_split=not args.allow_missing_split,
+        require_episode_id=not args.allow_missing_episode_id,
     )
     summary = {
         "output": args.output,

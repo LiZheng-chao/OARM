@@ -32,7 +32,7 @@ if YOPO_DIR not in sys.path:
 
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
-from OARM.policy.oarm_brake import deterministic_brake_endpoint
+from OARM.policy.oarm_brake import constrained_brake_command, deterministic_brake_endpoint
 from OARM.policy.oarm_latency_model import OARMLatencyModel
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration, calibrated_probability, risk_upper_bound
 from OARM.policy.oarm_rm_critic import risk_probability_from_window
@@ -108,6 +108,14 @@ class OARMNet:
         self.depth_emergency_retreat_distance = float(self.config.get("depth_emergency_retreat_distance", 0.0))
         self.depth_emergency_target_z = self.config.get("depth_emergency_target_z", None)
         self.depth_emergency_z_rate = float(self.config.get("depth_emergency_z_rate", 0.8))
+        self.brake_decel_mps2 = float(self.config.get("brake_decel_mps2", 3.0))
+        self.brake_max_time = float(self.config.get("brake_max_time", 5.0))
+        self.brake_max_accel_mps2 = float(self.config.get("brake_max_accel_mps2", 6.0))
+        self.brake_max_jerk_mps3 = float(self.config.get("brake_max_jerk_mps3", 30.0))
+        self.brake_max_thrust_accel_mps2 = float(self.config.get("brake_max_thrust_accel_mps2", 18.0))
+        self.brake_max_tilt_deg = float(self.config.get("brake_max_tilt_deg", 50.0))
+        self.brake_sample_count = int(self.config.get("brake_sample_count", 41))
+        self.brake_time_growth = float(self.config.get("brake_time_growth", 1.25))
         self.last_depth_emergency_stop = False
         self.last_depth_emergency_reason = None
         self.last_depth_emergency_target = None
@@ -115,6 +123,7 @@ class OARMNet:
         self.last_deterministic_brake_reason = None
         self.last_deterministic_brake_terminal_speed = None
         self.last_deterministic_brake_terminal_acc_norm = None
+        self.last_deterministic_brake_diagnostics = None
         self.last_selector_force_emergency_stop = False
         self.last_selector_force_emergency_reason = None
         self.last_stop_fallback_count = None
@@ -204,6 +213,8 @@ class OARMNet:
             InterventionSelectorConfig(
                 delta_keep=float(self.config.get("risk_threshold_keep", 0.10)),
                 delta_safe=float(self.config.get("risk_threshold_safe", 0.20)),
+                risk_improvement_min=float(self.config.get("risk_improvement_min", 0.02)),
+                lambda_risk=float(self.config.get("selector_lambda_risk", 1.0)),
             )
         )
         agile_bonus_enabled = any(
@@ -615,19 +626,31 @@ class OARMNet:
             start_vel = self.get_start_vel()
             start_acc = self.desire_acc
             if emergency_stop:
-                selected_time = float(np.clip(self.depth_emergency_traj_time, 0.1, 2.0))
-                end_pos, end_vel, end_acc = deterministic_brake_endpoint(
+                min_brake_time = float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time))
+                brake_command = constrained_brake_command(
                     start_pos,
                     start_vel,
-                    self.goal,
-                    selected_time,
-                    distance_scale=self.depth_emergency_distance_scale,
-                    retreat_distance=self.depth_emergency_retreat_distance,
+                    start_acc=start_acc,
+                    goal=self.goal,
+                    min_time=min_brake_time,
+                    brake_accel=self.brake_decel_mps2,
+                    max_time=self.brake_max_time,
+                    max_accel=self.brake_max_accel_mps2,
+                    max_jerk=self.brake_max_jerk_mps3,
+                    max_thrust_accel=self.brake_max_thrust_accel_mps2,
+                    max_tilt_deg=self.brake_max_tilt_deg,
+                    sample_count=self.brake_sample_count,
+                    time_growth=self.brake_time_growth,
                     target_z=self.depth_emergency_target_z,
                     z_rate=self.depth_emergency_z_rate,
                     min_command_z=self.min_command_z,
                     max_command_z=self.max_command_z,
                 )
+                selected_time = brake_command.duration
+                end_pos = brake_command.end_pos
+                end_vel = brake_command.end_vel
+                end_acc = brake_command.end_acc
+                diagnostics = brake_command.diagnostics.to_dict()
                 self.last_depth_emergency_target = end_pos.astype(float).tolist()
                 self.last_deterministic_brake_stop = True
                 self.last_deterministic_brake_reason = (
@@ -637,12 +660,14 @@ class OARMNet:
                 )
                 self.last_deterministic_brake_terminal_speed = float(np.linalg.norm(end_vel))
                 self.last_deterministic_brake_terminal_acc_norm = float(np.linalg.norm(end_acc))
+                self.last_deterministic_brake_diagnostics = diagnostics
             else:
                 self.last_depth_emergency_target = None
                 self.last_deterministic_brake_stop = False
                 self.last_deterministic_brake_reason = None
                 self.last_deterministic_brake_terminal_speed = None
                 self.last_deterministic_brake_terminal_acc_norm = None
+                self.last_deterministic_brake_diagnostics = None
                 end_pos = start_pos + endstate_w[action_id, :, 0]
                 if not self.yopo_preserve_mode:
                     end_pos[2] = float(np.clip(end_pos[2], self.min_command_z, self.max_command_z))
@@ -1587,6 +1612,10 @@ class OARMNet:
             "enable_rm_critic": bool(self.enable_rm_critic),
             "enable_latency_aware_risk": bool(self.enable_latency_aware_risk),
             "risk_source": risk_source,
+            "risk_threshold_keep": float(self.config.get("risk_threshold_keep", 0.10)),
+            "risk_threshold_safe": float(self.config.get("risk_threshold_safe", 0.20)),
+            "risk_improvement_min": float(self.config.get("risk_improvement_min", 0.02)),
+            "selector_lambda_risk": float(self.config.get("selector_lambda_risk", 1.0)),
             "use_calibrated_risk": bool(self.use_calibrated_risk),
             "use_validity_risk_fusion": bool(self.use_validity_risk_fusion),
             "validity_unknown_risk": float(self.validity_unknown_risk),
@@ -1611,6 +1640,12 @@ class OARMNet:
             "depth_emergency_retreat_distance": float(self.depth_emergency_retreat_distance),
             "depth_emergency_target_z": self.depth_emergency_target_z,
             "depth_emergency_z_rate": float(self.depth_emergency_z_rate),
+            "brake_decel_mps2": float(self.brake_decel_mps2),
+            "brake_max_time": float(self.brake_max_time),
+            "brake_max_accel_mps2": float(self.brake_max_accel_mps2),
+            "brake_max_jerk_mps3": float(self.brake_max_jerk_mps3),
+            "brake_max_thrust_accel_mps2": float(self.brake_max_thrust_accel_mps2),
+            "brake_max_tilt_deg": float(self.brake_max_tilt_deg),
             "depth_emergency_stop": bool(self.last_depth_emergency_stop),
             "depth_emergency_reason": self.last_depth_emergency_reason,
             "depth_emergency_target_w": self.last_depth_emergency_target,
@@ -1618,6 +1653,14 @@ class OARMNet:
             "deterministic_brake_reason": self.last_deterministic_brake_reason,
             "deterministic_brake_terminal_speed": self.last_deterministic_brake_terminal_speed,
             "deterministic_brake_terminal_acc_norm": self.last_deterministic_brake_terminal_acc_norm,
+            "deterministic_brake_diagnostics": self.last_deterministic_brake_diagnostics,
+            "deterministic_brake_feasible": None if self.last_deterministic_brake_diagnostics is None else bool(self.last_deterministic_brake_diagnostics.get("feasible", False)),
+            "deterministic_brake_duration": None if self.last_deterministic_brake_diagnostics is None else float(self.last_deterministic_brake_diagnostics.get("duration", 0.0)),
+            "deterministic_brake_stop_distance": None if self.last_deterministic_brake_diagnostics is None else float(self.last_deterministic_brake_diagnostics.get("stop_distance", 0.0)),
+            "deterministic_brake_peak_accel": None if self.last_deterministic_brake_diagnostics is None else float(self.last_deterministic_brake_diagnostics.get("peak_accel", 0.0)),
+            "deterministic_brake_peak_jerk": None if self.last_deterministic_brake_diagnostics is None else float(self.last_deterministic_brake_diagnostics.get("peak_jerk", 0.0)),
+            "deterministic_brake_peak_thrust_accel": None if self.last_deterministic_brake_diagnostics is None else float(self.last_deterministic_brake_diagnostics.get("peak_thrust_accel", 0.0)),
+            "deterministic_brake_peak_tilt_deg": None if self.last_deterministic_brake_diagnostics is None else float(self.last_deterministic_brake_diagnostics.get("peak_tilt_deg", 0.0)),
             "selector_force_emergency_stop": bool(self.last_selector_force_emergency_stop),
             "selector_force_emergency_reason": self.last_selector_force_emergency_reason,
             "stop_fallback_count": self.last_stop_fallback_count,
@@ -1895,6 +1938,8 @@ def parser():
     parser.add_argument("--enable-intervention-selector", action="store_true")
     parser.add_argument("--risk-threshold-keep", type=float, default=0.10)
     parser.add_argument("--risk-threshold-safe", type=float, default=0.20)
+    parser.add_argument("--risk-improvement-min", type=float, default=0.02)
+    parser.add_argument("--selector-lambda-risk", type=float, default=1.0)
     parser.add_argument("--progress-bonus-weight", type=float, default=0.0)
     parser.add_argument("--agile-progress-weight", type=float, default=0.0)
     parser.add_argument("--agile-goal-distance-weight", type=float, default=0.0)
@@ -1915,6 +1960,14 @@ def parser():
     parser.add_argument("--depth-emergency-retreat-distance", type=float, default=0.0)
     parser.add_argument("--depth-emergency-target-z", type=float, default=None)
     parser.add_argument("--depth-emergency-z-rate", type=float, default=0.8)
+    parser.add_argument("--brake-decel-mps2", type=float, default=3.0)
+    parser.add_argument("--brake-max-time", type=float, default=5.0)
+    parser.add_argument("--brake-max-accel-mps2", type=float, default=6.0)
+    parser.add_argument("--brake-max-jerk-mps3", type=float, default=30.0)
+    parser.add_argument("--brake-max-thrust-accel-mps2", type=float, default=18.0)
+    parser.add_argument("--brake-max-tilt-deg", type=float, default=50.0)
+    parser.add_argument("--brake-sample-count", type=int, default=41)
+    parser.add_argument("--brake-time-growth", type=float, default=1.25)
     parser.add_argument("--selector-min-traj-z", type=float, default=None)
     parser.add_argument("--selector-max-traj-z", type=float, default=None)
     parser.add_argument("--altitude-band-weight", type=float, default=0.0)
@@ -2003,6 +2056,8 @@ if __name__ == "__main__":
         "enable_intervention_selector": args.enable_intervention_selector,
         "risk_threshold_keep": args.risk_threshold_keep,
         "risk_threshold_safe": args.risk_threshold_safe,
+        "risk_improvement_min": args.risk_improvement_min,
+        "selector_lambda_risk": args.selector_lambda_risk,
         "progress_bonus_weight": args.progress_bonus_weight,
         "agile_progress_weight": args.agile_progress_weight,
         "agile_goal_distance_weight": args.agile_goal_distance_weight,
@@ -2023,6 +2078,14 @@ if __name__ == "__main__":
         "depth_emergency_retreat_distance": args.depth_emergency_retreat_distance,
         "depth_emergency_target_z": args.depth_emergency_target_z,
         "depth_emergency_z_rate": args.depth_emergency_z_rate,
+        "brake_decel_mps2": args.brake_decel_mps2,
+        "brake_max_time": args.brake_max_time,
+        "brake_max_accel_mps2": args.brake_max_accel_mps2,
+        "brake_max_jerk_mps3": args.brake_max_jerk_mps3,
+        "brake_max_thrust_accel_mps2": args.brake_max_thrust_accel_mps2,
+        "brake_max_tilt_deg": args.brake_max_tilt_deg,
+        "brake_sample_count": args.brake_sample_count,
+        "brake_time_growth": args.brake_time_growth,
         "selector_min_traj_z": args.selector_min_traj_z,
         "selector_max_traj_z": args.selector_max_traj_z,
         "altitude_band_weight": args.altitude_band_weight,
