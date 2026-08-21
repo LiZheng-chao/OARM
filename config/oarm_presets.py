@@ -13,6 +13,7 @@ class OARMTrainingPreset:
     train_risk_point_guidance: bool = oarm_cfg.train_risk_point_guidance
     train_reaction_margin: bool = oarm_cfg.train_reaction_margin
     train_margin_ranking: bool = oarm_cfg.train_margin_ranking
+    train_probabilistic_rm_critic: bool = oarm_cfg.train_probabilistic_rm_critic
     train_yaw_visibility: bool = oarm_cfg.train_yaw_visibility
     deployed_yaw_mode: str = oarm_cfg.deployed_yaw_mode
     risk_label_source: str = oarm_cfg.risk_label_source
@@ -127,6 +128,20 @@ OARM_TRAINING_PRESETS: Dict[str, OARMTrainingPreset] = {
         yopo_preserve_geometry_ce_temperature=0.75,
     ),
 
+
+    "oarm3_s2_prob_rm": OARMTrainingPreset(
+        candidate_mode="yopo_preserve",
+        backbone_mode="yopo_original",
+        train_occlusion_risk=False,
+        train_risk_point_guidance=True,
+        train_reaction_margin=True,
+        train_probabilistic_rm_critic=True,
+        train_margin_ranking=False,
+        risk_label_source="gt_pointcloud",
+        use_privileged_risk_filter=True,
+        use_occlusion_aware_visibility=True,
+        deployed_yaw_mode="goal",
+    ),
     "a4a": OARMTrainingPreset(
         candidate_mode="a4_preserve_brake",
         backbone_mode="yopo_original",

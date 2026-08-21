@@ -41,6 +41,7 @@ class OARMLoss(nn.Module):
         enable_risk_point_guidance: bool = oarm_cfg.train_risk_point_guidance,
         enable_reaction_margin: bool = oarm_cfg.train_reaction_margin,
         enable_margin_ranking: bool = oarm_cfg.train_margin_ranking,
+        enable_probabilistic_rm_critic: bool = oarm_cfg.train_probabilistic_rm_critic,
         enable_yaw_visibility: bool = False,
         deployed_yaw_mode: str = oarm_cfg.deployed_yaw_mode,
         enable_yield_feasibility: Optional[bool] = None,
@@ -57,6 +58,7 @@ class OARMLoss(nn.Module):
         self.enable_risk_point_guidance = enable_risk_point_guidance
         self.enable_reaction_margin = enable_reaction_margin
         self.enable_margin_ranking = enable_margin_ranking
+        self.enable_probabilistic_rm_critic = bool(enable_probabilistic_rm_critic)
         self.enable_yaw_visibility = enable_yaw_visibility
         self.risk_assoc_distance_m = risk_assoc_distance_m
         self.risk_assoc_sigma_m = risk_assoc_sigma_m
@@ -322,6 +324,10 @@ class OARMLoss(nn.Module):
             losses["margin_loss"] = torch.zeros((), device=total_cost.device)
             losses["margin_valid_rate"] = torch.zeros((), device=total_cost.device)
 
+
+        rm_critic_losses = self.probabilistic_rm_critic_loss(candidate_flat, labels)
+        losses.update(rm_critic_losses)
+
         if "yield_logit" in candidate_flat:
             yield_logit = candidate_flat["yield_logit"]
         else:
@@ -384,6 +390,7 @@ class OARMLoss(nn.Module):
             + utility_loss
             + oarm_cfg.risk_bce_weight * losses["risk_loss"]
             + oarm_cfg.margin_reg_weight * losses["margin_loss"]
+            + losses["rm_critic_loss"]
             + oarm_cfg.yield_bce_weight * losses["backup_loss"]
             + oarm_cfg.ranking_weight * ranking_loss
         )
@@ -401,6 +408,84 @@ class OARMLoss(nn.Module):
             }
         )
         return losses
+
+    def probabilistic_rm_critic_loss(self, candidate_flat: Dict[str, torch.Tensor], labels: Optional[Dict[str, torch.Tensor]]):
+        zero_ref = candidate_flat["traj_time"]
+        zero = torch.zeros((), device=zero_ref.device)
+        out = {
+            "rm_critic_window_nll": zero,
+            "rm_critic_validity_bce": zero,
+            "rm_critic_loss": zero,
+            "rm_critic_valid_rate": zero,
+            "rm_critic_progress_mask_rate": zero,
+            "rm_critic_window_error": zero,
+            "rm_critic_sigma_mean": zero,
+            "rm_event_valid_rate": zero,
+            "rm_right_censored_rate": zero,
+            "rm_no_entry_rate": zero,
+            "risk_visible_at_t0_rate": zero,
+        }
+        if not self.enable_probabilistic_rm_critic:
+            return out
+        if labels is None or "reaction_window" not in labels:
+            return out
+        required = ("reaction_window_mean", "reaction_window_logvar", "validity_logit")
+        if any(key not in candidate_flat for key in required):
+            return out
+
+        window = labels["reaction_window"].to(device=zero_ref.device).reshape_as(candidate_flat["reaction_window_mean"]).float()
+        event_valid = labels.get("rm_event_valid", labels.get("reaction_margin_valid"))
+        if event_valid is None:
+            event_valid = torch.ones_like(window, dtype=torch.bool)
+        else:
+            event_valid = event_valid.to(device=window.device).reshape_as(window).bool()
+        progress_mask = torch.ones_like(event_valid, dtype=torch.bool)
+        candidate_type = candidate_flat.get("candidate_type")
+        if candidate_type is not None:
+            candidate_type = candidate_type.to(device=window.device).reshape_as(window)
+            progress_mask = candidate_type == OARMCandidateGenerator.PROGRESS
+        finite = torch.isfinite(window) & torch.isfinite(candidate_flat["reaction_window_mean"])
+        valid_mask = event_valid & progress_mask & finite
+
+        logvar = candidate_flat["reaction_window_logvar"].reshape_as(window).float().clamp(min=-12.0, max=8.0)
+        mean = candidate_flat["reaction_window_mean"].reshape_as(window).float()
+        if bool(valid_mask.any()):
+            err = window[valid_mask] - mean[valid_mask]
+            inv_var = torch.exp(-logvar[valid_mask])
+            window_nll = 0.5 * (err.square() * inv_var + logvar[valid_mask]).mean()
+            out["rm_critic_window_nll"] = window_nll
+            out["rm_critic_window_error"] = err.abs().mean()
+            out["rm_critic_sigma_mean"] = torch.exp(0.5 * logvar[valid_mask]).mean()
+        else:
+            window_nll = zero
+
+        validity_logit = candidate_flat["validity_logit"].reshape_as(window).float()
+        validity_mask = progress_mask & torch.isfinite(validity_logit)
+        if bool(validity_mask.any()):
+            validity_target = event_valid.float()
+            validity_bce = F.binary_cross_entropy_with_logits(
+                validity_logit[validity_mask],
+                validity_target[validity_mask],
+            )
+            out["rm_critic_validity_bce"] = validity_bce
+        else:
+            validity_bce = zero
+
+        out["rm_critic_loss"] = (
+            oarm_cfg.rm_critic_window_nll_weight * window_nll
+            + oarm_cfg.rm_critic_validity_bce_weight * validity_bce
+        )
+        out["rm_critic_valid_rate"] = valid_mask.float().mean()
+        out["rm_critic_progress_mask_rate"] = progress_mask.float().mean()
+        out["rm_event_valid_rate"] = event_valid.float().mean()
+        for src, dst in (
+            ("rm_right_censored", "rm_right_censored_rate"),
+            ("rm_no_entry", "rm_no_entry_rate"),
+            ("risk_visible_at_t0", "risk_visible_at_t0_rate"),
+        ):
+            if src in labels:
+                out[dst] = labels[src].to(device=window.device).reshape_as(window).float().mean()
+        return out
 
     def deployed_yaw_reference(
         self,

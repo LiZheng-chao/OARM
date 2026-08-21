@@ -3,6 +3,7 @@ from torch import nn
 
 from OARM.config import oarm_cfg
 from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
+from OARM.policy.oarm_rm_critic import CandidateRMCritic, risk_logit_from_window
 from OARM.policy.oarm_types import OARMCandidate
 from OARM.utils.yopo_compat import ensure_yopo_path
 
@@ -31,6 +32,9 @@ class YOPOPreserveOARMNetwork(nn.Module):
         enable_utility_delta=False,
         utility_delta_scale=oarm_cfg.yopo_preserve_utility_delta_scale,
         append_brake_candidate=False,
+        enable_rm_critic=oarm_cfg.train_probabilistic_rm_critic,
+        rm_critic_hidden_dim=oarm_cfg.rm_critic_hidden_dim,
+        rm_critic_hazard_bins=oarm_cfg.rm_critic_hazard_bins,
     ):
         super().__init__()
         self.append_brake_candidate = bool(append_brake_candidate)
@@ -43,6 +47,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
         self.margin_scale = float(margin_scale)
         self.enable_utility_delta = bool(enable_utility_delta)
         self.utility_delta_scale = float(utility_delta_scale)
+        self.enable_rm_critic = bool(enable_rm_critic)
         self.state_transform = StateTransform()
         self.lattice_primitive = LatticePrimitive.get_instance()
         segment_time = float(self.lattice_primitive.segment_time)
@@ -71,6 +76,13 @@ class YOPOPreserveOARMNetwork(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 1, kernel_size=1),
         )
+        self.rm_critic = None
+        if self.enable_rm_critic:
+            self.rm_critic = CandidateRMCritic(
+                candidate_feature_dim=hidden_state + observation_dim,
+                hidden_dim=rm_critic_hidden_dim,
+                hazard_bins=rm_critic_hazard_bins,
+            )
         self.reset_aux_heads()
         if freeze_yopo_base:
             self.freeze_yopo_base()
@@ -106,6 +118,8 @@ class YOPOPreserveOARMNetwork(nn.Module):
         self.margin_risk_head.train(mode)
         self.rerank_head.train(mode)
         self.brake_gate_head.train(mode)
+        if self.rm_critic is not None:
+            self.rm_critic.train(mode)
         return self
 
     def adapt_legacy_aux_state_dict(self, state_dict):
@@ -145,7 +159,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
             elif key.startswith("module.") and key[len("module.") :] in own_state:
                 adapted[key[len("module.") :]] = value
         missing, unexpected = self.load_state_dict(adapted, strict=False)
-        ignored_prefixes = ("margin_risk_head.", "rerank_head.", "brake_gate_head.")
+        ignored_prefixes = ("margin_risk_head.", "rerank_head.", "brake_gate_head.", "rm_critic.")
         missing = [key for key in missing if not key.startswith(ignored_prefixes)]
         if strict and (missing or unexpected):
             raise RuntimeError(
@@ -154,7 +168,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
             )
         return missing, unexpected
 
-    def forward(self, depth: torch.Tensor, obs_prepared: torch.Tensor):
+    def forward(self, depth: torch.Tensor, obs_prepared: torch.Tensor, return_critic: bool = False):
         with torch.no_grad():
             depth_feature = self.image_backbone(depth)
             obs_feature = self.state_backbone(obs_prepared)
@@ -176,6 +190,13 @@ class YOPOPreserveOARMNetwork(nn.Module):
             brake_gate_raw = gate_map.flatten(1).gather(1, top1_id[:, None]).reshape(-1, 1, 1, 1)
             brake_gate_raw = brake_gate_raw.expand(-1, -1, margin_risk.shape[2], margin_risk.shape[3])
             aux = torch.cat((aux, brake_gate_raw), dim=1)
+        critic = None
+        if return_critic and self.rm_critic is not None:
+            b, c, v, h = detached_features.shape
+            candidate_feature = detached_features.permute(0, 2, 3, 1).reshape(b, v * h, c)
+            critic = self.rm_critic(candidate_feature, yopo_cost=score_pred.reshape(b, v * h))
+        if return_critic:
+            return endstate_pred, score_pred, aux, critic
         return endstate_pred, score_pred, aux
 
     def deterministic_brake_candidate(self, obs: torch.Tensor, dtype: torch.dtype, device: torch.device):
@@ -195,7 +216,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
     def inference(self, depth: torch.Tensor, obs: torch.Tensor) -> OARMCandidate:
         obs_norm = self.state_transform.normalize_obs(obs.clone())
         obs_prepared = self.state_transform.prepare_input(obs_norm)
-        endstate_pred, score_pred, aux = self.forward(depth, obs_prepared)
+        endstate_pred, score_pred, aux, critic = self.forward(depth, obs_prepared, return_critic=True)
         end_state_b = self.state_transform.pred_to_endstate(endstate_pred)
 
         b, _, v, h = end_state_b.shape
@@ -208,6 +229,21 @@ class YOPOPreserveOARMNetwork(nn.Module):
         yaw_terminal = torch.zeros((b, 1, v, h), device=depth.device, dtype=depth.dtype)
         margin_pred = self.margin_scale * torch.tanh(aux[:, 0:1])
         risk_logit = aux[:, 1:2]
+        reaction_window_mean = None
+        reaction_window_logvar = None
+        validity_logit = None
+        rm_insufficient_logit = None
+        if critic is not None:
+            reaction_window_mean = critic["reaction_window_mean"].reshape(b, 1, v, h)
+            reaction_window_logvar = critic["reaction_window_logvar"].reshape(b, 1, v, h)
+            validity_logit = critic["validity_logit"].reshape(b, 1, v, h)
+            rm_insufficient_logit = critic["insufficient_margin_logit"].reshape(b, 1, v, h)
+            margin_pred = reaction_window_mean - float(oarm_cfg.reaction_time)
+            risk_logit = risk_logit_from_window(
+                reaction_window_mean,
+                reaction_window_logvar,
+                reaction_budget_s=float(oarm_cfg.reaction_time),
+            )
         backup_logit = torch.zeros_like(risk_logit)
         utility_base = -score_pred
         if self.enable_utility_delta:
@@ -231,6 +267,10 @@ class YOPOPreserveOARMNetwork(nn.Module):
             yaw_anchor=anchors.yaw_anchor.reshape(b, v, h),
             utility_base=utility_base,
             utility_delta=utility_delta.reshape(b, v, h),
+            reaction_window_mean=reaction_window_mean,
+            reaction_window_logvar=reaction_window_logvar,
+            validity_logit=validity_logit,
+            rm_insufficient_logit=rm_insufficient_logit,
         )
         if not self.append_brake_candidate:
             return candidate
@@ -259,6 +299,18 @@ class YOPOPreserveOARMNetwork(nn.Module):
         brake_gate = aux[:, -1:, :1, :1].reshape(b, 1, 1)
         brake_base = utility_base_flat.max(dim=2, keepdim=True).values
         brake_utility = brake_base + brake_gate
+        if reaction_window_mean is not None:
+            window_flat = reaction_window_mean.reshape(b, 1, 1, yopo_n)
+            logvar_flat = reaction_window_logvar.reshape(b, 1, 1, yopo_n)
+            validity_flat = validity_logit.reshape(b, 1, 1, yopo_n)
+            insufficient_flat = rm_insufficient_logit.reshape(b, 1, 1, yopo_n)
+            brake_window = window_flat.mean(dim=3, keepdim=True)
+            brake_logvar = logvar_flat.max(dim=3, keepdim=True).values
+            brake_validity = torch.full_like(brake_window, -10.0)
+            brake_insufficient = torch.full_like(brake_window, 10.0)
+        else:
+            window_flat = logvar_flat = validity_flat = insufficient_flat = None
+            brake_window = brake_logvar = brake_validity = brake_insufficient = None
 
         return OARMCandidate(
             end_state_b=torch.cat((end_flat, brake_end), dim=3),
@@ -274,4 +326,8 @@ class YOPOPreserveOARMNetwork(nn.Module):
             yaw_anchor=torch.cat((yaw_anchor_flat, torch.zeros((b, 1, 1), device=depth.device, dtype=depth.dtype)), dim=2),
             utility_base=torch.cat((utility_base_flat, brake_base), dim=2),
             utility_delta=torch.cat((utility_delta_flat, brake_gate), dim=2),
+            reaction_window_mean=torch.cat((window_flat, brake_window), dim=3) if window_flat is not None else None,
+            reaction_window_logvar=torch.cat((logvar_flat, brake_logvar), dim=3) if logvar_flat is not None else None,
+            validity_logit=torch.cat((validity_flat, brake_validity), dim=3) if validity_flat is not None else None,
+            rm_insufficient_logit=torch.cat((insufficient_flat, brake_insufficient), dim=3) if insufficient_flat is not None else None,
         )

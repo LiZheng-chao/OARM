@@ -31,6 +31,8 @@ if YOPO_DIR not in sys.path:
     sys.path.insert(0, YOPO_DIR)
 
 from OARM.policy.oarm_network import OARMNetwork
+from OARM.policy.oarm_latency_model import OARMLatencyModel
+from OARM.policy.oarm_rm_critic import risk_probability_from_window
 from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
 from OARM.policy.oarm_state_transform import OARMStateTransform
 from OARM.utils.yopo_compat import ensure_yopo_path
@@ -152,6 +154,31 @@ class OARMNet:
         self.scenario = self.config.get("scenario", "unknown")
         self.seed = int(self.config.get("seed", 0))
         self.checkpoint_path = self.config.get("checkpoint", "")
+        enable_rm_critic = self.config.get("enable_rm_critic", None)
+        if enable_rm_critic is None and self.checkpoint_path and os.path.isfile(self.checkpoint_path):
+            try:
+                state_for_rm, _metadata_for_rm = load_oarm_checkpoint(self.checkpoint_path, map_location="cpu")
+                enable_rm_critic = any(key.startswith("preserve_network.rm_critic.") for key in state_for_rm)
+            except Exception as exc:
+                rospy.logwarn(f"Could not inspect checkpoint RM critic state; using disabled RM critic: {exc}")
+                enable_rm_critic = False
+        self.enable_rm_critic = bool(enable_rm_critic)
+        self.config["enable_rm_critic"] = self.enable_rm_critic
+        latency_aware_risk = self.config.get("enable_latency_aware_risk", None)
+        self.enable_latency_aware_risk = self.enable_rm_critic if latency_aware_risk is None else bool(latency_aware_risk)
+        self.config["enable_latency_aware_risk"] = self.enable_latency_aware_risk
+        self.latency_model = OARMLatencyModel(
+            brake_accel_mps2=float(self.config.get("latency_brake_accel_mps2", 6.0)),
+            sensor_age_s=float(self.config.get("sensor_age_ms", 0.0)) / 1000.0,
+            queue_latency_s=float(self.config.get("queue_latency_ms", 0.0)) / 1000.0,
+            selector_latency_s=float(self.config.get("selector_latency_ms", 0.0)) / 1000.0,
+            control_latency_s=float(self.config.get("control_latency_ms", 20.0)) / 1000.0,
+            actuation_latency_s=float(self.config.get("actuation_latency_ms", 30.0)) / 1000.0,
+            latency_window=int(self.config.get("latency_window", 128)),
+            quantile=float(self.config.get("latency_quantile", 0.95)),
+        )
+        self.last_latency_budget = None
+        self.warned_latency_risk_unavailable = False
         agile_bonus_enabled = any(
             abs(float(value)) > 1e-9
             for value in (
@@ -264,6 +291,7 @@ class OARMNet:
             backbone_mode=self.config.get("backbone_mode", "yopo_original"),
             enable_yield_candidates=self.config.get("enable_yield_candidates", False),
             utility_delta_scale=self.config["yopo_preserve_utility_delta_scale"],
+            enable_rm_critic=self.enable_rm_critic,
         ).to(self.device)
         self.load_policy(weight)
         self.policy.eval()
@@ -418,6 +446,24 @@ class OARMNet:
         obs = np.concatenate((vel_c, acc_c, goal_c), axis=0).astype(np.float32)
         return torch.from_numpy(obs[None, :])
 
+    def estimate_reaction_budget(self, depth_msg, obs, inference_latency_s):
+        sensor_age_s = None
+        if self.config.get("use_depth_header_sensor_age", True) and getattr(depth_msg, "header", None) is not None:
+            try:
+                stamp = depth_msg.header.stamp
+                if stamp is not None and not stamp.is_zero():
+                    sensor_age_s = max(0.0, (rospy.Time.now() - stamp).to_sec())
+            except Exception:
+                sensor_age_s = None
+        velocity_body = obs.detach().cpu().numpy()[0, :3]
+        budget = self.latency_model.estimate(
+            velocity_body_mps=velocity_body,
+            inference_latency_s=float(inference_latency_s),
+            sensor_age_s=sensor_age_s,
+        )
+        self.last_latency_budget = budget
+        return budget
+
     @torch.inference_mode()
     def callback_depth(self, data):
         if not self.odom_init:
@@ -446,6 +492,8 @@ class OARMNet:
             torch.cuda.synchronize()
         forward_end = time.time()
         flat = candidate.flatten()
+        forward_latency_s = forward_end - forward_start
+        latency_budget = self.estimate_reaction_budget(data, obs, forward_latency_s)
         endstate = flat["end_state_b"].detach().cpu().numpy()
         utility = flat["utility_score"].detach().cpu().numpy()
         utility_base = flat.get("utility_base")
@@ -455,8 +503,32 @@ class OARMNet:
         traj_time = flat["traj_time"].detach().cpu().numpy()
         candidate_type = flat.get("candidate_type")
         candidate_type = None if candidate_type is None else candidate_type.detach().cpu().numpy()
-        margin_pred = flat["margin_pred"].detach().cpu().numpy()
-        risk_prob = torch.sigmoid(flat["risk_logit"]).detach().cpu().numpy()
+        risk_logit_prob = torch.sigmoid(flat["risk_logit"]).detach().cpu().numpy()
+        margin_pred_t = flat["margin_pred"]
+        risk_prob_t = torch.sigmoid(flat["risk_logit"])
+        risk_source = "risk_logit"
+        reaction_window_mean_t = flat.get("reaction_window_mean")
+        reaction_window_logvar_t = flat.get("reaction_window_logvar")
+        validity_logit_t = flat.get("validity_logit")
+        if self.enable_latency_aware_risk and reaction_window_mean_t is not None and reaction_window_logvar_t is not None:
+            risk_prob_t = risk_probability_from_window(
+                reaction_window_mean_t,
+                reaction_window_logvar_t,
+                latency_budget.tau_total_s,
+            )
+            margin_pred_t = reaction_window_mean_t - float(latency_budget.tau_total_s)
+            risk_source = "reaction_window_latency"
+        elif self.enable_latency_aware_risk and not self.warned_latency_risk_unavailable:
+            rospy.logwarn(
+                "Latency-aware risk was requested, but this policy did not return reaction_window_mean/logvar; "
+                "falling back to risk_logit."
+            )
+            self.warned_latency_risk_unavailable = True
+        margin_pred = margin_pred_t.detach().cpu().numpy()
+        risk_prob = risk_prob_t.detach().cpu().numpy()
+        reaction_window_mean = None if reaction_window_mean_t is None else reaction_window_mean_t.detach().cpu().numpy()
+        reaction_window_logvar = None if reaction_window_logvar_t is None else reaction_window_logvar_t.detach().cpu().numpy()
+        validity_prob = None if validity_logit_t is None else torch.sigmoid(validity_logit_t).detach().cpu().numpy()
         yield_logit = flat["yield_logit"] if "yield_logit" in flat else flat["backup_logit"]
         yield_prob = torch.sigmoid(yield_logit).detach().cpu().numpy()
         yaw_terminal = flat["yaw_terminal"].detach().cpu().numpy()
@@ -556,6 +628,12 @@ class OARMNet:
             utility_base,
             utility_delta,
             altitude_violation,
+            risk_source=risk_source,
+            risk_logit_prob=risk_logit_prob,
+            reaction_window_mean=reaction_window_mean,
+            reaction_window_logvar=reaction_window_logvar,
+            validity_prob=validity_prob,
+            latency_budget=latency_budget,
             inference_latency_ms=(forward_end - forward_start) * 1000.0,
             candidate_decode_ms=(time3 - forward_end) * 1000.0,
             selection_ms=(time4 - time3) * 1000.0,
@@ -1302,10 +1380,16 @@ class OARMNet:
         utility_base,
         utility_delta,
         altitude_violation,
-        inference_latency_ms,
-        candidate_decode_ms,
-        selection_ms,
-        total_latency_ms,
+        risk_source="risk_logit",
+        risk_logit_prob=None,
+        reaction_window_mean=None,
+        reaction_window_logvar=None,
+        validity_prob=None,
+        latency_budget=None,
+        inference_latency_ms=0.0,
+        candidate_decode_ms=0.0,
+        selection_ms=0.0,
+        total_latency_ms=0.0,
     ):
         if self.log_jsonl_file is None:
             return
@@ -1370,6 +1454,9 @@ class OARMNet:
             "enable_yield_candidates": bool(self.config.get("enable_yield_candidates", False)),
             "deployed_yaw_mode": self.config.get("deployed_yaw_mode", "goal"),
             "selector_experiment": bool(self.selector_experiment),
+            "enable_rm_critic": bool(self.enable_rm_critic),
+            "enable_latency_aware_risk": bool(self.enable_latency_aware_risk),
+            "risk_source": risk_source,
             "oarm_margin_alpha": float(self.oarm_margin_alpha),
             "oarm_risk_beta": float(self.oarm_risk_beta),
             "agile_progress_weight": float(self.agile_progress_weight),
@@ -1433,6 +1520,11 @@ class OARMNet:
             "selected_margin_pred": float(margin_pred[action_id]),
             "reaction_margin": float(margin_pred[action_id]),
             "selected_risk_prob": float(risk_prob[action_id]),
+            "selected_risk_logit_prob": None if risk_logit_prob is None else float(risk_logit_prob[action_id]),
+            "selected_reaction_window_pred": None if reaction_window_mean is None else float(reaction_window_mean[action_id]),
+            "selected_reaction_window_logvar": None if reaction_window_logvar is None else float(reaction_window_logvar[action_id]),
+            "selected_reaction_window_std": None if reaction_window_logvar is None else float(np.exp(0.5 * reaction_window_logvar[action_id])),
+            "selected_validity_prob": None if validity_prob is None else float(validity_prob[action_id]),
             "selected_yield_prob": float(yield_prob[action_id]),
             "yaw0": float(self.last_yaw),
             "selected_yaw_terminal": float(yaw_terminal[action_id]),
@@ -1476,6 +1568,10 @@ class OARMNet:
             "uses_privileged_online": False,
             "mapless_online_inference": True,
         }
+        if latency_budget is not None:
+            for key, value in latency_budget.to_dict().items():
+                log_key = "latency_model_inference_latency_ms" if key == "inference_latency_ms" else key
+                row[log_key] = float(value)
         if self.log_candidate_table:
             candidates = []
             for i in range(int(len(utility))):
@@ -1492,6 +1588,10 @@ class OARMNet:
                     "selection_score": float(selection_score[i]),
                     "margin_pred": float(margin_pred[i]),
                     "risk_prob": float(risk_prob[i]),
+                    "risk_logit_prob": None if risk_logit_prob is None else float(risk_logit_prob[i]),
+                    "reaction_window_pred": None if reaction_window_mean is None else float(reaction_window_mean[i]),
+                    "reaction_window_logvar": None if reaction_window_logvar is None else float(reaction_window_logvar[i]),
+                    "validity_prob": None if validity_prob is None else float(validity_prob[i]),
                     "yield_prob": float(yield_prob[i]),
                     "yaw_terminal": float(yaw_terminal[i]),
                     "end_offset_w": cand_end_offset.astype(float).tolist(),
@@ -1616,6 +1716,18 @@ def parser():
     )
     parser.add_argument("--oarm-margin-alpha", type=float, default=0.0, help="A2 selector: add alpha * predicted reaction margin to selection score")
     parser.add_argument("--oarm-risk-beta", type=float, default=0.0, help="A2 selector: subtract beta * predicted risk probability from selection score")
+    parser.add_argument("--enable-rm-critic", action="store_true", default=None, help="enable the probabilistic reaction-window critic; omitted means auto-detect from checkpoint")
+    latency_risk_group = parser.add_mutually_exclusive_group()
+    latency_risk_group.add_argument("--enable-latency-aware-risk", dest="enable_latency_aware_risk", action="store_true", default=None)
+    latency_risk_group.add_argument("--disable-latency-aware-risk", dest="enable_latency_aware_risk", action="store_false")
+    parser.add_argument("--latency-brake-accel-mps2", type=float, default=6.0)
+    parser.add_argument("--latency-window", type=int, default=128)
+    parser.add_argument("--latency-quantile", type=float, default=0.95)
+    parser.add_argument("--sensor-age-ms", type=float, default=0.0)
+    parser.add_argument("--queue-latency-ms", type=float, default=0.0)
+    parser.add_argument("--selector-latency-ms", type=float, default=0.0)
+    parser.add_argument("--control-latency-ms", type=float, default=20.0)
+    parser.add_argument("--actuation-latency-ms", type=float, default=30.0)
     parser.add_argument("--progress-bonus-weight", type=float, default=0.0)
     parser.add_argument("--agile-progress-weight", type=float, default=0.0)
     parser.add_argument("--agile-goal-distance-weight", type=float, default=0.0)
@@ -1706,6 +1818,16 @@ if __name__ == "__main__":
         "fast_sim_mode": args.fast_sim_mode,
         "oarm_margin_alpha": args.oarm_margin_alpha,
         "oarm_risk_beta": args.oarm_risk_beta,
+        "enable_rm_critic": args.enable_rm_critic,
+        "enable_latency_aware_risk": args.enable_latency_aware_risk,
+        "latency_brake_accel_mps2": args.latency_brake_accel_mps2,
+        "latency_window": args.latency_window,
+        "latency_quantile": args.latency_quantile,
+        "sensor_age_ms": args.sensor_age_ms,
+        "queue_latency_ms": args.queue_latency_ms,
+        "selector_latency_ms": args.selector_latency_ms,
+        "control_latency_ms": args.control_latency_ms,
+        "actuation_latency_ms": args.actuation_latency_ms,
         "progress_bonus_weight": args.progress_bonus_weight,
         "agile_progress_weight": args.agile_progress_weight,
         "agile_goal_distance_weight": args.agile_goal_distance_weight,

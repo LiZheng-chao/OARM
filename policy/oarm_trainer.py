@@ -57,6 +57,7 @@ class OARMTrainer:
         train_risk_point_guidance=oarm_cfg.train_risk_point_guidance,
         train_reaction_margin=oarm_cfg.train_reaction_margin,
         train_margin_ranking=oarm_cfg.train_margin_ranking,
+        train_probabilistic_rm_critic=oarm_cfg.train_probabilistic_rm_critic,
         train_yaw_visibility=oarm_cfg.train_yaw_visibility,
         deployed_yaw_mode=oarm_cfg.deployed_yaw_mode,
         risk_label_source=oarm_cfg.risk_label_source,
@@ -146,6 +147,7 @@ class OARMTrainer:
         self.train_risk_point_guidance = train_risk_point_guidance
         self.train_reaction_margin = train_reaction_margin
         self.train_margin_ranking = bool(train_margin_ranking)
+        self.train_probabilistic_rm_critic = bool(train_probabilistic_rm_critic)
         self.train_yaw_visibility = bool(train_yaw_visibility)
         self.deployed_yaw_mode = deployed_yaw_mode
         self.risk_label_source = risk_label_source
@@ -233,6 +235,7 @@ class OARMTrainer:
             backbone_mode=self.backbone_mode,
             enable_yield_candidates=self.enable_yield_candidates,
             utility_delta_scale=self.yopo_preserve_utility_delta_scale,
+            enable_rm_critic=self.train_probabilistic_rm_critic,
         ).to(self.device)
         if checkpoint_path and init_from_a1_checkpoint_path:
             raise ValueError("Use either --checkpoint for same-structure resume or --init-from-a1-checkpoint for A1->A3h initialization, not both")
@@ -268,6 +271,7 @@ class OARMTrainer:
                 enable_risk_point_guidance=train_risk_point_guidance,
                 enable_reaction_margin=train_reaction_margin,
                 enable_margin_ranking=self.train_margin_ranking,
+                enable_probabilistic_rm_critic=self.train_probabilistic_rm_critic,
                 enable_yaw_visibility=self.train_yaw_visibility,
                 deployed_yaw_mode=self.deployed_yaw_mode,
                 enable_yield_feasibility=self.train_yield_feasibility,
@@ -609,6 +613,7 @@ class OARMTrainer:
             oracle_ce_loss = torch.zeros((), device=self.device)
             geometry_ce_loss = torch.zeros((), device=self.device)
             brake_gate_loss = torch.zeros((), device=self.device)
+            rm_critic_loss = loss_dict.get("rm_critic_loss", torch.zeros((), device=self.device))
             oracle_ce_pair_rate = torch.zeros((), device=self.device)
             oracle_ce_top1_acc = torch.zeros((), device=self.device)
             oracle_ce_target_margin_mean = torch.zeros((), device=self.device)
@@ -913,6 +918,7 @@ class OARMTrainer:
                 + oracle_ce_loss
                 + geometry_ce_loss
                 + brake_gate_loss
+                + rm_critic_loss
             )
         return loss_dict
 
@@ -1171,7 +1177,9 @@ class OARMTrainer:
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             if self.train_yield_head_only:
                 raise ValueError(f"--train-yield-head-only is not compatible with candidate_mode={self.candidate_mode}")
-            if self.candidate_mode == "a4_preserve_brake":
+            if self.train_probabilistic_rm_critic:
+                train_prefixes = ["preserve_network.rm_critic."]
+            elif self.candidate_mode == "a4_preserve_brake":
                 train_prefixes = ["preserve_network.brake_gate_head."]
             else:
                 train_prefixes = ["preserve_network.margin_risk_head."]
@@ -1219,14 +1227,16 @@ class OARMTrainer:
             raise RuntimeError("No trainable OARM parameters were configured")
         if self.candidate_mode not in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             return
-        allowed_prefixes = ("preserve_network.margin_risk_head.", "preserve_network.rerank_head.", "preserve_network.brake_gate_head.")
+        allowed_prefixes = ("preserve_network.margin_risk_head.", "preserve_network.rerank_head.", "preserve_network.brake_gate_head.", "preserve_network.rm_critic.")
         bad = [name for name in trainable if not name.startswith(allowed_prefixes)]
         if bad:
             raise RuntimeError(
                 f"{self.candidate_mode} must train only preserve auxiliary heads; unexpected trainable parameters: "
                 + ", ".join(bad)
             )
-        if self.candidate_mode == "yopo_preserve":
+        if self.train_probabilistic_rm_critic:
+            required_prefixes = ("preserve_network.rm_critic.",)
+        elif self.candidate_mode == "yopo_preserve":
             required_prefixes = ("preserve_network.margin_risk_head.",)
         elif self.candidate_mode == "a4_preserve_brake":
             required_prefixes = ("preserve_network.brake_gate_head.",)

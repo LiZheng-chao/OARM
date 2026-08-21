@@ -46,6 +46,10 @@ class OARMCandidate:
     yaw_anchor: torch.Tensor = None
     utility_base: torch.Tensor = None
     utility_delta: torch.Tensor = None
+    reaction_window_mean: torch.Tensor = None
+    reaction_window_logvar: torch.Tensor = None
+    validity_logit: torch.Tensor = None
+    rm_insufficient_logit: torch.Tensor = None
 
     def flatten(self) -> Dict[str, torch.Tensor]:
         b, _, v, h = self.end_state_b.shape
@@ -72,4 +76,12 @@ class OARMCandidate:
             flat["utility_base"] = self.utility_base.reshape(b * n)
         if self.utility_delta is not None:
             flat["utility_delta"] = self.utility_delta.reshape(b * n)
+        if self.reaction_window_mean is not None:
+            flat["reaction_window_mean"] = self.reaction_window_mean.permute(0, 2, 3, 1).reshape(b * n)
+        if self.reaction_window_logvar is not None:
+            flat["reaction_window_logvar"] = self.reaction_window_logvar.permute(0, 2, 3, 1).reshape(b * n)
+        if self.validity_logit is not None:
+            flat["validity_logit"] = self.validity_logit.permute(0, 2, 3, 1).reshape(b * n)
+        if self.rm_insufficient_logit is not None:
+            flat["rm_insufficient_logit"] = self.rm_insufficient_logit.permute(0, 2, 3, 1).reshape(b * n)
         return flat

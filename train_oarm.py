@@ -25,6 +25,7 @@ TRAINING_OPTION_KEYS = (
     "train_risk_point_guidance",
     "train_reaction_margin",
     "train_margin_ranking",
+    "train_probabilistic_rm_critic",
     "train_yaw_visibility",
     "deployed_yaw_mode",
     "risk_label_source",
@@ -93,7 +94,7 @@ def parser():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--stage",
-        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "a4a", "full"],
+        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "a4a", "oarm3_s2_prob_rm", "full"],
         default="v0",
         help="named ablation preset; CLI flags and --config override it",
     )
@@ -121,6 +122,7 @@ def parser():
     p.add_argument("--train-occlusion-risk", action="store_true")
     p.add_argument("--train-reaction-margin", action="store_true")
     p.add_argument("--train-margin-ranking", action="store_true")
+    p.add_argument("--train-probabilistic-rm-critic", action="store_true")
     p.add_argument("--train-yaw-visibility", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
     p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="")
@@ -206,6 +208,7 @@ def resolve_training_options(args):
         "train_risk_point_guidance": args.train_risk_point_guidance,
         "train_reaction_margin": args.train_reaction_margin,
         "train_margin_ranking": args.train_margin_ranking,
+        "train_probabilistic_rm_critic": args.train_probabilistic_rm_critic,
         "train_yaw_visibility": args.train_yaw_visibility,
         "use_weak_margin_label": args.use_weak_margin_label,
         "train_backup_feasibility": args.train_backup_feasibility,

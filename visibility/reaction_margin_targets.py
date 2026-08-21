@@ -41,7 +41,18 @@ def generate_reaction_margin_labels(
         current = flat_labels["reaction_margin"]
         if current.shape[0] == flat["traj_time"].shape[0]:
             return flat_labels
-        for key in ("reaction_margin", "reaction_margin_valid", "reaction_margin_censored"):
+        for key in (
+            "reaction_margin",
+            "reaction_margin_valid",
+            "reaction_margin_censored",
+            "reaction_window",
+            "rm_event_valid",
+            "rm_right_censored",
+            "rm_no_entry",
+            "risk_visible_at_t0",
+            "critical_risk_point_id",
+            "critical_risk_weight",
+        ):
             flat_labels.pop(key, None)
     if "risk_points_w" not in flat_labels:
         return flat_labels
@@ -96,7 +107,15 @@ def generate_reaction_margin_labels(
     flat_labels["reaction_margin"] = margin_labels["reaction_margin_softmin"].detach()
     flat_labels["reaction_margin_valid"] = margin_labels["reaction_margin_valid"].detach()
     flat_labels["reaction_margin_censored"] = margin_labels["reaction_margin_censored"].detach()
+    flat_labels["reaction_window"] = margin_labels["reaction_window_softmin"].detach()
+    flat_labels["rm_event_valid"] = margin_labels["rm_event_valid_gt"].detach()
+    flat_labels["rm_right_censored"] = margin_labels["rm_right_censored_gt"].detach()
+    flat_labels["rm_no_entry"] = margin_labels["rm_no_entry_gt"].detach()
+    flat_labels["risk_visible_at_t0"] = margin_labels["risk_visible_at_t0_gt"].detach()
+    flat_labels["critical_risk_point_id"] = margin_labels["critical_risk_point_id"].detach()
+    flat_labels["critical_risk_weight"] = margin_labels["critical_risk_weight"].detach()
     if include_diagnostics:
         flat_labels["reaction_margin_min"] = margin_labels["reaction_margin_min"].detach()
+        flat_labels["reaction_window_min"] = margin_labels["reaction_window_min"].detach()
         flat_labels["reaction_margin_arrival_time_min"] = margin_labels["arrival_time_min"].detach()
     return flat_labels

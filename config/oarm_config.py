@@ -67,6 +67,11 @@ class OARMConfig:
     train_risk_point_guidance: bool = False
     train_reaction_margin: bool = False
     train_margin_ranking: bool = False
+    train_probabilistic_rm_critic: bool = False
+    rm_critic_hidden_dim: int = 128
+    rm_critic_hazard_bins: int = 0
+    rm_critic_window_nll_weight: float = 1.0
+    rm_critic_validity_bce_weight: float = 0.25
     train_yaw_visibility: bool = False
     deployed_yaw_mode: str = "goal"
     use_weak_margin_label: bool = False

@@ -88,10 +88,13 @@ class OARMLatencyModel:
             speed_parallel_mps = self._norm3(velocity_body_mps or ())
         speed_parallel_mps = max(float(speed_parallel_mps), 0.0)
         sensor_age = self.sensor_age_s if sensor_age_s is None else max(float(sensor_age_s), 0.0)
-        queue = self.queue_history.quantile(self.quantile) if queue_latency_s is None else max(float(queue_latency_s), 0.0)
-        inference = self.inference_history.quantile(self.quantile) if inference_latency_s is None else max(float(inference_latency_s), 0.0)
+        queue_p95 = self.queue_history.quantile(self.quantile)
+        inference_p95 = self.inference_history.quantile(self.quantile)
+        control_p95 = self.control_history.quantile(self.quantile)
+        queue = queue_p95 if queue_latency_s is None else max(max(float(queue_latency_s), 0.0), queue_p95)
+        inference = inference_p95 if inference_latency_s is None else max(max(float(inference_latency_s), 0.0), inference_p95)
         selector = self.selector_latency_s if selector_latency_s is None else max(float(selector_latency_s), 0.0)
-        control = self.control_history.quantile(self.quantile) if control_latency_s is None else max(float(control_latency_s), 0.0)
+        control = control_p95 if control_latency_s is None else max(max(float(control_latency_s), 0.0), control_p95)
         actuation = self.actuation_latency_s if actuation_latency_s is None else max(float(actuation_latency_s), 0.0)
         tau_fixed = sensor_age + queue + inference + selector + control + actuation
         maneuver = speed_parallel_mps / self.brake_accel_mps2

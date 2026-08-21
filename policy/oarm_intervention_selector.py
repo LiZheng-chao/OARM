@@ -49,10 +49,22 @@ class OARMInterventionSelector:
     def __init__(self, config: InterventionSelectorConfig = None):
         self.config = config or InterventionSelectorConfig()
 
-    def select(self, risk_upper_bound: Iterable[float], yopo_cost: Optional[Iterable[float]] = None, geometry_admissible: Optional[Iterable[bool]] = None, deviation_from_top1: Optional[Iterable[float]] = None, probe_candidates: Optional[List[Dict[str, Any]]] = None, brake_feasible: bool = True, top1_index: int = 0, latency_spike: bool = False, high_uncertainty: bool = False) -> InterventionSelection:
+    def select(
+        self,
+        risk_upper_bound: Iterable[float],
+        yopo_cost: Optional[Iterable[float]] = None,
+        geometry_admissible: Optional[Iterable[bool]] = None,
+        deviation_from_top1: Optional[Iterable[float]] = None,
+        probe_candidates: Optional[List[Dict[str, Any]]] = None,
+        brake_feasible: bool = True,
+        brake_risk_upper_bound: Optional[float] = None,
+        top1_index: int = 0,
+        latency_spike: bool = False,
+        high_uncertainty: bool = False,
+    ) -> InterventionSelection:
         risks = [float(v) for v in _as_list(risk_upper_bound)]
         if not risks:
-            return self._brake(None, None, BRAKE_NO_SAFE_CANDIDATE, brake_feasible)
+            return self._brake(None, None, BRAKE_NO_SAFE_CANDIDATE, brake_feasible, brake_risk_upper_bound)
         n = len(risks)
         top1_index = int(max(0, min(top1_index, n - 1)))
         admissible = [bool(v) for v in _as_list(geometry_admissible, n, True)]
@@ -60,9 +72,9 @@ class OARMInterventionSelector:
         deviation = [float(v) for v in _as_list(deviation_from_top1, n, 0.0)]
         risk_before = risks[top1_index]
         if latency_spike:
-            return self._brake(top1_index, risk_before, BRAKE_LATENCY_SPIKE, brake_feasible)
+            return self._brake(top1_index, risk_before, BRAKE_LATENCY_SPIKE, brake_feasible, brake_risk_upper_bound)
         if high_uncertainty:
-            return self._brake(top1_index, risk_before, BRAKE_HIGH_UNCERTAINTY, brake_feasible)
+            return self._brake(top1_index, risk_before, BRAKE_HIGH_UNCERTAINTY, brake_feasible, brake_risk_upper_bound)
         if admissible[top1_index] and risk_before <= self.config.delta_keep:
             return InterventionSelection(top1_index, "KEEP", KEEP_LOW_RISK, risk_before, risk_before, costs[top1_index])
         safe = [idx for idx, risk in enumerate(risks) if admissible[idx] and risk <= self.config.delta_safe]
@@ -73,7 +85,7 @@ class OARMInterventionSelector:
         probe = self._select_probe(probe_candidates or [], risk_before)
         if probe is not None:
             return probe
-        return self._brake(top1_index, risk_before, BRAKE_NO_SAFE_CANDIDATE, brake_feasible)
+        return self._brake(top1_index, risk_before, BRAKE_NO_SAFE_CANDIDATE, brake_feasible, brake_risk_upper_bound)
 
     def _select_probe(self, probe_candidates: List[Dict[str, Any]], risk_before: Optional[float]):
         feasible = []
@@ -94,5 +106,18 @@ class OARMInterventionSelector:
         return InterventionSelection(idx, "PROBE", PROBE_VISIBILITY_GAIN, risk_before, risk, score, dict(cand))
 
     @staticmethod
-    def _brake(top1_index: Optional[int], risk_before: Optional[float], reason: str, brake_feasible: bool) -> InterventionSelection:
-        return InterventionSelection(None, "BRAKE", reason, risk_before, 0.0 if brake_feasible else None, metadata={"brake_feasible": bool(brake_feasible), "top1_index": top1_index})
+    def _brake(
+        top1_index: Optional[int],
+        risk_before: Optional[float],
+        reason: str,
+        brake_feasible: bool,
+        brake_risk_upper_bound: Optional[float] = None,
+    ) -> InterventionSelection:
+        return InterventionSelection(
+            None,
+            "BRAKE",
+            reason,
+            risk_before,
+            None if brake_risk_upper_bound is None else float(brake_risk_upper_bound),
+            metadata={"brake_feasible": bool(brake_feasible), "top1_index": top1_index},
+        )
