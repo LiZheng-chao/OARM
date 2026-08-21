@@ -32,6 +32,7 @@ if YOPO_DIR not in sys.path:
 
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
+from OARM.policy.oarm_brake import deterministic_brake_endpoint
 from OARM.policy.oarm_latency_model import OARMLatencyModel
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration, calibrated_probability, risk_upper_bound
 from OARM.policy.oarm_rm_critic import risk_probability_from_window
@@ -110,6 +111,10 @@ class OARMNet:
         self.last_depth_emergency_stop = False
         self.last_depth_emergency_reason = None
         self.last_depth_emergency_target = None
+        self.last_deterministic_brake_stop = False
+        self.last_deterministic_brake_reason = None
+        self.last_deterministic_brake_terminal_speed = None
+        self.last_deterministic_brake_terminal_acc_norm = None
         self.last_selector_force_emergency_stop = False
         self.last_selector_force_emergency_reason = None
         self.last_stop_fallback_count = None
@@ -611,22 +616,33 @@ class OARMNet:
             start_acc = self.desire_acc
             if emergency_stop:
                 selected_time = float(np.clip(self.depth_emergency_traj_time, 0.1, 2.0))
-                emergency_target = start_pos + start_vel * selected_time * self.depth_emergency_distance_scale
-                goal_vec = self.goal - start_pos
-                goal_vec[2] = 0.0
-                goal_norm = float(np.linalg.norm(goal_vec))
-                if self.depth_emergency_retreat_distance > 0.0 and goal_norm > 1e-3:
-                    emergency_target -= (goal_vec / goal_norm) * self.depth_emergency_retreat_distance
-                target_z = self.goal[2] if self.depth_emergency_target_z is None else float(self.depth_emergency_target_z)
-                max_z_step = max(0.0, self.depth_emergency_z_rate) * selected_time
-                z_delta = float(np.clip(target_z - start_pos[2], -max_z_step, max_z_step))
-                emergency_target[2] = float(np.clip(start_pos[2] + z_delta, self.min_command_z, self.max_command_z))
-                self.last_depth_emergency_target = emergency_target.astype(float).tolist()
-                end_pos = emergency_target
-                end_vel = np.zeros(3, dtype=np.float32)
-                end_acc = np.zeros(3, dtype=np.float32)
+                end_pos, end_vel, end_acc = deterministic_brake_endpoint(
+                    start_pos,
+                    start_vel,
+                    self.goal,
+                    selected_time,
+                    distance_scale=self.depth_emergency_distance_scale,
+                    retreat_distance=self.depth_emergency_retreat_distance,
+                    target_z=self.depth_emergency_target_z,
+                    z_rate=self.depth_emergency_z_rate,
+                    min_command_z=self.min_command_z,
+                    max_command_z=self.max_command_z,
+                )
+                self.last_depth_emergency_target = end_pos.astype(float).tolist()
+                self.last_deterministic_brake_stop = True
+                self.last_deterministic_brake_reason = (
+                    self.last_depth_emergency_reason
+                    or self.last_selector_force_emergency_reason
+                    or (intervention.intervention_reason if intervention_brake and intervention is not None else "emergency_brake")
+                )
+                self.last_deterministic_brake_terminal_speed = float(np.linalg.norm(end_vel))
+                self.last_deterministic_brake_terminal_acc_norm = float(np.linalg.norm(end_acc))
             else:
                 self.last_depth_emergency_target = None
+                self.last_deterministic_brake_stop = False
+                self.last_deterministic_brake_reason = None
+                self.last_deterministic_brake_terminal_speed = None
+                self.last_deterministic_brake_terminal_acc_norm = None
                 end_pos = start_pos + endstate_w[action_id, :, 0]
                 if not self.yopo_preserve_mode:
                     end_pos[2] = float(np.clip(end_pos[2], self.min_command_z, self.max_command_z))
@@ -1534,6 +1550,10 @@ class OARMNet:
         selected_end_pos = start_pos + endstate_w[action_id, :, 0]
         selected_end_vel = endstate_w[action_id, :, 1]
         selected_end_acc = endstate_w[action_id, :, 2]
+        deterministic_brake = bool(self.last_deterministic_brake_stop)
+        commanded_end_pos = np.array(self.last_depth_emergency_target, dtype=np.float32) if deterministic_brake and self.last_depth_emergency_target is not None else selected_end_pos
+        commanded_end_vel = np.zeros(3, dtype=np.float32) if deterministic_brake else selected_end_vel
+        commanded_end_acc = np.zeros(3, dtype=np.float32) if deterministic_brake else selected_end_acc
         selected_goal_distance_drop = None
         selected_goal_distance_drop_rate = None
         selected_lateral_distance = None
@@ -1594,6 +1614,10 @@ class OARMNet:
             "depth_emergency_stop": bool(self.last_depth_emergency_stop),
             "depth_emergency_reason": self.last_depth_emergency_reason,
             "depth_emergency_target_w": self.last_depth_emergency_target,
+            "deterministic_brake_stop": bool(deterministic_brake),
+            "deterministic_brake_reason": self.last_deterministic_brake_reason,
+            "deterministic_brake_terminal_speed": self.last_deterministic_brake_terminal_speed,
+            "deterministic_brake_terminal_acc_norm": self.last_deterministic_brake_terminal_acc_norm,
             "selector_force_emergency_stop": bool(self.last_selector_force_emergency_stop),
             "selector_force_emergency_reason": self.last_selector_force_emergency_reason,
             "stop_fallback_count": self.last_stop_fallback_count,
@@ -1661,6 +1685,9 @@ class OARMNet:
             "selected_end_pos_w": selected_end_pos.astype(float).tolist(),
             "selected_end_vel_w": selected_end_vel.astype(float).tolist(),
             "selected_end_acc_w": selected_end_acc.astype(float).tolist(),
+            "commanded_end_pos_w": commanded_end_pos.astype(float).tolist(),
+            "commanded_end_vel_w": commanded_end_vel.astype(float).tolist(),
+            "commanded_end_acc_w": commanded_end_acc.astype(float).tolist(),
             "selected_goal_distance_drop": selected_goal_distance_drop,
             "selected_goal_distance_drop_rate": selected_goal_distance_drop_rate,
             "selected_lateral_distance": selected_lateral_distance,
@@ -1678,7 +1705,7 @@ class OARMNet:
             "arrive": bool(self.arrive),
             "first_arrival_time": self.first_arrival_time,
             "end_norm": float(np.linalg.norm(end_offset)),
-            "emergency_brake": bool(selected_type in {"brake", "yield"}),
+            "emergency_brake": bool(selected_type in {"brake", "yield"} or deterministic_brake),
             "collision": False,
             "collision_flag": False,
             "success": bool(self.arrive),

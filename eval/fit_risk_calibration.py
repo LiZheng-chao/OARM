@@ -1,0 +1,256 @@
+import argparse
+import json
+import math
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+
+import torch
+
+from OARM.policy.oarm_risk_calibrator import (
+    TemperatureCalibration,
+    binary_calibration_metrics,
+    fit_conformal_slack,
+    fit_temperature_scaling,
+    reliability_bins,
+)
+
+
+AUTO_LABEL_KEYS = (
+    "risk_label",
+    "label",
+    "rm_violation_gt",
+    "insufficient_reaction_gt",
+    "collision",
+    "collision_flag",
+    "selected_risk_label",
+    "selected_rm_violation_gt",
+    "selected_collision",
+)
+AUTO_RAW_RISK_KEYS = (
+    "raw_risk_prob",
+    "selected_raw_risk_prob",
+    "risk_logit_prob",
+    "selected_risk_logit_prob",
+    "risk_prob",
+    "selected_risk_prob",
+)
+AUTO_FUSED_RISK_KEYS = (
+    "validity_fused_risk_prob",
+    "selected_validity_fused_risk_prob",
+    "raw_risk_prob",
+    "selected_raw_risk_prob",
+    "risk_prob",
+    "selected_risk_prob",
+)
+AUTO_VALIDITY_KEYS = ("validity_prob", "selected_validity_prob")
+
+
+def _first_number(row: Dict, keys: Iterable[str]) -> Optional[float]:
+    for key in keys:
+        if key in row and row[key] is not None:
+            try:
+                value = float(row[key])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                return value
+    return None
+
+
+def _first_label(row: Dict, keys: Iterable[str]) -> Optional[float]:
+    for key in keys:
+        if key not in row or row[key] is None:
+            continue
+        value = row[key]
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return 1.0 if value >= 0.5 else 0.0
+    return None
+
+
+def _iter_rows(paths: Iterable[Path]) -> Iterator[Dict]:
+    for path in paths:
+        with path.open("r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{path}:{line_no} is not valid JSONL") from exc
+
+
+def _iter_records(row: Dict, include_candidates: bool) -> Iterator[Dict]:
+    if include_candidates and isinstance(row.get("candidates"), list):
+        parent = {key: value for key, value in row.items() if key != "candidates"}
+        for cand in row["candidates"]:
+            if isinstance(cand, dict):
+                merged = dict(parent)
+                merged.update(cand)
+                yield merged
+    else:
+        yield row
+
+
+def _extract_arrays(
+    paths: Iterable[Path],
+    label_key: Optional[str],
+    risk_key: Optional[str],
+    validity_key: Optional[str],
+    use_validity_fusion: bool,
+    validity_unknown_risk: float,
+    include_candidates: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, int]]:
+    labels: List[float] = []
+    risks: List[float] = []
+    stats = {"records_seen": 0, "records_used": 0, "missing_label": 0, "missing_risk": 0, "missing_validity": 0}
+    label_keys = (label_key,) if label_key else AUTO_LABEL_KEYS
+    risk_keys = (risk_key,) if risk_key else (AUTO_RAW_RISK_KEYS if use_validity_fusion else AUTO_FUSED_RISK_KEYS)
+    validity_keys = (validity_key,) if validity_key else AUTO_VALIDITY_KEYS
+
+    for row in _iter_rows(paths):
+        for record in _iter_records(row, include_candidates):
+            stats["records_seen"] += 1
+            label = _first_label(record, label_keys)
+            if label is None:
+                stats["missing_label"] += 1
+                continue
+            risk = _first_number(record, risk_keys)
+            if risk is None:
+                stats["missing_risk"] += 1
+                continue
+            risk = min(max(risk, 0.0), 1.0)
+            if use_validity_fusion:
+                validity = _first_number(record, validity_keys)
+                if validity is None:
+                    stats["missing_validity"] += 1
+                    continue
+                validity = min(max(validity, 0.0), 1.0)
+                risk = validity * risk + (1.0 - validity) * float(validity_unknown_risk)
+            labels.append(label)
+            risks.append(risk)
+            stats["records_used"] += 1
+
+    if not risks:
+        raise ValueError(f"no usable calibration records found; stats={stats}")
+    probs = torch.tensor(risks, dtype=torch.float32)
+    y = torch.tensor(labels, dtype=torch.float32)
+    return probs, y, stats
+
+
+def _logit_from_prob(probabilities: torch.Tensor) -> torch.Tensor:
+    probs = torch.clamp(probabilities.float(), min=1e-6, max=1.0 - 1e-6)
+    return torch.logit(probs)
+
+
+def fit_calibration_from_jsonl(
+    inputs: Iterable[str],
+    output: str,
+    label_key: Optional[str] = None,
+    risk_key: Optional[str] = None,
+    validity_key: Optional[str] = None,
+    use_validity_fusion: bool = True,
+    validity_unknown_risk: float = 0.5,
+    empirical_upper_alpha: float = 0.1,
+    n_bins: int = 15,
+    max_iter: int = 100,
+    include_candidates: bool = True,
+) -> Dict:
+    paths = [Path(p) for p in inputs]
+    probs, labels, stats = _extract_arrays(
+        paths,
+        label_key=label_key,
+        risk_key=risk_key,
+        validity_key=validity_key,
+        use_validity_fusion=use_validity_fusion,
+        validity_unknown_risk=validity_unknown_risk,
+        include_candidates=include_candidates,
+    )
+    logits = _logit_from_prob(probs)
+    before = binary_calibration_metrics(probs, labels, n_bins=n_bins)
+    calibration = fit_temperature_scaling(logits, labels, max_iter=max_iter)
+    calibrated = torch.sigmoid(logits / max(float(calibration.temperature), 1e-6))
+    after = binary_calibration_metrics(calibrated, labels, n_bins=n_bins)
+    slack = fit_conformal_slack(calibrated, labels, alpha=empirical_upper_alpha)
+    calibration.conformal_slack = float(slack)
+    calibration.fitted_on = ",".join(str(p) for p in paths)
+    upper = torch.clamp(calibrated + float(slack), min=0.0, max=1.0)
+    upper_metrics = binary_calibration_metrics(upper, labels, n_bins=n_bins)
+
+    payload = calibration.state_dict()
+    payload.update(
+        {
+            "calibration_version": "temperature_empirical_upper_v1",
+            "empirical_upper_alpha": float(empirical_upper_alpha),
+            "validity_fusion": bool(use_validity_fusion),
+            "validity_unknown_risk": float(validity_unknown_risk),
+            "sample_count": int(labels.numel()),
+            "metrics_before": before.__dict__,
+            "metrics_after_temperature": after.__dict__,
+            "metrics_after_empirical_upper": upper_metrics.__dict__,
+            "reliability_bins_after_temperature": reliability_bins(calibrated, labels, n_bins=n_bins),
+            "input_stats": stats,
+            "note": "conformal_slack is an empirical conservative risk upper slack, not a formal conformal guarantee unless the calibration split/protocol justifies it.",
+        }
+    )
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return payload
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Fit OARM risk temperature calibration and empirical conservative upper slack from JSONL logs.")
+    p.add_argument("--input", nargs="+", required=True, help="calibration JSONL file(s); rows may contain a candidates array")
+    p.add_argument("--output", required=True, help="output calibration JSON path")
+    p.add_argument("--label-key", default=None, help="override label key; default auto-detects common GT label fields")
+    p.add_argument("--risk-key", default=None, help="override risk probability key; default uses raw risk when validity fusion is enabled")
+    p.add_argument("--validity-key", default=None, help="override validity probability key")
+    validity = p.add_mutually_exclusive_group()
+    validity.add_argument("--use-validity-fusion", dest="use_validity_fusion", action="store_true", default=True)
+    validity.add_argument("--disable-validity-fusion", dest="use_validity_fusion", action="store_false")
+    p.add_argument("--validity-unknown-risk", type=float, default=0.5)
+    p.add_argument("--empirical-upper-alpha", type=float, default=0.1, help="quantile tail for conservative risk upper slack")
+    p.add_argument("--n-bins", type=int, default=15)
+    p.add_argument("--max-iter", type=int, default=100)
+    p.add_argument("--selected-only", action="store_true", help="fit on top-level selected row fields instead of per-candidate table")
+    return p
+
+
+def main() -> None:
+    args = parser().parse_args()
+    payload = fit_calibration_from_jsonl(
+        args.input,
+        args.output,
+        label_key=args.label_key,
+        risk_key=args.risk_key,
+        validity_key=args.validity_key,
+        use_validity_fusion=args.use_validity_fusion,
+        validity_unknown_risk=args.validity_unknown_risk,
+        empirical_upper_alpha=args.empirical_upper_alpha,
+        n_bins=args.n_bins,
+        max_iter=args.max_iter,
+        include_candidates=not args.selected_only,
+    )
+    summary = {
+        "output": args.output,
+        "sample_count": payload["sample_count"],
+        "temperature": payload["temperature"],
+        "empirical_conservative_upper_slack": payload["conformal_slack"],
+        "metrics_before": payload["metrics_before"],
+        "metrics_after_temperature": payload["metrics_after_temperature"],
+        "metrics_after_empirical_upper": payload["metrics_after_empirical_upper"],
+        "input_stats": payload["input_stats"],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

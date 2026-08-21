@@ -28,7 +28,9 @@ class TemperatureCalibration:
     @classmethod
     def from_file(cls, path: str) -> "TemperatureCalibration":
         with open(path, "r", encoding="utf-8") as f:
-            return cls(**json.load(f))
+            payload = json.load(f)
+        allowed = set(cls.__dataclass_fields__.keys())
+        return cls(**{key: value for key, value in payload.items() if key in allowed})
 
     def save(self, path: str):
         with open(path, "w", encoding="utf-8") as f:

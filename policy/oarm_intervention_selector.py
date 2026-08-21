@@ -77,7 +77,11 @@ class OARMInterventionSelector:
             return self._brake(top1_index, risk_before, BRAKE_HIGH_UNCERTAINTY, brake_feasible, brake_risk_upper_bound)
         if admissible[top1_index] and risk_before <= self.config.delta_keep:
             return InterventionSelection(top1_index, "KEEP", KEEP_LOW_RISK, risk_before, risk_before, costs[top1_index])
-        safe = [idx for idx, risk in enumerate(risks) if admissible[idx] and risk <= self.config.delta_safe]
+        safe = [
+            idx
+            for idx, risk in enumerate(risks)
+            if idx != top1_index and admissible[idx] and risk <= self.config.delta_safe
+        ]
         if safe:
             best = min(safe, key=lambda idx: costs[idx] + self.config.lambda_deviation * deviation[idx])
             score = costs[best] + self.config.lambda_deviation * deviation[best]

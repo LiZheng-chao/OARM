@@ -1,11 +1,18 @@
 import argparse
+import json
+import os
 import tempfile
 
+import numpy as np
 import torch
 
 from OARM.config import get_oarm_training_preset
+from OARM.eval.fit_risk_calibration import fit_calibration_from_jsonl
 from OARM.loss import OARMLoss
+from OARM.policy.oarm_brake import deterministic_brake_endpoint
+from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
 from OARM.policy.oarm_network import OARMNetwork
+from OARM.policy.oarm_risk_calibrator import TemperatureCalibration
 from OARM.policy.oarm_rm_critic import risk_probability_from_window
 from OARM.policy.oarm_trainer import OARMTrainer
 from OARM.train_oarm import parser, resolve_training_options
@@ -123,6 +130,77 @@ def check_loss_fail_fast():
         assert "reaction_window" in str(exc)
         return
     raise AssertionError("RM critic loss should fail when reaction_window labels are missing")
+
+
+def check_intervention_selector_excludes_top1_rerank():
+    selector = OARMInterventionSelector(InterventionSelectorConfig(delta_keep=0.10, delta_safe=0.20))
+    decision = selector.select(
+        risk_upper_bound=[0.15, 0.35, 0.40],
+        yopo_cost=[0.0, 0.1, 0.2],
+        geometry_admissible=[True, True, True],
+        top1_index=0,
+    )
+    assert decision.intervention_type == "BRAKE"
+    assert decision.intervention_reason == "BRAKE_NO_SAFE_CANDIDATE"
+
+    decision = selector.select(
+        risk_upper_bound=[0.15, 0.18, 0.40],
+        yopo_cost=[0.0, 0.3, 0.2],
+        geometry_admissible=[True, True, True],
+        top1_index=0,
+    )
+    assert decision.intervention_type == "RERANK"
+    assert decision.selected_index == 1
+
+
+def check_deterministic_brake_endpoint():
+    end_pos, end_vel, end_acc = deterministic_brake_endpoint(
+        start_pos=np.array([1.0, 2.0, 1.5], dtype=np.float32),
+        start_vel=np.array([2.0, 0.0, -0.5], dtype=np.float32),
+        goal=np.array([5.0, 2.0, 2.0], dtype=np.float32),
+        selected_time=0.5,
+        distance_scale=0.0,
+        retreat_distance=0.25,
+        target_z=1.8,
+        z_rate=0.4,
+        min_command_z=1.0,
+        max_command_z=2.0,
+    )
+    assert np.allclose(end_vel, np.zeros(3), atol=1e-6)
+    assert np.allclose(end_acc, np.zeros(3), atol=1e-6)
+    assert end_pos[0] < 1.0
+    assert 1.0 <= float(end_pos[2]) <= 2.0
+
+
+def check_fit_risk_calibration_cli_core():
+    rows = [
+        {
+            "candidates": [
+                {"raw_risk_prob": 0.05, "validity_prob": 0.9, "risk_label": 0},
+                {"raw_risk_prob": 0.80, "validity_prob": 0.8, "risk_label": 1},
+            ]
+        },
+        {
+            "candidates": [
+                {"raw_risk_prob": 0.20, "validity_prob": 0.7, "risk_label": 0},
+                {"raw_risk_prob": 0.65, "validity_prob": 0.9, "risk_label": 1},
+            ]
+        },
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, "calib.jsonl")
+        out_path = os.path.join(tmpdir, "calibration.json")
+        with open(in_path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        payload = fit_calibration_from_jsonl([in_path], out_path, empirical_upper_alpha=0.25, max_iter=10)
+        assert payload["sample_count"] == 4
+        assert payload["validity_fusion"] is True
+        assert payload["conformal_slack"] >= 0.0
+        loaded = TemperatureCalibration.from_file(out_path)
+        assert loaded.temperature == payload["temperature"]
+        assert loaded.conformal_slack == payload["conformal_slack"]
+        assert os.path.exists(out_path)
 
 
 def check_trainable_contract():
@@ -256,6 +334,9 @@ def main():
     check_checkpoint_metadata()
     check_labeler_window_semantics()
     check_loss_fail_fast()
+    check_intervention_selector_excludes_top1_rerank()
+    check_deterministic_brake_endpoint()
+    check_fit_risk_calibration_cli_core()
     check_trainable_contract()
     check_end_to_end_mini_batch()
     print("oarm3_s2_smoke ok")
