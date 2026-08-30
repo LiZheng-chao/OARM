@@ -13,6 +13,7 @@ class LatencyBudget:
     control_latency_s: float
     actuation_latency_s: float
     maneuver_latency_s: float
+    reaction_margin_s: float
     tau_fixed_s: float
     tau_total_s: float
     brake_distance_m: float
@@ -26,6 +27,7 @@ class LatencyBudget:
             "selector_latency_ms": 1000.0 * self.selector_latency_s,
             "control_latency_ms": 1000.0 * self.control_latency_s,
             "estimated_brake_time_ms": 1000.0 * self.maneuver_latency_s,
+            "reaction_margin_ms": 1000.0 * self.reaction_margin_s,
             "reaction_budget_ms": 1000.0 * self.tau_total_s,
         }
 
@@ -58,13 +60,14 @@ class RollingQuantile:
 class OARMLatencyModel:
     """Online reaction-time budget with a conservative braking term."""
 
-    def __init__(self, brake_accel_mps2: float = 6.0, sensor_age_s: float = 0.0, queue_latency_s: float = 0.0, selector_latency_s: float = 0.0, control_latency_s: float = 0.02, actuation_latency_s: float = 0.03, latency_window: int = 128, quantile: float = 0.95):
+    def __init__(self, brake_accel_mps2: float = 6.0, sensor_age_s: float = 0.0, queue_latency_s: float = 0.0, selector_latency_s: float = 0.0, control_latency_s: float = 0.02, actuation_latency_s: float = 0.03, reaction_margin_s: float = 0.0, latency_window: int = 128, quantile: float = 0.95):
         self.brake_accel_mps2 = max(float(brake_accel_mps2), 1e-3)
         self.sensor_age_s = max(float(sensor_age_s), 0.0)
         self.queue_latency_s = max(float(queue_latency_s), 0.0)
         self.selector_latency_s = max(float(selector_latency_s), 0.0)
         self.control_latency_s = max(float(control_latency_s), 0.0)
         self.actuation_latency_s = max(float(actuation_latency_s), 0.0)
+        self.reaction_margin_s = max(float(reaction_margin_s), 0.0)
         self.quantile = float(quantile)
         self.inference_history = RollingQuantile(latency_window, default=0.0)
         self.queue_history = RollingQuantile(latency_window, default=self.queue_latency_s)
@@ -82,7 +85,7 @@ class OARMLatencyModel:
         self.queue_history.update(queue_latency_s)
         self.control_history.update(control_latency_s)
 
-    def estimate(self, speed_parallel_mps: Optional[float] = None, velocity_body_mps: Optional[Iterable[float]] = None, inference_latency_s: Optional[float] = None, sensor_age_s: Optional[float] = None, queue_latency_s: Optional[float] = None, selector_latency_s: Optional[float] = None, control_latency_s: Optional[float] = None, actuation_latency_s: Optional[float] = None) -> LatencyBudget:
+    def estimate(self, speed_parallel_mps: Optional[float] = None, velocity_body_mps: Optional[Iterable[float]] = None, inference_latency_s: Optional[float] = None, sensor_age_s: Optional[float] = None, queue_latency_s: Optional[float] = None, selector_latency_s: Optional[float] = None, control_latency_s: Optional[float] = None, actuation_latency_s: Optional[float] = None, reaction_margin_s: Optional[float] = None) -> LatencyBudget:
         self.update(inference_latency_s, queue_latency_s, control_latency_s)
         if speed_parallel_mps is None:
             speed_parallel_mps = self._norm3(velocity_body_mps or ())
@@ -96,7 +99,9 @@ class OARMLatencyModel:
         selector = self.selector_latency_s if selector_latency_s is None else max(float(selector_latency_s), 0.0)
         control = control_p95 if control_latency_s is None else max(max(float(control_latency_s), 0.0), control_p95)
         actuation = self.actuation_latency_s if actuation_latency_s is None else max(float(actuation_latency_s), 0.0)
+        reaction_margin = self.reaction_margin_s if reaction_margin_s is None else max(float(reaction_margin_s), 0.0)
         tau_fixed = sensor_age + queue + inference + selector + control + actuation
         maneuver = speed_parallel_mps / self.brake_accel_mps2
-        brake_distance = speed_parallel_mps * tau_fixed + speed_parallel_mps * speed_parallel_mps / (2.0 * self.brake_accel_mps2)
-        return LatencyBudget(sensor_age, queue, inference, selector, control, actuation, maneuver, tau_fixed, tau_fixed + maneuver, brake_distance, speed_parallel_mps)
+        tau_total = tau_fixed + maneuver + reaction_margin
+        brake_distance = speed_parallel_mps * (tau_fixed + reaction_margin) + speed_parallel_mps * speed_parallel_mps / (2.0 * self.brake_accel_mps2)
+        return LatencyBudget(sensor_age, queue, inference, selector, control, actuation, maneuver, reaction_margin, tau_fixed, tau_total, brake_distance, speed_parallel_mps)

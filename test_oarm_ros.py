@@ -117,6 +117,7 @@ class OARMNet:
         self.brake_sample_count = int(self.config.get("brake_sample_count", 81))
         self.brake_time_growth = float(self.config.get("brake_time_growth", 1.25))
         self.brake_verified_risk_upper = float(self.config.get("brake_verified_risk_upper", self.config.get("risk_threshold_keep", 0.10)))
+        self.brake_require_visible_stop_distance = bool(self.config.get("brake_require_visible_stop_distance", True))
         self.last_depth_emergency_stop = False
         self.last_depth_emergency_reason = None
         self.last_depth_emergency_target = None
@@ -193,6 +194,7 @@ class OARMNet:
             selector_latency_s=float(self.config.get("selector_latency_ms", 0.0)) / 1000.0,
             control_latency_s=float(self.config.get("control_latency_ms", 20.0)) / 1000.0,
             actuation_latency_s=float(self.config.get("actuation_latency_ms", 30.0)) / 1000.0,
+            reaction_margin_s=float(self.config.get("reaction_budget_margin_ms", 0.0)) / 1000.0,
             latency_window=int(self.config.get("latency_window", 128)),
             quantile=float(self.config.get("latency_quantile", 0.95)),
         )
@@ -1037,7 +1039,14 @@ class OARMNet:
         geometry = self._evaluate_single_candidate_geometry(depth_m, endstate_w, traj_time)
         diagnostics = command.diagnostics.to_dict()
         dynamic_feasible = bool(diagnostics.get("feasible", False))
-        geometry_admissible = bool(geometry["geometry_admissible"])
+        visible_stop_margin = None
+        if geometry.get("depth_clearance") is not None:
+            visible_stop_margin = float(geometry["depth_clearance"]) - float(diagnostics.get("stop_distance", 0.0))
+        visible_stop_ok = True if visible_stop_margin is None else visible_stop_margin >= 0.0
+        geometry_admissible = bool(
+            geometry["geometry_admissible"]
+            and (visible_stop_ok or not self.brake_require_visible_stop_distance)
+        )
         risk_upper = float(self.brake_verified_risk_upper) if dynamic_feasible and geometry_admissible else 1.0
         info = {
             "command": command,
@@ -1045,6 +1054,8 @@ class OARMNet:
             "traj_time": traj_time,
             "dynamic_feasible": dynamic_feasible,
             "geometry_admissible": geometry_admissible,
+            "visible_stop_margin": visible_stop_margin,
+            "visible_stop_distance_ok": bool(visible_stop_ok),
             "feasible": bool(dynamic_feasible and geometry_admissible),
             "risk_upper_bound": risk_upper,
             "risk_source": "geometry_dynamic_proxy",
@@ -1717,6 +1728,7 @@ class OARMNet:
             "selector_lambda_risk": float(self.config.get("selector_lambda_risk", 1.0)),
             "use_calibrated_risk": bool(self.use_calibrated_risk),
             "use_validity_risk_fusion": bool(self.use_validity_risk_fusion),
+            "reaction_budget_margin_ms": float(self.config.get("reaction_budget_margin_ms", 0.0)),
             "validity_unknown_risk": float(self.validity_unknown_risk),
             "calibration_temperature": float(self.risk_calibration.temperature),
             "calibration_conformal_slack": float(self.risk_calibration.conformal_slack),
@@ -1747,6 +1759,7 @@ class OARMNet:
             "brake_max_tilt_deg": float(self.brake_max_tilt_deg),
             "brake_sample_count": int(self.brake_sample_count),
             "brake_verified_risk_upper": float(self.brake_verified_risk_upper),
+            "brake_require_visible_stop_distance": bool(self.brake_require_visible_stop_distance),
             "brake_candidate_info": self.last_brake_candidate_info,
             "brake_dynamic_feasible": None if self.last_brake_candidate_info is None else bool(self.last_brake_candidate_info.get("dynamic_feasible", False)),
             "brake_geometry_admissible": None if self.last_brake_candidate_info is None else bool(self.last_brake_candidate_info.get("geometry_admissible", False)),
@@ -1755,6 +1768,8 @@ class OARMNet:
             "brake_peak_accel": None if self.last_brake_candidate_info is None else float(self.last_brake_candidate_info.get("peak_accel", 0.0)),
             "brake_peak_jerk": None if self.last_brake_candidate_info is None else float(self.last_brake_candidate_info.get("peak_jerk", 0.0)),
             "brake_peak_tilt": None if self.last_brake_candidate_info is None else float(self.last_brake_candidate_info.get("peak_tilt_deg", 0.0)),
+            "brake_visible_stop_margin": None if self.last_brake_candidate_info is None or self.last_brake_candidate_info.get("visible_stop_margin") is None else float(self.last_brake_candidate_info.get("visible_stop_margin", 0.0)),
+            "brake_visible_stop_distance_ok": None if self.last_brake_candidate_info is None else bool(self.last_brake_candidate_info.get("visible_stop_distance_ok", False)),
             "depth_emergency_stop": bool(self.last_depth_emergency_stop),
             "depth_emergency_reason": self.last_depth_emergency_reason,
             "depth_emergency_target_w": self.last_depth_emergency_target,
@@ -1919,6 +1934,23 @@ class OARMNet:
                 if self.last_candidate_max_z is not None:
                     cand["max_z"] = float(self.last_candidate_max_z[i])
                 candidates.append(cand)
+            if self.last_brake_candidate_info is not None:
+                brake_info = dict(self.last_brake_candidate_info)
+                brake_info.pop("command", None)
+                brake_info.update(
+                    {
+                        "id": int(len(candidates)),
+                        "type": "brake_verified",
+                        "time": float(brake_info.get("duration", self.selected_traj_time)),
+                        "utility": None,
+                        "selection_score": None,
+                        "risk_prob": float(brake_info.get("risk_upper_bound", 1.0)),
+                        "risk_upper_bound": float(brake_info.get("risk_upper_bound", 1.0)),
+                        "dynamic_feasible": bool(brake_info.get("dynamic_feasible", False)),
+                        "geometry_admissible": bool(brake_info.get("geometry_admissible", False)),
+                    }
+                )
+                candidates.append(brake_info)
             row["candidates"] = candidates
             row["candidate_count"] = len(candidates)
         self.log_jsonl_file.write(json.dumps(row, sort_keys=True) + "\n")
@@ -2039,6 +2071,7 @@ def parser():
     parser.add_argument("--selector-latency-ms", type=float, default=0.0)
     parser.add_argument("--control-latency-ms", type=float, default=20.0)
     parser.add_argument("--actuation-latency-ms", type=float, default=30.0)
+    parser.add_argument("--reaction-budget-margin-ms", type=float, default=0.0)
     parser.add_argument("--calibration-file", type=str, default="")
     parser.add_argument("--use-calibrated-risk", action="store_true")
     parser.add_argument("--risk-conformal-slack", type=float, default=None)
@@ -2077,6 +2110,7 @@ def parser():
     parser.add_argument("--brake-max-tilt-deg", type=float, default=50.0)
     parser.add_argument("--brake-sample-count", type=int, default=81)
     parser.add_argument("--brake-verified-risk-upper", type=float, default=0.10)
+    parser.add_argument("--disable-brake-visible-stop-distance-check", dest="brake_require_visible_stop_distance", action="store_false", default=True)
     parser.add_argument("--brake-time-growth", type=float, default=1.25)
     parser.add_argument("--selector-min-traj-z", type=float, default=None)
     parser.add_argument("--selector-max-traj-z", type=float, default=None)
@@ -2158,6 +2192,7 @@ if __name__ == "__main__":
         "selector_latency_ms": args.selector_latency_ms,
         "control_latency_ms": args.control_latency_ms,
         "actuation_latency_ms": args.actuation_latency_ms,
+        "reaction_budget_margin_ms": args.reaction_budget_margin_ms,
         "calibration_file": args.calibration_file,
         "use_calibrated_risk": args.use_calibrated_risk,
         "risk_conformal_slack": args.risk_conformal_slack,
@@ -2196,6 +2231,7 @@ if __name__ == "__main__":
         "brake_max_tilt_deg": args.brake_max_tilt_deg,
         "brake_sample_count": args.brake_sample_count,
         "brake_verified_risk_upper": args.brake_verified_risk_upper,
+        "brake_require_visible_stop_distance": args.brake_require_visible_stop_distance,
         "brake_time_growth": args.brake_time_growth,
         "selector_min_traj_z": args.selector_min_traj_z,
         "selector_max_traj_z": args.selector_max_traj_z,

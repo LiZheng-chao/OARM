@@ -12,6 +12,7 @@ from OARM.eval.fit_risk_calibration import fit_calibration_from_jsonl
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_brake import constrained_brake_command, deterministic_brake_endpoint, evaluate_brake_trajectory
 from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
+from OARM.policy.oarm_latency_model import OARMLatencyModel
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration
 from OARM.policy.oarm_rm_critic import risk_probability_from_window
@@ -131,6 +132,23 @@ def check_loss_fail_fast():
         assert "reaction_window" in str(exc)
         return
     raise AssertionError("RM critic loss should fail when reaction_window labels are missing")
+
+
+def check_latency_budget_margin():
+    model = OARMLatencyModel(
+        brake_accel_mps2=2.0,
+        sensor_age_s=0.01,
+        queue_latency_s=0.02,
+        selector_latency_s=0.03,
+        control_latency_s=0.04,
+        actuation_latency_s=0.05,
+        reaction_margin_s=0.10,
+    )
+    budget = model.estimate(speed_parallel_mps=2.0, inference_latency_s=0.06)
+    assert abs(budget.maneuver_latency_s - 1.0) < 1e-6
+    assert abs(budget.tau_fixed_s - 0.21) < 1e-6
+    assert abs(budget.tau_total_s - 1.31) < 1e-6
+    assert budget.log_fields_ms()["reaction_margin_ms"] == 100.0
 
 
 def check_intervention_selector_excludes_top1_rerank():
@@ -266,22 +284,22 @@ def check_fit_risk_calibration_cli_core():
             "split": "calibration",
             "episode_id": "ep0",
             "candidates": [
-                {"raw_risk_prob": 0.05, "validity_prob": 0.9, "insufficient_reaction_gt": 0},
-                {"raw_risk_prob": 0.80, "validity_prob": 0.8, "insufficient_reaction_gt": 1},
+                {"raw_risk_prob": 0.05, "validity_prob": 0.9, "insufficient_reaction_gt": 0, "reaction_window_gt": 1.0, "reaction_budget_s": 0.5},
+                {"raw_risk_prob": 0.80, "validity_prob": 0.8, "insufficient_reaction_gt": 1, "reaction_window_gt": 0.2, "reaction_budget_s": 0.5},
             ]
         },
         {
             "split": "calibration",
             "episode_id": "ep1",
             "candidates": [
-                {"raw_risk_prob": 0.20, "validity_prob": 0.7, "insufficient_reaction_gt": 0},
-                {"raw_risk_prob": 0.65, "validity_prob": 0.9, "insufficient_reaction_gt": 1},
+                {"raw_risk_prob": 0.20, "validity_prob": 0.7, "insufficient_reaction_gt": 0, "reaction_window_gt": 0.8, "reaction_budget_s": 0.5},
+                {"raw_risk_prob": 0.65, "validity_prob": 0.9, "insufficient_reaction_gt": 1, "reaction_window_gt": 0.1, "reaction_budget_s": 0.5},
             ]
         },
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         in_path = os.path.join(tmpdir, "calib.jsonl")
-        out_path = os.path.join(tmpdir, "calibration.json")
+        out_path = os.path.join(tmpdir, "calibration_fit.json")
         with open(in_path, "w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
@@ -296,6 +314,13 @@ def check_fit_risk_calibration_cli_core():
         assert loaded.conformal_slack == payload["conformal_slack"]
         assert os.path.exists(out_path)
 
+        derived_path = os.path.join(tmpdir, "derived_calibration.json")
+        derived = fit_calibration_from_jsonl([in_path], derived_path, label_key="reaction_window_lt_budget", empirical_upper_alpha=0.25, max_iter=10)
+        assert derived["sample_count"] == 4
+        assert derived["label_key"] == "reaction_window_lt_budget"
+        assert derived["input_stats"]["missing_reaction_window"] == 0
+        assert derived["input_stats"]["missing_reaction_budget"] == 0
+
         bad_path = os.path.join(tmpdir, "bad_collision.jsonl")
         with open(bad_path, "w", encoding="utf-8") as f:
             f.write(json.dumps({"split": "calibration", "episode_id": "ep_bad", "candidates": [{"raw_risk_prob": 0.4, "validity_prob": 1.0, "collision": True}]}) + "\n")
@@ -305,6 +330,16 @@ def check_fit_risk_calibration_cli_core():
             assert "episode-level" in str(exc) or "candidate-level" in str(exc)
         else:
             raise AssertionError("candidate-level calibration must reject episode collision labels")
+
+        generic_path = os.path.join(tmpdir, "bad_generic_label.jsonl")
+        with open(generic_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"split": "calibration", "episode_id": "ep_generic", "candidates": [{"raw_risk_prob": 0.4, "validity_prob": 1.0, "risk_label": 1}]}) + "\n")
+        try:
+            fit_calibration_from_jsonl([generic_path], os.path.join(tmpdir, "bad_generic.json"), label_key="risk_label")
+        except ValueError as exc:
+            assert "too generic" in str(exc)
+        else:
+            raise AssertionError("candidate-level calibration must reject generic risk_label labels")
 
         missing_split = os.path.join(tmpdir, "missing_split.jsonl")
         with open(missing_split, "w", encoding="utf-8") as f:
@@ -334,6 +369,23 @@ def check_episode_split_manifest_guard():
         result = check_episode_splits(manifests)
         assert result["ok"] is True
         assert result["splits"]["calibration"]["episode_count"] == 1
+
+        data_path = os.path.join(tmpdir, "calibration_data.jsonl")
+        out_path = os.path.join(tmpdir, "calibration_fit_manifest.json")
+        with open(data_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"split": "calibration", "episode_id": "cal_ep", "map_id": "map_cal", "raw_risk_prob": 0.2, "validity_prob": 1.0, "reaction_window_gt": 1.0, "reaction_budget_s": 0.5}) + "\n")
+            f.write(json.dumps({"split": "calibration", "episode_id": "cal_ep", "map_id": "map_cal", "raw_risk_prob": 0.8, "validity_prob": 1.0, "reaction_window_gt": 0.1, "reaction_budget_s": 0.5}) + "\n")
+        payload = fit_calibration_from_jsonl(
+            [data_path],
+            out_path,
+            label_key="reaction_window_lt_budget",
+            train_manifest=manifests["train"],
+            val_manifest=manifests["val"],
+            calibration_manifest=manifests["calibration"],
+            test_manifest=manifests["test"],
+            max_iter=5,
+        )
+        assert payload["split_manifest_check"]["ok"] is True
 
         with open(manifests["test"], "w", encoding="utf-8") as f:
             json.dump({"episodes": [{"episode_id": "test_ep", "map_id": "map_cal"}]}, f)
@@ -476,6 +528,7 @@ def main():
     check_checkpoint_metadata()
     check_labeler_window_semantics()
     check_loss_fail_fast()
+    check_latency_budget_margin()
     check_intervention_selector_excludes_top1_rerank()
     check_deterministic_brake_endpoint()
     check_constrained_brake_trajectory()

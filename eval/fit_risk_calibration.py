@@ -6,6 +6,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 
+from OARM.eval.check_episode_splits import check_episode_splits
 from OARM.policy.oarm_risk_calibrator import (
     TemperatureCalibration,
     binary_calibration_metrics,
@@ -18,12 +19,13 @@ from OARM.policy.oarm_risk_calibrator import (
 CANDIDATE_LABEL_KEYS = (
     "insufficient_reaction_gt",
     "rm_violation_gt",
-    "risk_label",
-    "label",
-    "selected_risk_label",
     "selected_rm_violation_gt",
+    "reaction_window_lt_budget",
 )
+REACTION_WINDOW_KEYS = ("reaction_window_gt", "reaction_window", "selected_reaction_window_gt", "rm_reaction_window_gt")
+REACTION_BUDGET_KEYS = ("reaction_budget_s", "latency_tau_total_s", "tau_total_s", "reaction_budget", "selected_reaction_budget_s")
 EPISODE_LEVEL_LABEL_KEYS = {"collision", "collision_flag", "success", "success_flag", "arrive"}
+GENERIC_LABEL_KEYS = {"risk_label", "selected_risk_label", "label"}
 AUTO_RAW_RISK_KEYS = (
     "raw_risk_prob",
     "selected_raw_risk_prob",
@@ -114,6 +116,8 @@ def _extract_arrays(
     risks: List[float] = []
     if not label_key:
         raise ValueError("risk calibration requires an explicit candidate-level --label-key, e.g. insufficient_reaction_gt")
+    if label_key in GENERIC_LABEL_KEYS:
+        raise ValueError(f"{label_key!r} is too generic for calibration; use an explicit candidate-level RM label")
     if include_candidates and label_key in EPISODE_LEVEL_LABEL_KEYS:
         raise ValueError(f"{label_key!r} is episode-level and cannot be used for candidate-level calibration")
     stats = {
@@ -126,6 +130,8 @@ def _extract_arrays(
         "non_calibration_split": 0,
         "missing_episode_id": 0,
         "episode_count": 0,
+        "missing_reaction_window": 0,
+        "missing_reaction_budget": 0,
     }
     risk_keys = (risk_key,) if risk_key else (AUTO_RAW_RISK_KEYS if use_validity_fusion else AUTO_FUSED_RISK_KEYS)
     validity_keys = (validity_key,) if validity_key else AUTO_VALIDITY_KEYS
@@ -150,10 +156,22 @@ def _extract_arrays(
                     continue
             else:
                 episode_ids.add(str(episode_id))
-            label = _first_label(record, (label_key,))
-            if label is None:
-                stats["missing_label"] += 1
-                continue
+            if label_key == "reaction_window_lt_budget":
+                window = _first_number(record, REACTION_WINDOW_KEYS)
+                budget = _first_number(record, REACTION_BUDGET_KEYS)
+                if window is None:
+                    stats["missing_reaction_window"] += 1
+                if budget is None:
+                    stats["missing_reaction_budget"] += 1
+                if window is None or budget is None:
+                    stats["missing_label"] += 1
+                    continue
+                label = 1.0 if window < budget else 0.0
+            else:
+                label = _first_label(record, (label_key,))
+                if label is None:
+                    stats["missing_label"] += 1
+                    continue
             risk = _first_number(record, risk_keys)
             if risk is None:
                 stats["missing_risk"] += 1
@@ -206,8 +224,29 @@ def fit_calibration_from_jsonl(
     episode_key: str = "episode_id",
     require_split: bool = True,
     require_episode_id: bool = True,
+    train_manifest: Optional[str] = None,
+    val_manifest: Optional[str] = None,
+    calibration_manifest: Optional[str] = None,
+    test_manifest: Optional[str] = None,
+    ignore_map_overlap: bool = False,
 ) -> Dict:
     paths = [Path(p) for p in inputs]
+    split_check = None
+    manifests = {
+        "train": train_manifest,
+        "val": val_manifest,
+        "calibration": calibration_manifest,
+        "test": test_manifest,
+    }
+    if any(manifests.values()):
+        missing = [name for name, value in manifests.items() if not value]
+        if missing:
+            raise ValueError(f"split manifest check requires all four manifests; missing={missing}")
+        split_check = check_episode_splits(
+            {name: value for name, value in manifests.items() if value},
+            episode_key=episode_key,
+            check_maps=not ignore_map_overlap,
+        )
     probs, labels, stats = _extract_arrays(
         paths,
         label_key=label_key,
@@ -246,6 +285,7 @@ def fit_calibration_from_jsonl(
             "episode_key": episode_key,
             "require_split": bool(require_split),
             "require_episode_id": bool(require_episode_id),
+            "split_manifest_check": split_check,
             "sample_count": int(labels.numel()),
             "metrics_before": before.__dict__,
             "metrics_after_temperature": after.__dict__,
@@ -266,7 +306,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Fit OARM risk temperature calibration and empirical conservative upper slack from JSONL logs.")
     p.add_argument("--input", nargs="+", required=True, help="calibration JSONL file(s); rows may contain a candidates array")
     p.add_argument("--output", required=True, help="output calibration JSON path")
-    p.add_argument("--label-key", required=True, choices=CANDIDATE_LABEL_KEYS, help="candidate-level calibration label, e.g. insufficient_reaction_gt; episode-level collision labels are intentionally rejected")
+    p.add_argument("--label-key", required=True, choices=CANDIDATE_LABEL_KEYS, help="candidate-level calibration label; use reaction_window_lt_budget to derive y=1[reaction_window < tau]")
     p.add_argument("--risk-key", default=None, help="override risk probability key; default uses raw risk when validity fusion is enabled")
     p.add_argument("--validity-key", default=None, help="override validity probability key")
     validity = p.add_mutually_exclusive_group()
@@ -282,6 +322,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--episode-key", default="episode_id")
     p.add_argument("--allow-missing-split", action="store_true", help="ad-hoc smoke only; formal calibration should keep split metadata")
     p.add_argument("--allow-missing-episode-id", action="store_true", help="ad-hoc smoke only; formal calibration should keep episode metadata")
+    p.add_argument("--train-manifest", default=None)
+    p.add_argument("--val-manifest", default=None)
+    p.add_argument("--calibration-manifest", default=None)
+    p.add_argument("--test-manifest", default=None)
+    p.add_argument("--ignore-map-overlap", action="store_true")
     return p
 
 
@@ -304,6 +349,11 @@ def main() -> None:
         episode_key=args.episode_key,
         require_split=not args.allow_missing_split,
         require_episode_id=not args.allow_missing_episode_id,
+        train_manifest=args.train_manifest,
+        val_manifest=args.val_manifest,
+        calibration_manifest=args.calibration_manifest,
+        test_manifest=args.test_manifest,
+        ignore_map_overlap=args.ignore_map_overlap,
     )
     summary = {
         "output": args.output,
