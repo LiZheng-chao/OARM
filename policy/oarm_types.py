@@ -50,6 +50,8 @@ class OARMCandidate:
     reaction_window_logvar: torch.Tensor = None
     validity_logit: torch.Tensor = None
     rm_insufficient_logit: torch.Tensor = None
+    zero_window_logit: torch.Tensor = None
+    hazard_logits: torch.Tensor = None
 
     def flatten(self) -> Dict[str, torch.Tensor]:
         b, _, v, h = self.end_state_b.shape
@@ -84,4 +86,8 @@ class OARMCandidate:
             flat["validity_logit"] = self.validity_logit.permute(0, 2, 3, 1).reshape(b * n)
         if self.rm_insufficient_logit is not None:
             flat["rm_insufficient_logit"] = self.rm_insufficient_logit.permute(0, 2, 3, 1).reshape(b * n)
+        if self.zero_window_logit is not None:
+            flat["zero_window_logit"] = self.zero_window_logit.permute(0, 2, 3, 1).reshape(b * n)
+        if self.hazard_logits is not None:
+            flat["hazard_logits"] = self.hazard_logits.permute(0, 2, 3, 1).reshape(b * n, self.hazard_logits.shape[1])
         return flat

@@ -26,6 +26,10 @@ TRAINING_OPTION_KEYS = (
     "train_reaction_margin",
     "train_margin_ranking",
     "train_probabilistic_rm_critic",
+    "rm_critic_hazard_bins",
+    "rm_critic_hazard_max_time_s",
+    "rm_critic_zero_bce_weight",
+    "rm_critic_hazard_bce_weight",
     "train_yaw_visibility",
     "deployed_yaw_mode",
     "risk_label_source",
@@ -123,6 +127,10 @@ def parser():
     p.add_argument("--train-reaction-margin", action="store_true")
     p.add_argument("--train-margin-ranking", action="store_true")
     p.add_argument("--train-probabilistic-rm-critic", action="store_true")
+    p.add_argument("--rm-critic-hazard-bins", type=int, default=None)
+    p.add_argument("--rm-critic-hazard-max-time-s", type=float, default=None)
+    p.add_argument("--rm-critic-zero-bce-weight", type=float, default=None)
+    p.add_argument("--rm-critic-hazard-bce-weight", type=float, default=None)
     p.add_argument("--train-yaw-visibility", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="")
     p.add_argument("--risk-label-source", choices=["proxy", "proxy_esdf", "gt_pointcloud"], default="")
@@ -249,6 +257,10 @@ def resolve_training_options(args):
         "risk_assoc_distance_m",
         "risk_assoc_sigma_m",
         "risk_arrival_radius_m",
+        "rm_critic_hazard_bins",
+        "rm_critic_hazard_max_time_s",
+        "rm_critic_zero_bce_weight",
+        "rm_critic_hazard_bce_weight",
         "yopo_preserve_unsafe_clearance_m",
         "yopo_preserve_safe_clearance_m",
     ):

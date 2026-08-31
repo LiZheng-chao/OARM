@@ -3,7 +3,7 @@ from torch import nn
 
 from OARM.config import oarm_cfg
 from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
-from OARM.policy.oarm_rm_critic import CandidateRMCritic, risk_logit_from_window
+from OARM.policy.oarm_rm_critic import CandidateRMCritic, risk_logit_from_window, two_stage_risk_logit
 from OARM.policy.oarm_types import OARMCandidate
 from OARM.utils.yopo_compat import ensure_yopo_path
 
@@ -35,6 +35,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
         enable_rm_critic=oarm_cfg.train_probabilistic_rm_critic,
         rm_critic_hidden_dim=oarm_cfg.rm_critic_hidden_dim,
         rm_critic_hazard_bins=oarm_cfg.rm_critic_hazard_bins,
+        rm_critic_hazard_max_time_s=oarm_cfg.rm_critic_hazard_max_time_s,
     ):
         super().__init__()
         self.append_brake_candidate = bool(append_brake_candidate)
@@ -48,6 +49,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
         self.enable_utility_delta = bool(enable_utility_delta)
         self.utility_delta_scale = float(utility_delta_scale)
         self.enable_rm_critic = bool(enable_rm_critic)
+        self.rm_critic_hazard_max_time_s = max(float(rm_critic_hazard_max_time_s), 1e-3)
         self.state_transform = StateTransform()
         self.lattice_primitive = LatticePrimitive.get_instance()
         segment_time = float(self.lattice_primitive.segment_time)
@@ -127,6 +129,24 @@ class YOPOPreserveOARMNetwork(nn.Module):
         prefix = ""
         if any(key.startswith("preserve_network.") for key in adapted):
             prefix = "preserve_network."
+
+        critic_final_weight = prefix + "rm_critic.mlp.4.weight"
+        critic_final_bias = prefix + "rm_critic.mlp.4.bias"
+        own_state = self.state_dict()
+        if critic_final_weight in adapted and critic_final_weight in own_state:
+            src_w = adapted[critic_final_weight]
+            dst_w = own_state[critic_final_weight]
+            src_b = adapted.get(critic_final_bias)
+            dst_b = own_state.get(critic_final_bias)
+            if src_w.shape != dst_w.shape and src_w.ndim == dst_w.ndim == 2 and src_w.shape[1] == dst_w.shape[1]:
+                rows = min(src_w.shape[0], dst_w.shape[0])
+                new_w = dst_w.detach().clone()
+                new_w[:rows] = src_w[:rows].to(device=new_w.device, dtype=new_w.dtype)
+                adapted[critic_final_weight] = new_w
+                if src_b is not None and dst_b is not None:
+                    new_b = dst_b.detach().clone()
+                    new_b[:rows] = src_b[:rows].to(device=new_b.device, dtype=new_b.dtype)
+                    adapted[critic_final_bias] = new_b
 
         old_prefix = prefix + "aux_head."
         margin_prefix = prefix + "margin_risk_head."
@@ -233,17 +253,32 @@ class YOPOPreserveOARMNetwork(nn.Module):
         reaction_window_logvar = None
         validity_logit = None
         rm_insufficient_logit = None
+        zero_window_logit = None
+        hazard_logits = None
         if critic is not None:
             reaction_window_mean = critic["reaction_window_mean"].reshape(b, 1, v, h)
             reaction_window_logvar = critic["reaction_window_logvar"].reshape(b, 1, v, h)
             validity_logit = critic["validity_logit"].reshape(b, 1, v, h)
             rm_insufficient_logit = critic["insufficient_margin_logit"].reshape(b, 1, v, h)
+            zero_window_logit = critic.get("zero_window_logit", critic["insufficient_margin_logit"]).reshape(b, 1, v, h)
             margin_pred = reaction_window_mean - float(oarm_cfg.reaction_time)
-            risk_logit = risk_logit_from_window(
-                reaction_window_mean,
-                reaction_window_logvar,
-                reaction_budget_s=float(oarm_cfg.reaction_time),
-            )
+            if "hazard_logits" in critic:
+                hazard_count = int(critic["hazard_logits"].shape[-1])
+                hazard_last = critic["hazard_logits"].reshape(b, v, h, hazard_count)
+                hazard_logits = hazard_last.permute(0, 3, 1, 2).contiguous()
+                risk_logit = two_stage_risk_logit(
+                    validity_logit.reshape(b, v, h),
+                    zero_window_logit.reshape(b, v, h),
+                    hazard_last,
+                    reaction_budget_s=float(oarm_cfg.reaction_time),
+                    hazard_max_time_s=self.rm_critic_hazard_max_time_s,
+                ).reshape(b, 1, v, h)
+            else:
+                risk_logit = risk_logit_from_window(
+                    reaction_window_mean,
+                    reaction_window_logvar,
+                    reaction_budget_s=float(oarm_cfg.reaction_time),
+                )
         backup_logit = torch.zeros_like(risk_logit)
         utility_base = -score_pred
         if self.enable_utility_delta:
@@ -271,6 +306,8 @@ class YOPOPreserveOARMNetwork(nn.Module):
             reaction_window_logvar=reaction_window_logvar,
             validity_logit=validity_logit,
             rm_insufficient_logit=rm_insufficient_logit,
+            zero_window_logit=zero_window_logit,
+            hazard_logits=hazard_logits,
         )
         if not self.append_brake_candidate:
             return candidate
@@ -304,13 +341,22 @@ class YOPOPreserveOARMNetwork(nn.Module):
             logvar_flat = reaction_window_logvar.reshape(b, 1, 1, yopo_n)
             validity_flat = validity_logit.reshape(b, 1, 1, yopo_n)
             insufficient_flat = rm_insufficient_logit.reshape(b, 1, 1, yopo_n)
+            zero_flat = zero_window_logit.reshape(b, 1, 1, yopo_n) if zero_window_logit is not None else insufficient_flat
+            if hazard_logits is not None:
+                hazard_flat = hazard_logits.reshape(b, hazard_logits.shape[1], 1, yopo_n)
+                brake_hazard = torch.full_like(hazard_flat[:, :, :, :1], -10.0)
+            else:
+                hazard_flat = brake_hazard = None
             brake_window = torch.zeros_like(window_flat[:, :, :, :1])
             brake_logvar = torch.full_like(brake_window, 8.0)
             brake_validity = torch.full_like(brake_window, -10.0)
             brake_insufficient = torch.zeros_like(brake_window)
+            brake_zero = torch.full_like(brake_window, -10.0)
         else:
-            window_flat = logvar_flat = validity_flat = insufficient_flat = None
-            brake_window = brake_logvar = brake_validity = brake_insufficient = None
+            window_flat = logvar_flat = validity_flat = insufficient_flat = zero_flat = None
+            hazard_flat = None
+            brake_window = brake_logvar = brake_validity = brake_insufficient = brake_zero = None
+            brake_hazard = None
 
         return OARMCandidate(
             end_state_b=torch.cat((end_flat, brake_end), dim=3),
@@ -330,4 +376,6 @@ class YOPOPreserveOARMNetwork(nn.Module):
             reaction_window_logvar=torch.cat((logvar_flat, brake_logvar), dim=3) if logvar_flat is not None else None,
             validity_logit=torch.cat((validity_flat, brake_validity), dim=3) if validity_flat is not None else None,
             rm_insufficient_logit=torch.cat((insufficient_flat, brake_insufficient), dim=3) if insufficient_flat is not None else None,
+            zero_window_logit=torch.cat((zero_flat, brake_zero), dim=3) if zero_flat is not None else None,
+            hazard_logits=torch.cat((hazard_flat, brake_hazard), dim=3) if hazard_flat is not None else None,
         )

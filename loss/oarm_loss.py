@@ -9,6 +9,7 @@ from OARM.loss.backup_feasibility_loss import stopping_yield_label, stopping_dis
 from OARM.loss.yaw_visibility_loss import YawVisibilityLoss
 from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
 from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial, sample_yaw_cubic, yaw_cubic_coefficients
+from OARM.policy.oarm_rm_critic import two_stage_risk_probability
 from OARM.utils.yopo_compat import ensure_yopo_path
 from OARM.visibility.reaction_margin_labeler import ReactionMarginLabeler
 from OARM.visibility.reaction_margin_targets import generate_reaction_margin_labels
@@ -48,6 +49,10 @@ class OARMLoss(nn.Module):
         risk_assoc_distance_m: float = oarm_cfg.risk_assoc_distance_m,
         risk_assoc_sigma_m: float = oarm_cfg.risk_assoc_sigma_m,
         risk_arrival_radius_m: float = oarm_cfg.risk_arrival_radius_m,
+        rm_critic_hazard_bins: int = oarm_cfg.rm_critic_hazard_bins,
+        rm_critic_hazard_max_time_s: float = oarm_cfg.rm_critic_hazard_max_time_s,
+        rm_critic_zero_bce_weight: float = oarm_cfg.rm_critic_zero_bce_weight,
+        rm_critic_hazard_bce_weight: float = oarm_cfg.rm_critic_hazard_bce_weight,
     ):
         super().__init__()
         self.smoothness_weight = smoothness_weight
@@ -63,6 +68,10 @@ class OARMLoss(nn.Module):
         self.risk_assoc_distance_m = risk_assoc_distance_m
         self.risk_assoc_sigma_m = risk_assoc_sigma_m
         self.risk_arrival_radius_m = risk_arrival_radius_m
+        self.rm_critic_hazard_bins = max(int(rm_critic_hazard_bins), 0)
+        self.rm_critic_hazard_max_time_s = max(float(rm_critic_hazard_max_time_s), 1e-3)
+        self.rm_critic_zero_bce_weight = float(rm_critic_zero_bce_weight)
+        self.rm_critic_hazard_bce_weight = float(rm_critic_hazard_bce_weight)
         if deployed_yaw_mode not in {"goal", "hold", "predicted"}:
             raise ValueError(f"Unknown deployed_yaw_mode: {deployed_yaw_mode}")
         self.deployed_yaw_mode = deployed_yaw_mode
@@ -415,11 +424,16 @@ class OARMLoss(nn.Module):
         out = {
             "rm_critic_window_nll": zero,
             "rm_critic_validity_bce": zero,
+            "rm_critic_zero_bce": zero,
+            "rm_critic_hazard_bce": zero,
             "rm_critic_loss": zero,
             "rm_critic_valid_rate": zero,
+            "rm_critic_positive_event_rate": zero,
+            "rm_critic_hazard_mask_rate": zero,
             "rm_critic_progress_mask_rate": zero,
             "rm_critic_window_error": zero,
             "rm_critic_sigma_mean": zero,
+            "rm_critic_two_stage_risk_mean": zero,
             "rm_event_valid_rate": zero,
             "rm_right_censored_rate": zero,
             "rm_no_entry_rate": zero,
@@ -433,6 +447,8 @@ class OARMLoss(nn.Module):
         if labels is None or "reaction_window" not in labels:
             raise RuntimeError("Probabilistic RM critic training requires reaction_window labels; use the OARM3 S2 training route.")
         required = ("reaction_window_mean", "reaction_window_logvar", "validity_logit")
+        if self.rm_critic_hazard_bins > 0:
+            required = required + ("zero_window_logit", "hazard_logits")
         missing = [key for key in required if key not in candidate_flat]
         if missing:
             raise RuntimeError("Probabilistic RM critic training requires critic outputs: " + ", ".join(missing))
@@ -459,17 +475,23 @@ class OARMLoss(nn.Module):
             candidate_type = candidate_type.to(device=window.device).reshape_as(window)
             progress_mask = candidate_type == OARMCandidateGenerator.PROGRESS
         finite = torch.isfinite(window) & torch.isfinite(candidate_flat["reaction_window_mean"])
-        valid_mask = interaction_valid & (~no_entry) & progress_mask & finite
+        interaction_mask = interaction_valid & (~no_entry) & progress_mask & finite
+        visible_at_t0 = labels.get("risk_visible_at_t0")
+        if visible_at_t0 is None:
+            zero_target_bool = interaction_mask & timely_visible & (window <= 1e-6)
+        else:
+            zero_target_bool = visible_at_t0.to(device=window.device).reshape_as(window).bool() & interaction_mask
+        positive_event_mask = interaction_mask & timely_visible & (~zero_target_bool) & (window > 1e-6)
 
         logvar = candidate_flat["reaction_window_logvar"].reshape_as(window).float().clamp(min=-12.0, max=8.0)
         mean = candidate_flat["reaction_window_mean"].reshape_as(window).float()
-        if bool(valid_mask.any()):
-            err = window[valid_mask] - mean[valid_mask]
-            inv_var = torch.exp(-logvar[valid_mask])
-            window_nll = 0.5 * (err.square() * inv_var + logvar[valid_mask]).mean()
+        if bool(positive_event_mask.any()):
+            err = window[positive_event_mask] - mean[positive_event_mask]
+            inv_var = torch.exp(-logvar[positive_event_mask])
+            window_nll = 0.5 * (err.square() * inv_var + logvar[positive_event_mask]).mean()
             out["rm_critic_window_nll"] = window_nll
             out["rm_critic_window_error"] = err.abs().mean()
-            out["rm_critic_sigma_mean"] = torch.exp(0.5 * logvar[valid_mask]).mean()
+            out["rm_critic_sigma_mean"] = torch.exp(0.5 * logvar[positive_event_mask]).mean()
         else:
             window_nll = zero
 
@@ -501,16 +523,64 @@ class OARMLoss(nn.Module):
         else:
             validity_bce = zero
 
+        zero_bce = zero
+        hazard_bce = zero
+        if self.rm_critic_hazard_bins > 0:
+            zero_logit = candidate_flat["zero_window_logit"].reshape_as(window).float()
+            zero_mask = interaction_mask & torch.isfinite(zero_logit)
+            if bool(zero_mask.any()):
+                zero_target = zero_target_bool.float()
+                target_zero = zero_target[zero_mask]
+                logits_zero = zero_logit[zero_mask]
+                pos = target_zero.sum()
+                neg = target_zero.numel() - pos
+                pos_weight = (neg / pos.clamp(min=1.0)).clamp(min=1.0, max=50.0)
+                zero_bce = F.binary_cross_entropy_with_logits(logits_zero, target_zero, pos_weight=pos_weight)
+                out["rm_critic_zero_bce"] = zero_bce
+            hazard_logits = candidate_flat["hazard_logits"].to(device=window.device).float()
+            if hazard_logits.shape[-1] != self.rm_critic_hazard_bins:
+                raise RuntimeError(
+                    f"hazard_logits bin mismatch: got {hazard_logits.shape[-1]}, expected {self.rm_critic_hazard_bins}"
+                )
+            hazard_mask = positive_event_mask & torch.isfinite(hazard_logits).all(dim=-1)
+            if bool(hazard_mask.any()):
+                k = int(self.rm_critic_hazard_bins)
+                horizon = max(float(self.rm_critic_hazard_max_time_s), 1e-3)
+                idx = torch.floor(window[hazard_mask].clamp(min=0.0, max=horizon - 1e-6) / horizon * k).long()
+                idx = idx.clamp(min=0, max=k - 1)
+                bin_id = torch.arange(k, device=window.device)[None, :]
+                event_bin = idx[:, None]
+                hazard_target = (bin_id == event_bin).to(dtype=hazard_logits.dtype)
+                survival_mask = bin_id <= event_bin
+                hazard_loss_all = F.binary_cross_entropy_with_logits(
+                    hazard_logits[hazard_mask],
+                    hazard_target,
+                    reduction="none",
+                )
+                hazard_bce = hazard_loss_all[survival_mask].mean()
+                out["rm_critic_hazard_bce"] = hazard_bce
+                out["rm_critic_hazard_mask_rate"] = hazard_mask.float().mean()
+                out["rm_critic_two_stage_risk_mean"] = two_stage_risk_probability(
+                    validity_logit,
+                    zero_logit,
+                    hazard_logits,
+                    reaction_budget_s=oarm_cfg.reaction_time,
+                    hazard_max_time_s=self.rm_critic_hazard_max_time_s,
+                ).mean()
+
         out["rm_critic_loss"] = (
             oarm_cfg.rm_critic_window_nll_weight * window_nll
             + oarm_cfg.rm_critic_validity_bce_weight * validity_bce
+            + self.rm_critic_zero_bce_weight * zero_bce
+            + self.rm_critic_hazard_bce_weight * hazard_bce
         )
-        out["rm_critic_valid_rate"] = valid_mask.float().mean()
+        out["rm_critic_valid_rate"] = positive_event_mask.float().mean()
+        out["rm_critic_positive_event_rate"] = positive_event_mask.float().mean()
         out["rm_critic_progress_mask_rate"] = progress_mask.float().mean()
         out["rm_event_valid_rate"] = timely_visible.float().mean()
         out["rm_timely_visible_rate"] = timely_visible.float().mean()
         out["rm_interaction_valid_rate"] = interaction_valid.float().mean()
-        out["rm_zero_window_rate"] = ((window <= 1e-6) & valid_mask).float().mean()
+        out["rm_zero_window_rate"] = zero_target_bool.float().mean()
         for src, dst in (
             ("rm_right_censored", "rm_right_censored_rate"),
             ("rm_no_entry", "rm_no_entry_rate"),

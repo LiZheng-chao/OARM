@@ -32,6 +32,66 @@ def risk_logit_from_window(
     return torch.logit(prob)
 
 
+def hazard_cdf_from_logits(
+    hazard_logits: torch.Tensor,
+    reaction_budget_s,
+    max_time_s: float = 2.5,
+) -> torch.Tensor:
+    """Discrete positive-window CDF F+(tau) from per-bin hazard logits."""
+    if hazard_logits is None or hazard_logits.shape[-1] <= 0:
+        raise ValueError("hazard_logits must have a non-empty last dimension")
+    budget = torch.as_tensor(
+        reaction_budget_s,
+        device=hazard_logits.device,
+        dtype=hazard_logits.dtype,
+    )
+    while budget.dim() < hazard_logits.dim() - 1:
+        budget = budget.unsqueeze(-1)
+    budget = budget.unsqueeze(-1)
+    bins = int(hazard_logits.shape[-1])
+    horizon = max(float(max_time_s), 1e-3)
+    width = horizon / bins
+    right_edges = torch.arange(1, bins + 1, device=hazard_logits.device, dtype=hazard_logits.dtype) * width
+    left_edges = right_edges - width
+    fraction = ((budget - left_edges) / width).clamp(0.0, 1.0)
+    hazard = torch.sigmoid(hazard_logits).clamp(1e-6, 1.0 - 1e-6)
+    survival_before = torch.cumprod(1.0 - hazard, dim=-1)
+    survival_before = torch.cat((torch.ones_like(survival_before[..., :1]), survival_before[..., :-1]), dim=-1)
+    event_mass = survival_before * hazard
+    return (event_mass * fraction).sum(dim=-1).clamp(1e-6, 1.0 - 1e-6)
+
+
+def two_stage_risk_probability(
+    interaction_logit: torch.Tensor,
+    zero_window_logit: torch.Tensor,
+    hazard_logits: torch.Tensor,
+    reaction_budget_s,
+    hazard_max_time_s: float = 2.5,
+) -> torch.Tensor:
+    p_interaction = torch.sigmoid(interaction_logit)
+    p_zero = torch.sigmoid(zero_window_logit)
+    positive_cdf = hazard_cdf_from_logits(hazard_logits, reaction_budget_s, max_time_s=hazard_max_time_s)
+    risk = p_interaction * (p_zero + (1.0 - p_zero) * positive_cdf)
+    return risk.clamp(1e-6, 1.0 - 1e-6)
+
+
+def two_stage_risk_logit(
+    interaction_logit: torch.Tensor,
+    zero_window_logit: torch.Tensor,
+    hazard_logits: torch.Tensor,
+    reaction_budget_s,
+    hazard_max_time_s: float = 2.5,
+) -> torch.Tensor:
+    prob = two_stage_risk_probability(
+        interaction_logit,
+        zero_window_logit,
+        hazard_logits,
+        reaction_budget_s,
+        hazard_max_time_s=hazard_max_time_s,
+    )
+    return torch.logit(prob)
+
+
 class CandidateRMCritic(nn.Module):
     """Candidate-level probabilistic reaction-window critic.
 
@@ -107,6 +167,7 @@ class CandidateRMCritic(nn.Module):
             "reaction_window_mean": raw[..., 0],
             "reaction_window_logvar": raw[..., 1].clamp(min=-12.0, max=8.0),
             "insufficient_margin_logit": raw[..., 2],
+            "zero_window_logit": raw[..., 2],
             "validity_logit": raw[..., 3],
         }
         if self.hazard_bins > 0:

@@ -15,7 +15,12 @@ from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, O
 from OARM.policy.oarm_latency_model import OARMLatencyModel
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration
-from OARM.policy.oarm_rm_critic import risk_probability_from_window
+from OARM.policy.oarm_rm_critic import (
+    CandidateRMCritic,
+    hazard_cdf_from_logits,
+    risk_probability_from_window,
+    two_stage_risk_probability,
+)
 from OARM.policy.oarm_trainer import OARMTrainer
 from OARM.train_oarm import parser, resolve_training_options
 from OARM.utils.checkpoint import make_oarm_checkpoint, validate_checkpoint_metadata
@@ -27,12 +32,14 @@ def check_preset_route():
     assert preset.candidate_mode == "yopo_preserve"
     assert preset.backbone_mode == "yopo_original"
     assert preset.train_probabilistic_rm_critic is True
+    assert preset.rm_critic_hazard_bins == 8
     assert preset.train_reaction_margin is False
     assert preset.train_margin_ranking is False
 
     args = parser().parse_args(["--stage", "oarm3_s2_prob_rm"])
     options = resolve_training_options(args)
     assert options["train_probabilistic_rm_critic"] is True
+    assert options["rm_critic_hazard_bins"] == 8
     assert options["train_reaction_margin"] is False
 
 
@@ -132,6 +139,52 @@ def check_loss_fail_fast():
         assert "reaction_window" in str(exc)
         return
     raise AssertionError("RM critic loss should fail when reaction_window labels are missing")
+
+
+def check_two_stage_hazard_risk_model():
+    critic = CandidateRMCritic(candidate_feature_dim=3, hazard_bins=4)
+    critic_out = critic(torch.zeros(2, 5, 3))
+    assert critic_out["hazard_logits"].shape == (2, 5, 4)
+    assert torch.allclose(critic_out["zero_window_logit"], critic_out["insufficient_margin_logit"])
+
+    hazard_logits = torch.tensor([[-4.0, 3.0, -4.0, -4.0]], dtype=torch.float32)
+    cdf_early = hazard_cdf_from_logits(hazard_logits, 0.25, max_time_s=2.0)
+    cdf_late = hazard_cdf_from_logits(hazard_logits, 1.25, max_time_s=2.0)
+    assert bool(torch.all(cdf_late >= cdf_early))
+
+    interaction = torch.tensor([4.0], dtype=torch.float32)
+    zero_low = torch.tensor([-4.0], dtype=torch.float32)
+    zero_high = torch.tensor([4.0], dtype=torch.float32)
+    risk_low_zero = two_stage_risk_probability(interaction, zero_low, hazard_logits, 0.75, hazard_max_time_s=2.0)
+    risk_high_zero = two_stage_risk_probability(interaction, zero_high, hazard_logits, 0.75, hazard_max_time_s=2.0)
+    assert bool(torch.all(risk_high_zero >= risk_low_zero))
+
+    loss = OARMLoss(
+        enable_probabilistic_rm_critic=True,
+        rm_critic_hazard_bins=4,
+        rm_critic_hazard_max_time_s=2.0,
+    )
+    candidate_flat = {
+        "traj_time": torch.ones(4),
+        "reaction_window_mean": torch.tensor([0.0, 0.5, 1.2, 0.0]),
+        "reaction_window_logvar": torch.zeros(4),
+        "validity_logit": torch.zeros(4),
+        "zero_window_logit": torch.zeros(4),
+        "hazard_logits": torch.zeros(4, 4),
+    }
+    labels = {
+        "reaction_window": torch.tensor([0.0, 0.5, 1.2, 0.0]),
+        "rm_interaction_valid": torch.tensor([True, True, True, False]),
+        "rm_timely_visible": torch.tensor([True, True, True, False]),
+        "rm_event_valid": torch.tensor([True, True, True, False]),
+        "rm_no_entry": torch.tensor([False, False, False, True]),
+        "risk_visible_at_t0": torch.tensor([True, False, False, False]),
+    }
+    loss_dict = loss.probabilistic_rm_critic_loss(candidate_flat, labels)
+    assert loss_dict["rm_critic_zero_bce"] > 0.0
+    assert loss_dict["rm_critic_hazard_bce"] > 0.0
+    assert loss_dict["rm_critic_positive_event_rate"] > 0.0
+    assert loss_dict["rm_critic_two_stage_risk_mean"] > 0.0
 
 
 def check_latency_budget_margin():
@@ -474,8 +527,9 @@ def check_end_to_end_mini_batch():
 
     loss_dict = loss_fn.probabilistic_rm_critic_loss(flat, labels)
     assert torch.isfinite(loss_dict["rm_critic_loss"])
-    assert loss_dict["rm_critic_valid_rate"].item() > 0.99
-    assert loss_dict["rm_zero_window_rate"].item() > 0.0
+    assert loss_dict["rm_interaction_valid_rate"].item() > 0.99
+    assert loss_dict["rm_critic_positive_event_rate"].item() > 0.0
+    assert loss_dict["rm_zero_window_rate"].item() >= 0.0
     optimizer.zero_grad(set_to_none=True)
     loss_dict["rm_critic_loss"].backward()
 
@@ -528,6 +582,7 @@ def main():
     check_checkpoint_metadata()
     check_labeler_window_semantics()
     check_loss_fail_fast()
+    check_two_stage_hazard_risk_model()
     check_latency_budget_margin()
     check_intervention_selector_excludes_top1_rerank()
     check_deterministic_brake_endpoint()

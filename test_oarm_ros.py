@@ -35,7 +35,7 @@ from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, O
 from OARM.policy.oarm_brake import constrained_brake_command, deterministic_brake_endpoint
 from OARM.policy.oarm_latency_model import OARMLatencyModel
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration, calibrated_probability, risk_upper_bound
-from OARM.policy.oarm_rm_critic import risk_probability_from_window
+from OARM.policy.oarm_rm_critic import risk_probability_from_window, two_stage_risk_probability
 from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
 from OARM.policy.oarm_state_transform import OARMStateTransform
 from OARM.utils.yopo_compat import ensure_yopo_path
@@ -184,6 +184,27 @@ class OARMNet:
                 enable_rm_critic = False
         self.enable_rm_critic = bool(enable_rm_critic)
         self.config["enable_rm_critic"] = self.enable_rm_critic
+        self.rm_critic_hazard_bins = int(self.config.get("rm_critic_hazard_bins") or 0)
+        self.rm_critic_hazard_max_time_s = float(self.config.get("rm_critic_hazard_max_time_s", 2.5))
+        if self.checkpoint_path and os.path.isfile(self.checkpoint_path):
+            try:
+                state_for_hazard, metadata_for_hazard = load_oarm_checkpoint(self.checkpoint_path, map_location="cpu")
+                training_options = metadata_for_hazard.get("training_options") or {}
+                meta_bins = metadata_for_hazard.get("rm_critic_hazard_bins", training_options.get("rm_critic_hazard_bins"))
+                if meta_bins is not None and self.rm_critic_hazard_bins <= 0:
+                    self.rm_critic_hazard_bins = int(meta_bins)
+                meta_horizon = metadata_for_hazard.get("rm_critic_hazard_max_time_s", training_options.get("rm_critic_hazard_max_time_s"))
+                if meta_horizon is not None and "rm_critic_hazard_max_time_s" not in self.config:
+                    self.rm_critic_hazard_max_time_s = float(meta_horizon)
+                final_bias = state_for_hazard.get("preserve_network.rm_critic.mlp.4.bias")
+                if final_bias is not None:
+                    inferred_bins = max(0, int(final_bias.numel()) - 4)
+                    if inferred_bins > 0:
+                        self.rm_critic_hazard_bins = inferred_bins
+            except Exception as exc:
+                rospy.logwarn(f"Could not inspect checkpoint RM hazard metadata; using configured hazard bins={self.rm_critic_hazard_bins}: {exc}")
+        self.config["rm_critic_hazard_bins"] = self.rm_critic_hazard_bins
+        self.config["rm_critic_hazard_max_time_s"] = self.rm_critic_hazard_max_time_s
         latency_aware_risk = self.config.get("enable_latency_aware_risk", None)
         self.enable_latency_aware_risk = self.enable_rm_critic if latency_aware_risk is None else bool(latency_aware_risk)
         self.config["enable_latency_aware_risk"] = self.enable_latency_aware_risk
@@ -335,6 +356,8 @@ class OARMNet:
             enable_yield_candidates=self.config.get("enable_yield_candidates", False),
             utility_delta_scale=self.config["yopo_preserve_utility_delta_scale"],
             enable_rm_critic=self.enable_rm_critic,
+            rm_critic_hazard_bins=self.rm_critic_hazard_bins,
+            rm_critic_hazard_max_time_s=self.rm_critic_hazard_max_time_s,
         ).to(self.device)
         self.load_policy(weight)
         self.policy.eval()
@@ -553,7 +576,27 @@ class OARMNet:
         reaction_window_mean_t = flat.get("reaction_window_mean")
         reaction_window_logvar_t = flat.get("reaction_window_logvar")
         validity_logit_t = flat.get("validity_logit")
-        if self.enable_latency_aware_risk and reaction_window_mean_t is not None and reaction_window_logvar_t is not None:
+        zero_window_logit_t = flat.get("zero_window_logit", flat.get("rm_insufficient_logit"))
+        hazard_logits_t = flat.get("hazard_logits")
+        hazard_risk_prob_t = None
+        if (
+            self.enable_latency_aware_risk
+            and validity_logit_t is not None
+            and zero_window_logit_t is not None
+            and hazard_logits_t is not None
+        ):
+            hazard_risk_prob_t = two_stage_risk_probability(
+                validity_logit_t,
+                zero_window_logit_t,
+                hazard_logits_t,
+                latency_budget.tau_total_s,
+                hazard_max_time_s=self.rm_critic_hazard_max_time_s,
+            )
+            risk_prob_t = hazard_risk_prob_t
+            if reaction_window_mean_t is not None:
+                margin_pred_t = reaction_window_mean_t - float(latency_budget.tau_total_s)
+            risk_source = "two_stage_hazard_latency"
+        elif self.enable_latency_aware_risk and reaction_window_mean_t is not None and reaction_window_logvar_t is not None:
             risk_prob_t = risk_probability_from_window(
                 reaction_window_mean_t,
                 reaction_window_logvar_t,
@@ -582,6 +625,7 @@ class OARMNet:
         risk_upper_t = risk_upper_bound(calibrated_risk_t, self.risk_calibration).to(device=validity_fused_risk_t.device)
         margin_pred = margin_pred_t.detach().cpu().numpy()
         raw_risk_prob = raw_risk_prob_t.detach().cpu().numpy()
+        hazard_risk_prob = None if hazard_risk_prob_t is None else hazard_risk_prob_t.detach().cpu().numpy()
         validity_fused_risk_prob = validity_fused_risk_t.detach().cpu().numpy()
         calibrated_risk_prob = calibrated_risk_t.detach().cpu().numpy()
         risk_upper = risk_upper_t.detach().cpu().numpy()
@@ -740,6 +784,7 @@ class OARMNet:
             risk_source=risk_source,
             risk_logit_prob=risk_logit_prob,
             raw_risk_prob=raw_risk_prob,
+            hazard_risk_prob=hazard_risk_prob,
             validity_fused_risk_prob=validity_fused_risk_prob,
             calibrated_risk_prob=calibrated_risk_prob,
             risk_upper_bound=risk_upper,
@@ -1638,6 +1683,7 @@ class OARMNet:
         risk_source="risk_logit",
         risk_logit_prob=None,
         raw_risk_prob=None,
+        hazard_risk_prob=None,
         validity_fused_risk_prob=None,
         calibrated_risk_prob=None,
         risk_upper_bound=None,
@@ -1829,6 +1875,7 @@ class OARMNet:
             "reaction_margin": float(margin_pred[action_id]),
             "selected_risk_prob": float(risk_prob[action_id]),
             "selected_raw_risk_prob": None if raw_risk_prob is None else float(raw_risk_prob[action_id]),
+            "selected_hazard_risk_prob": None if hazard_risk_prob is None else float(hazard_risk_prob[action_id]),
             "selected_validity_fused_risk_prob": None if validity_fused_risk_prob is None else float(validity_fused_risk_prob[action_id]),
             "selected_calibrated_risk_prob": None if calibrated_risk_prob is None else float(calibrated_risk_prob[action_id]),
             "selected_risk_upper_bound": None if risk_upper_bound is None else float(risk_upper_bound[action_id]),
@@ -1911,6 +1958,7 @@ class OARMNet:
                     "margin_pred": float(margin_pred[i]),
                     "risk_prob": float(risk_prob[i]),
                     "raw_risk_prob": None if raw_risk_prob is None else float(raw_risk_prob[i]),
+                    "hazard_risk_prob": None if hazard_risk_prob is None else float(hazard_risk_prob[i]),
                     "validity_fused_risk_prob": None if validity_fused_risk_prob is None else float(validity_fused_risk_prob[i]),
                     "calibrated_risk_prob": None if calibrated_risk_prob is None else float(calibrated_risk_prob[i]),
                     "risk_upper_bound": None if risk_upper_bound is None else float(risk_upper_bound[i]),
@@ -2066,6 +2114,8 @@ def parser():
     parser.add_argument("--latency-brake-accel-mps2", type=float, default=6.0)
     parser.add_argument("--latency-window", type=int, default=128)
     parser.add_argument("--latency-quantile", type=float, default=0.95)
+    parser.add_argument("--rm-critic-hazard-bins", type=int, default=None)
+    parser.add_argument("--rm-critic-hazard-max-time-s", type=float, default=2.5)
     parser.add_argument("--sensor-age-ms", type=float, default=0.0)
     parser.add_argument("--queue-latency-ms", type=float, default=0.0)
     parser.add_argument("--selector-latency-ms", type=float, default=0.0)
@@ -2187,6 +2237,8 @@ if __name__ == "__main__":
         "latency_brake_accel_mps2": args.latency_brake_accel_mps2,
         "latency_window": args.latency_window,
         "latency_quantile": args.latency_quantile,
+        "rm_critic_hazard_bins": args.rm_critic_hazard_bins,
+        "rm_critic_hazard_max_time_s": args.rm_critic_hazard_max_time_s,
         "sensor_age_ms": args.sensor_age_ms,
         "queue_latency_ms": args.queue_latency_ms,
         "selector_latency_ms": args.selector_latency_ms,

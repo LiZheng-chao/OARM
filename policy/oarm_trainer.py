@@ -58,6 +58,10 @@ class OARMTrainer:
         train_reaction_margin=oarm_cfg.train_reaction_margin,
         train_margin_ranking=oarm_cfg.train_margin_ranking,
         train_probabilistic_rm_critic=oarm_cfg.train_probabilistic_rm_critic,
+        rm_critic_hazard_bins=oarm_cfg.rm_critic_hazard_bins,
+        rm_critic_hazard_max_time_s=oarm_cfg.rm_critic_hazard_max_time_s,
+        rm_critic_zero_bce_weight=oarm_cfg.rm_critic_zero_bce_weight,
+        rm_critic_hazard_bce_weight=oarm_cfg.rm_critic_hazard_bce_weight,
         train_yaw_visibility=oarm_cfg.train_yaw_visibility,
         deployed_yaw_mode=oarm_cfg.deployed_yaw_mode,
         risk_label_source=oarm_cfg.risk_label_source,
@@ -148,6 +152,10 @@ class OARMTrainer:
         self.train_reaction_margin = train_reaction_margin
         self.train_margin_ranking = bool(train_margin_ranking)
         self.train_probabilistic_rm_critic = bool(train_probabilistic_rm_critic)
+        self.rm_critic_hazard_bins = max(int(rm_critic_hazard_bins), 0)
+        self.rm_critic_hazard_max_time_s = max(float(rm_critic_hazard_max_time_s), 1e-3)
+        self.rm_critic_zero_bce_weight = float(rm_critic_zero_bce_weight)
+        self.rm_critic_hazard_bce_weight = float(rm_critic_hazard_bce_weight)
         self.train_yaw_visibility = bool(train_yaw_visibility)
         self.deployed_yaw_mode = deployed_yaw_mode
         if self.train_probabilistic_rm_critic:
@@ -248,6 +256,8 @@ class OARMTrainer:
             enable_yield_candidates=self.enable_yield_candidates,
             utility_delta_scale=self.yopo_preserve_utility_delta_scale,
             enable_rm_critic=self.train_probabilistic_rm_critic,
+            rm_critic_hazard_bins=self.rm_critic_hazard_bins,
+            rm_critic_hazard_max_time_s=self.rm_critic_hazard_max_time_s,
         ).to(self.device)
         if checkpoint_path and init_from_a1_checkpoint_path:
             raise ValueError("Use either --checkpoint for same-structure resume or --init-from-a1-checkpoint for A1->A3h initialization, not both")
@@ -291,6 +301,10 @@ class OARMTrainer:
                 risk_assoc_distance_m=self.risk_assoc_distance_m,
                 risk_assoc_sigma_m=self.risk_assoc_sigma_m,
                 risk_arrival_radius_m=self.risk_arrival_radius_m,
+                rm_critic_hazard_bins=self.rm_critic_hazard_bins,
+                rm_critic_hazard_max_time_s=self.rm_critic_hazard_max_time_s,
+                rm_critic_zero_bce_weight=self.rm_critic_zero_bce_weight,
+                rm_critic_hazard_bce_weight=self.rm_critic_hazard_bce_weight,
             )
         if self.use_fused_adamw:
             self.optimizer = torch.optim.AdamW(
@@ -612,6 +626,8 @@ class OARMTrainer:
             )
         if self.train_probabilistic_rm_critic:
             required_prediction_keys = ("reaction_window_mean", "reaction_window_logvar", "validity_logit")
+            if self.rm_critic_hazard_bins > 0:
+                required_prediction_keys = required_prediction_keys + ("zero_window_logit", "hazard_logits")
             missing_prediction_keys = [key for key in required_prediction_keys if key not in flat]
             if missing_prediction_keys:
                 raise RuntimeError("OARM3 S2 policy did not return RM critic outputs: " + ", ".join(missing_prediction_keys))

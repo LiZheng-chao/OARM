@@ -34,6 +34,8 @@ class OARMNetwork(nn.Module):
         enable_yield_candidates=oarm_cfg.enable_yield_candidates,
         utility_delta_scale=oarm_cfg.yopo_preserve_utility_delta_scale,
         enable_rm_critic=oarm_cfg.train_probabilistic_rm_critic,
+        rm_critic_hazard_bins=oarm_cfg.rm_critic_hazard_bins,
+        rm_critic_hazard_max_time_s=oarm_cfg.rm_critic_hazard_max_time_s,
     ):
         super().__init__()
         self.preserve_network = None
@@ -50,6 +52,8 @@ class OARMNetwork(nn.Module):
                 utility_delta_scale=utility_delta_scale,
                 append_brake_candidate=(candidate_mode == "a4_preserve_brake"),
                 enable_rm_critic=enable_rm_critic,
+                rm_critic_hazard_bins=rm_critic_hazard_bins,
+                rm_critic_hazard_max_time_s=rm_critic_hazard_max_time_s,
             )
             return
         if output_dim != 15:
