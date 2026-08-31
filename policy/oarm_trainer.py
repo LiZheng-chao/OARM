@@ -236,14 +236,16 @@ class OARMTrainer:
         self.console = Console(force_terminal=self.progress_bar)
         self.progress_log = Progress(
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
+            BarColumn(bar_width=None),
             TaskProgressColumn(),
             MofNCompleteColumn(),
+            TextColumn("{task.fields[loss]}", justify="right"),
+            TextColumn("{task.fields[fps]}", justify="right"),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
             console=self.console,
             transient=False,
-            refresh_per_second=2,
+            refresh_per_second=4,
             disable=not self.progress_bar,
         )
         self.tensorboard_path = self.get_next_log_path(tensorboard_path)
@@ -443,7 +445,7 @@ class OARMTrainer:
         train_start = time.time()
         train_steps = self._planned_steps(self.train_dataloader, self.max_train_batches)
         with self.progress_log:
-            total_progress = self.progress_log.add_task("Training", total=max(1, epoch * train_steps))
+            total_progress = self.progress_log.add_task("Training", total=max(1, epoch * train_steps), loss="loss: --", fps="fps: --")
             for self.epoch_i in range(epoch):
                 self.policy.train()
                 train_loss = self.train_one_epoch(self.epoch_i, total_progress)
@@ -466,7 +468,7 @@ class OARMTrainer:
         losses = []
         total_steps = self._planned_steps(self.train_dataloader, self.max_train_batches)
         epoch_start = time.time()
-        one_epoch_progress = self.progress_log.add_task(f"Epoch: {epoch}", total=total_steps)
+        one_epoch_progress = self.progress_log.add_task(f"Train epoch {epoch}", total=total_steps, loss="loss: --", fps="fps: --")
         for step, batch in enumerate(self.train_dataloader):
             if self.max_train_batches is not None and step >= self.max_train_batches:
                 break
@@ -504,10 +506,10 @@ class OARMTrainer:
             losses.append(total_loss.item())
             self.log_losses("Train", loss_dict, epoch, step)
             self.update_oracle_ce_sanity(loss_dict, epoch, step)
-            self.log_progress("Train", epoch, step, total_steps, losses, epoch_start)
             self.progress_log.update(one_epoch_progress, advance=1)
             if total_progress is not None:
                 self.progress_log.update(total_progress, advance=1)
+            self.log_progress("Train", epoch, step, total_steps, losses, epoch_start, one_epoch_progress, total_progress)
         self.progress_log.remove_task(one_epoch_progress)
         return float(np.mean(losses)) if losses else 0.0
 
@@ -515,7 +517,7 @@ class OARMTrainer:
         losses = []
         total_steps = self._planned_steps(self.val_dataloader, self.max_val_batches)
         epoch_start = time.time()
-        one_epoch_progress = self.progress_log.add_task(f"Eval: {epoch}", total=total_steps)
+        one_epoch_progress = self.progress_log.add_task(f"Eval epoch {epoch}", total=total_steps, loss="loss: --", fps="fps: --")
         for step, batch in enumerate(self.val_dataloader):
             if self.max_val_batches is not None and step >= self.max_val_batches:
                 break
@@ -532,8 +534,8 @@ class OARMTrainer:
             metric = self.validation_metric(loss_dict)
             losses.append(float(metric.detach().cpu() if torch.is_tensor(metric) else metric))
             self.log_losses("Eval", loss_dict, epoch, step)
-            self.log_progress("Eval", epoch, step, total_steps, losses, epoch_start)
             self.progress_log.update(one_epoch_progress, advance=1)
+            self.log_progress("Eval", epoch, step, total_steps, losses, epoch_start, one_epoch_progress)
         self.progress_log.remove_task(one_epoch_progress)
         return float(np.mean(losses)) if losses else 0.0
 
@@ -1174,19 +1176,26 @@ class OARMTrainer:
             if torch.is_tensor(value) and value.dim() == 0:
                 self.tensorboard_log.add_scalar(f"{prefix}/{key}", value.item(), global_step)
 
-    def log_progress(self, prefix, epoch, step, total_steps, losses, epoch_start):
-        if not self.log_interval:
-            return
+    def log_progress(self, prefix, epoch, step, total_steps, losses, epoch_start, progress_task=None, total_progress=None):
         current_step = step + 1
-        if current_step != 1 and current_step % self.log_interval != 0 and current_step < total_steps:
-            return
         elapsed = time.time() - epoch_start
         avg_step_s = elapsed / max(current_step, 1)
         eta_s = avg_step_s * max(total_steps - current_step, 0)
         batch_fps = current_step / max(elapsed, 1e-6)
+        mean_loss = float(np.mean(losses)) if losses else 0.0
+        loss_text = f"loss: {mean_loss:.3g}"
+        fps_text = f"fps: {batch_fps:.3g} eta: {self._format_seconds(eta_s)}"
+        if progress_task is not None:
+            self.progress_log.update(progress_task, loss=loss_text, fps=fps_text)
+        if total_progress is not None:
+            self.progress_log.update(total_progress, loss=f"{prefix.lower()} {loss_text}", fps=fps_text)
+        if not self.log_interval:
+            return
+        if current_step != 1 and current_step % self.log_interval != 0 and current_step < total_steps:
+            return
         self.progress_log.console.log(
             f"{prefix}: {epoch}, Step: {current_step}/{total_steps}, "
-            f"Total Loss: {np.mean(losses):.3g}, Batch FPS: {batch_fps:.3g}, "
+            f"Total Loss: {mean_loss:.3g}, Batch FPS: {batch_fps:.3g}, "
             f"ETA: {self._format_seconds(eta_s)}"
         )
 

@@ -36,11 +36,13 @@ def load_policy(
     allow_checkpoint_mismatch,
     enable_yield_candidates=False,
     deployed_yaw_mode="goal",
+    enable_rm_critic=False,
 ):
     policy = OARMNetwork(
         candidate_mode=candidate_mode,
         backbone_mode=backbone_mode,
         enable_yield_candidates=enable_yield_candidates,
+        enable_rm_critic=enable_rm_critic,
     ).to(device)
     if checkpoint:
         state_dict, checkpoint_metadata = load_oarm_checkpoint(checkpoint, map_location=device)
@@ -231,9 +233,10 @@ def render_sample(data, output_png, output_json, top_k):
 def parser():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", type=str, default="")
-    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier"], default="typed_frontier")
+    p.add_argument("--candidate-mode", choices=["yopo", "typed_frontier", "yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"], default="typed_frontier")
     p.add_argument("--backbone-mode", choices=["oarm_light", "yopo_original"], default="yopo_original")
     p.add_argument("--enable-yield-candidates", action="store_true")
+    p.add_argument("--enable-rm-critic", action="store_true")
     p.add_argument("--deployed-yaw-mode", choices=["goal", "hold", "predicted"], default="goal")
     p.add_argument("--allow-checkpoint-mismatch", action="store_true")
     p.add_argument("--mode", choices=["train", "valid"], default="valid")
@@ -269,6 +272,7 @@ def main(args):
         args.allow_checkpoint_mismatch,
         enable_yield_candidates=args.enable_yield_candidates,
         deployed_yaw_mode=args.deployed_yaw_mode,
+        enable_rm_critic=args.enable_rm_critic,
     )
     end = min(args.sample + args.count, len(dataset))
     for sample_id in range(args.sample, end):

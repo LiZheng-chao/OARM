@@ -46,6 +46,7 @@ TYPE_NAMES = {
 
 EVAL_STAGE_MAP = {
     "eval_occlusion_risk": "train_occlusion_risk",
+    "eval_probabilistic_rm_critic": "train_probabilistic_rm_critic",
     "eval_risk_point_guidance": "train_risk_point_guidance",
     "eval_reaction_margin": "train_reaction_margin",
     "eval_margin_ranking": "train_margin_ranking",
@@ -390,7 +391,7 @@ def maybe_generate_reaction_margin_labels(
         end_state_w,
         map_id_expanded,
         goal_w,
-        enabled=args.eval_reaction_margin,
+        enabled=args.eval_reaction_margin or args.eval_probabilistic_rm_critic,
         labeler=labeler,
         line_of_sight=line_of_sight,
         yaw_helper=yaw_helper,
@@ -621,6 +622,9 @@ def evaluate(args):
         backbone_mode=args.backbone_mode,
         enable_yield_candidates=args.enable_yield_candidates,
         utility_delta_scale=args.yopo_preserve_utility_delta_scale,
+        enable_rm_critic=args.eval_probabilistic_rm_critic,
+        rm_critic_hazard_bins=args.rm_critic_hazard_bins,
+        rm_critic_hazard_max_time_s=args.rm_critic_hazard_max_time_s,
     ).to(device)
     if args.checkpoint:
         if args.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
@@ -660,12 +664,18 @@ def evaluate(args):
 
     with yopo_dataset_cfg(args.dataset_root or None):
         loss_fn = OARMLoss(
+            eval_points=args.eval_points,
             use_esdf_collision=args.use_esdf_collision,
             use_occlusion_aware_visibility=args.use_occlusion_aware_visibility,
             enable_occlusion_risk=args.eval_occlusion_risk,
             enable_risk_point_guidance=args.eval_risk_point_guidance,
             enable_reaction_margin=args.eval_reaction_margin,
             enable_margin_ranking=args.eval_margin_ranking,
+            enable_probabilistic_rm_critic=args.eval_probabilistic_rm_critic,
+            rm_critic_hazard_bins=args.rm_critic_hazard_bins,
+            rm_critic_hazard_max_time_s=args.rm_critic_hazard_max_time_s,
+            rm_critic_zero_bce_weight=args.rm_critic_zero_bce_weight,
+            rm_critic_hazard_bce_weight=args.rm_critic_hazard_bce_weight,
             enable_yaw_visibility=args.eval_yaw_visibility,
             deployed_yaw_mode=args.deployed_yaw_mode,
             enable_yield_feasibility=args.eval_backup_feasibility,
@@ -861,7 +871,7 @@ def parser():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--stage",
-        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "a4a", "full"],
+        choices=["v0", "v1_occ", "v2_margin", "v3_yield", "a3h", "oarm3_s2_prob_rm", "a4a", "full"],
         default="v0",
         help="named evaluation preset matching OARM/train_oarm.py",
     )
@@ -898,6 +908,11 @@ def parser():
     p.add_argument("--risk-assoc-distance-m", type=float, default=None)
     p.add_argument("--risk-assoc-sigma-m", type=float, default=None)
     p.add_argument("--risk-arrival-radius-m", type=float, default=None)
+    p.add_argument("--rm-critic-hazard-bins", type=int, default=None)
+    p.add_argument("--rm-critic-hazard-max-time-s", type=float, default=None)
+    p.add_argument("--rm-critic-zero-bce-weight", type=float, default=None)
+    p.add_argument("--rm-critic-hazard-bce-weight", type=float, default=None)
+    p.add_argument("--eval-points", type=int, default=30)
     p.add_argument("--mode", choices=["train", "valid"], default="valid")
     p.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     p.add_argument("--batch-size", type=int, default=16)
@@ -907,6 +922,7 @@ def parser():
     p.add_argument("--eval-occlusion-risk", action="store_true")
     p.add_argument("--eval-reaction-margin", action="store_true")
     p.add_argument("--eval-margin-ranking", action="store_true")
+    p.add_argument("--eval-probabilistic-rm-critic", action="store_true")
     p.add_argument("--eval-risk-point-guidance", action="store_true")
     p.add_argument("--eval-yaw-visibility", action="store_true")
     p.add_argument("--use-weak-margin-label", action="store_true")
@@ -932,6 +948,15 @@ def apply_eval_stage(args):
     for key in GT_SAMPLER_ARG_KEYS:
         value = getattr(args, key)
         if value is None or value == "":
+            setattr(args, key, getattr(preset, key, getattr(oarm_cfg, key)))
+    for key in (
+        "rm_critic_hazard_bins",
+        "rm_critic_hazard_max_time_s",
+        "rm_critic_zero_bce_weight",
+        "rm_critic_hazard_bce_weight",
+    ):
+        value = getattr(args, key)
+        if value is None:
             setattr(args, key, getattr(preset, key, getattr(oarm_cfg, key)))
     if preset.enable_yield_candidates and not args.enable_yield_candidates:
         args.enable_yield_candidates = True
