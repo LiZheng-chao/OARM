@@ -43,7 +43,8 @@ class OARMDataset(Dataset):
                 "Generate or place the YOPO dataset there before running dataset or one-batch-loss checks."
             )
         self.dataset_dir = dataset_dir
-        with yopo_dataset_cfg(dataset_dir):
+        yopo_dataset_dir = self.numeric_yopo_dataset_view(dataset_dir, repo_root)
+        with yopo_dataset_cfg(yopo_dataset_dir):
             self.base = YOPODataset(mode=mode, val_ratio=val_ratio)
         dataset_tag = self.dataset_cache_tag(dataset_dir)
         self.cache_dir = os.path.join(
@@ -70,6 +71,60 @@ class OARMDataset(Dataset):
         digest = hashlib.sha1(os.path.abspath(dataset_dir).encode("utf-8")).hexdigest()[:8]
         safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in name)
         return f"{safe_name}_{digest}"
+
+    @classmethod
+    def numeric_yopo_dataset_view(cls, dataset_dir, repo_root):
+        numeric_folders = []
+        non_numeric_folders = []
+        for entry in os.scandir(dataset_dir):
+            if not entry.is_dir():
+                continue
+            name = os.path.basename(entry.path)
+            if name.isdigit():
+                numeric_folders.append(entry.path)
+            else:
+                non_numeric_folders.append(entry.path)
+        numeric_folders.sort(key=lambda path: int(os.path.basename(path)))
+        if not non_numeric_folders:
+            return dataset_dir
+        if not numeric_folders:
+            raise FileNotFoundError(
+                f"YOPO numeric map folders were not found in {dataset_dir}; "
+                "OARM pilot folders can coexist there, but the YOPO base loader still needs numeric map folders."
+            )
+        names_digest = hashlib.sha1(
+            "\n".join(os.path.basename(path) for path in numeric_folders).encode("utf-8")
+        ).hexdigest()[:8]
+        view_root = os.path.join(
+            repo_root,
+            "OARM",
+            "cache",
+            "yopo_numeric_dataset_views",
+            f"{cls.dataset_cache_tag(dataset_dir)}_{names_digest}",
+        )
+        os.makedirs(view_root, exist_ok=True)
+        for new_idx, folder in enumerate(numeric_folders):
+            old_name = os.path.basename(folder)
+            folder_link = os.path.join(view_root, str(new_idx))
+            cls._ensure_link(folder_link, folder)
+            pose_candidates = [
+                os.path.join(dataset_dir, f"pose-{old_name}.csv"),
+                os.path.join(dataset_dir, f"pose-{new_idx}.csv"),
+            ]
+            pose_src = next((path for path in pose_candidates if os.path.isfile(path)), None)
+            if pose_src is None:
+                raise FileNotFoundError(f"Missing pose csv for YOPO map folder {folder}; tried {pose_candidates}")
+            cls._ensure_link(os.path.join(view_root, f"pose-{new_idx}.csv"), pose_src)
+        return view_root
+
+    @staticmethod
+    def _ensure_link(link_path, target_path):
+        target_path = os.path.abspath(target_path)
+        if os.path.lexists(link_path):
+            if os.path.islink(link_path) and os.path.abspath(os.readlink(link_path)) == target_path:
+                return
+            raise FileExistsError(f"Refusing to overwrite existing dataset view entry {link_path}")
+        os.symlink(target_path, link_path)
 
     def __len__(self):
         return len(self.base)

@@ -107,19 +107,41 @@ def generate_reaction_margin_labels(
         risk_weight,
         visibility_mask=visibility_mask,
     )
-    flat_labels["reaction_margin"] = margin_labels["reaction_margin_softmin"].detach()
-    flat_labels["reaction_margin_valid"] = margin_labels["reaction_margin_valid"].detach()
-    flat_labels["reaction_margin_censored"] = margin_labels["reaction_margin_censored"].detach()
-    flat_labels["reaction_window"] = margin_labels["reaction_window_softmin"].detach()
-    flat_labels["rm_event_valid"] = margin_labels["rm_event_valid_gt"].detach()
-    flat_labels["rm_interaction_valid"] = margin_labels["rm_interaction_valid_gt"].detach()
-    flat_labels["rm_timely_visible"] = margin_labels["rm_timely_visible_gt"].detach()
-    flat_labels["rm_right_censored"] = margin_labels["rm_right_censored_gt"].detach()
-    flat_labels["rm_blind_at_entry"] = margin_labels["rm_blind_at_entry_gt"].detach()
-    flat_labels["rm_no_entry"] = margin_labels["rm_no_entry_gt"].detach()
-    flat_labels["risk_visible_at_t0"] = margin_labels["risk_visible_at_t0_gt"].detach()
-    flat_labels["critical_risk_point_id"] = margin_labels["critical_risk_point_id"].detach()
-    flat_labels["critical_risk_weight"] = margin_labels["critical_risk_weight"].detach()
+    reaction_margin_value = margin_labels.get(
+        "reaction_margin_softmin",
+        margin_labels.get("reaction_margin_gt", margin_labels.get("reaction_margin_min")),
+    )
+    if reaction_margin_value is None:
+        raise KeyError("labeler output must include reaction_margin_softmin, reaction_margin_gt, or reaction_margin_min")
+    reaction_window_value = margin_labels.get(
+        "reaction_window_softmin",
+        margin_labels.get("reaction_window_gt", reaction_margin_value + float(getattr(labeler, "reaction_time", 0.0))),
+    )
+    valid_value = margin_labels.get("reaction_margin_valid", torch.isfinite(reaction_margin_value))
+    censored_value = margin_labels.get("reaction_margin_censored", torch.zeros_like(valid_value, dtype=torch.bool))
+    event_valid_value = margin_labels.get("rm_event_valid_gt", valid_value.bool() & (~censored_value.bool()))
+    interaction_valid_value = margin_labels.get("rm_interaction_valid_gt", valid_value.bool())
+    timely_visible_value = margin_labels.get("rm_timely_visible_gt", event_valid_value.bool())
+    right_censored_value = margin_labels.get("rm_right_censored_gt", interaction_valid_value.bool() & (~timely_visible_value.bool()))
+    blind_at_entry_value = margin_labels.get("rm_blind_at_entry_gt", right_censored_value.bool())
+    no_entry_value = margin_labels.get("rm_no_entry_gt", torch.zeros_like(interaction_valid_value, dtype=torch.bool))
+    visible_t0_value = margin_labels.get("risk_visible_at_t0_gt", torch.zeros_like(interaction_valid_value, dtype=torch.bool))
+    critical_id_value = margin_labels.get("critical_risk_point_id", torch.full_like(reaction_margin_value, -1, dtype=torch.long))
+    critical_weight_value = margin_labels.get("critical_risk_weight", torch.zeros_like(reaction_margin_value))
+
+    flat_labels["reaction_margin"] = reaction_margin_value.detach()
+    flat_labels["reaction_margin_valid"] = valid_value.detach()
+    flat_labels["reaction_margin_censored"] = censored_value.detach()
+    flat_labels["reaction_window"] = reaction_window_value.detach()
+    flat_labels["rm_event_valid"] = event_valid_value.detach()
+    flat_labels["rm_interaction_valid"] = interaction_valid_value.detach()
+    flat_labels["rm_timely_visible"] = timely_visible_value.detach()
+    flat_labels["rm_right_censored"] = right_censored_value.detach()
+    flat_labels["rm_blind_at_entry"] = blind_at_entry_value.detach()
+    flat_labels["rm_no_entry"] = no_entry_value.detach()
+    flat_labels["risk_visible_at_t0"] = visible_t0_value.detach()
+    flat_labels["critical_risk_point_id"] = critical_id_value.detach()
+    flat_labels["critical_risk_weight"] = critical_weight_value.detach()
     if include_diagnostics:
         flat_labels["reaction_margin_min"] = margin_labels["reaction_margin_min"].detach()
         flat_labels["reaction_window_min"] = margin_labels["reaction_window_min"].detach()

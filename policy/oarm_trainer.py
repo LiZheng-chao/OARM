@@ -1236,10 +1236,11 @@ class OARMTrainer:
         return [name for name, param in self.policy.named_parameters() if param.requires_grad]
 
     def configure_trainable_parameters(self):
+        train_probabilistic_rm_critic = bool(getattr(self, "train_probabilistic_rm_critic", False))
         if self.candidate_mode in {"yopo_preserve", "yopo_preserve_rerank", "a4_preserve_brake"}:
             if self.train_yield_head_only:
                 raise ValueError(f"--train-yield-head-only is not compatible with candidate_mode={self.candidate_mode}")
-            if self.train_probabilistic_rm_critic:
+            if train_probabilistic_rm_critic:
                 train_prefixes = ["preserve_network.rm_critic."]
             elif self.candidate_mode == "a4_preserve_brake":
                 train_prefixes = ["preserve_network.brake_gate_head."]
@@ -1296,7 +1297,7 @@ class OARMTrainer:
                 f"{self.candidate_mode} must train only preserve auxiliary heads; unexpected trainable parameters: "
                 + ", ".join(bad)
             )
-        if self.train_probabilistic_rm_critic:
+        if bool(getattr(self, "train_probabilistic_rm_critic", False)):
             required_prefixes = ("preserve_network.rm_critic.",)
         elif self.candidate_mode == "yopo_preserve":
             required_prefixes = ("preserve_network.margin_risk_head.",)

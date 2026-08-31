@@ -513,7 +513,36 @@ class OARMNet:
         obs = np.concatenate((vel_c, acc_c, goal_c), axis=0).astype(np.float32)
         return torch.from_numpy(obs[None, :])
 
-    def estimate_reaction_budget(self, depth_msg, obs, inference_latency_s):
+    def build_constrained_brake_command(self):
+        generation_start = time.time()
+        start_pos = self.get_start_pos().astype(np.float32)
+        start_vel = self.get_start_vel().astype(np.float32)
+        start_acc = self.desire_acc if self.desire_acc is not None else np.zeros(3, dtype=np.float32)
+        start_acc = np.asarray(start_acc, dtype=np.float32).reshape(3)
+        min_brake_time = float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time))
+        command = constrained_brake_command(
+            start_pos,
+            start_vel,
+            start_acc=start_acc,
+            goal=self.goal,
+            min_time=min_brake_time,
+            brake_accel=self.brake_decel_mps2,
+            max_time=self.brake_max_time,
+            max_accel=self.brake_max_accel_mps2,
+            max_jerk=self.brake_max_jerk_mps3,
+            max_thrust_accel=self.brake_max_thrust_accel_mps2,
+            max_tilt_deg=self.brake_max_tilt_deg,
+            sample_count=self.brake_sample_count,
+            time_growth=self.brake_time_growth,
+            target_z=self.depth_emergency_target_z,
+            z_rate=self.depth_emergency_z_rate,
+            min_command_z=self.min_command_z,
+            max_command_z=self.max_command_z,
+        )
+        generation_latency_ms = 1000.0 * (time.time() - generation_start)
+        return command, start_pos, start_vel, start_acc, generation_latency_ms
+
+    def estimate_reaction_budget(self, depth_msg, obs, inference_latency_s, brake_bundle=None, brake_generation_latency_ms=0.0):
         sensor_age_s = None
         if self.config.get("use_depth_header_sensor_age", True) and getattr(depth_msg, "header", None) is not None:
             try:
@@ -523,40 +552,20 @@ class OARMNet:
             except Exception:
                 sensor_age_s = None
         velocity_body = obs.detach().cpu().numpy()[0, :3]
-        start_acc = obs.detach().cpu().numpy()[0, 3:6]
-        goal_body = obs.detach().cpu().numpy()[0, 6:9]
+        speed_parallel_mps = None
         brake_duration_s = None
         brake_distance_m = None
-        try:
-            brake_command = constrained_brake_command(
-                np.zeros(3, dtype=np.float32),
-                velocity_body,
-                start_acc=start_acc,
-                goal=goal_body,
-                min_time=float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time)),
-                brake_accel=self.brake_decel_mps2,
-                max_time=self.brake_max_time,
-                max_accel=self.brake_max_accel_mps2,
-                max_jerk=self.brake_max_jerk_mps3,
-                max_thrust_accel=self.brake_max_thrust_accel_mps2,
-                max_tilt_deg=self.brake_max_tilt_deg,
-                sample_count=self.brake_sample_count,
-                time_growth=self.brake_time_growth,
-                target_z=goal_body[2] if goal_body.size >= 3 else None,
-                z_rate=self.depth_emergency_z_rate,
-                min_command_z=self.min_command_z,
-                max_command_z=self.max_command_z,
-            )
+        if brake_bundle is not None:
+            brake_command, _start_pos, start_vel, _start_acc, _generation_ms = brake_bundle
+            speed_parallel_mps = float(np.linalg.norm(start_vel))
             brake_duration_s = float(brake_command.duration)
             brake_distance_m = float(brake_command.diagnostics.stop_distance)
-        except Exception as exc:
-            if not getattr(self, "warned_latency_brake_unavailable", False):
-                rospy.logwarn(f"Could not compute constrained brake duration for latency budget; using speed/brake_accel fallback: {exc}")
-                self.warned_latency_brake_unavailable = True
         budget = self.latency_model.estimate(
+            speed_parallel_mps=speed_parallel_mps,
             velocity_body_mps=velocity_body,
             inference_latency_s=float(inference_latency_s),
             sensor_age_s=sensor_age_s,
+            selector_latency_s=max(float(brake_generation_latency_ms), 0.0) / 1000.0,
             maneuver_latency_s=brake_duration_s,
             brake_distance_m=brake_distance_m,
         )
@@ -590,9 +599,25 @@ class OARMNet:
         if self.device == "cuda":
             torch.cuda.synchronize()
         forward_end = time.time()
+        brake_bundle = None
+        brake_generation_latency_ms = 0.0
+        if self.enable_latency_aware_risk or self.enable_intervention_selector or self.depth_emergency_stop:
+            try:
+                brake_bundle = self.build_constrained_brake_command()
+                brake_generation_latency_ms = float(brake_bundle[-1])
+            except Exception as exc:
+                if not getattr(self, "warned_latency_brake_unavailable", False):
+                    rospy.logwarn(f"Could not compute constrained brake command for this planning frame; using latency fallback: {exc}")
+                    self.warned_latency_brake_unavailable = True
         flat = candidate.flatten()
         forward_latency_s = forward_end - forward_start
-        latency_budget = self.estimate_reaction_budget(data, obs, forward_latency_s)
+        latency_budget = self.estimate_reaction_budget(
+            data,
+            obs,
+            forward_latency_s,
+            brake_bundle=brake_bundle,
+            brake_generation_latency_ms=brake_generation_latency_ms,
+        )
         endstate = flat["end_state_b"].detach().cpu().numpy()
         utility = flat["utility_score"].detach().cpu().numpy()
         utility_base = flat.get("utility_base")
@@ -691,7 +716,11 @@ class OARMNet:
         intervention_brake = False
         brake_candidate = None
         if self.enable_intervention_selector:
-            brake_candidate = self.build_and_evaluate_brake_candidate(depth_m)
+            brake_candidate = self.build_and_evaluate_brake_candidate(
+                depth_m,
+                brake_bundle=brake_bundle,
+                brake_generation_latency_ms=brake_generation_latency_ms,
+            )
             action_id, selection_score, intervention = self.apply_intervention_selector(
                 utility,
                 endstate_w,
@@ -717,27 +746,14 @@ class OARMNet:
             if emergency_stop:
                 if intervention_brake and brake_candidate is not None:
                     brake_command = brake_candidate["command"]
+                    start_pos = brake_candidate.get("start_pos", start_pos)
+                    start_vel = brake_candidate.get("start_vel", start_vel)
+                    start_acc = brake_candidate.get("start_acc", start_acc)
                 else:
-                    min_brake_time = float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time))
-                    brake_command = constrained_brake_command(
-                        start_pos,
-                        start_vel,
-                        start_acc=start_acc,
-                        goal=self.goal,
-                        min_time=min_brake_time,
-                        brake_accel=self.brake_decel_mps2,
-                        max_time=self.brake_max_time,
-                        max_accel=self.brake_max_accel_mps2,
-                        max_jerk=self.brake_max_jerk_mps3,
-                        max_thrust_accel=self.brake_max_thrust_accel_mps2,
-                        max_tilt_deg=self.brake_max_tilt_deg,
-                        sample_count=self.brake_sample_count,
-                        time_growth=self.brake_time_growth,
-                        target_z=self.depth_emergency_target_z,
-                        z_rate=self.depth_emergency_z_rate,
-                        min_command_z=self.min_command_z,
-                        max_command_z=self.max_command_z,
-                    )
+                    if brake_bundle is not None:
+                        brake_command, start_pos, start_vel, start_acc, _brake_generation_ms = brake_bundle
+                    else:
+                        brake_command, start_pos, start_vel, start_acc, brake_generation_latency_ms = self.build_constrained_brake_command()
                 selected_time = brake_command.duration
                 end_pos = brake_command.end_pos
                 end_vel = brake_command.end_vel
@@ -832,6 +848,8 @@ class OARMNet:
             candidate_decode_ms=(time3 - forward_end) * 1000.0,
             selection_ms=(time4 - time3) * 1000.0,
             total_latency_ms=(time5 - time0) * 1000.0,
+            brake_generation_latency_ms=brake_generation_latency_ms,
+            total_planning_latency_ms=(time5 - time0) * 1000.0,
         )
         self.print_time(time0, time1, time2, time3, time4, time5)
 
@@ -1086,30 +1104,12 @@ class OARMNet:
             "geometry_admissible": bool(depth_ok and altitude_ok),
         }
 
-    def build_and_evaluate_brake_candidate(self, depth_m):
-        start_pos = self.get_start_pos()
-        start_vel = self.get_start_vel()
-        start_acc = self.desire_acc if self.desire_acc is not None else np.zeros(3, dtype=np.float32)
-        min_brake_time = float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time))
-        command = constrained_brake_command(
-            start_pos,
-            start_vel,
-            start_acc=start_acc,
-            goal=self.goal,
-            min_time=min_brake_time,
-            brake_accel=self.brake_decel_mps2,
-            max_time=self.brake_max_time,
-            max_accel=self.brake_max_accel_mps2,
-            max_jerk=self.brake_max_jerk_mps3,
-            max_thrust_accel=self.brake_max_thrust_accel_mps2,
-            max_tilt_deg=self.brake_max_tilt_deg,
-            sample_count=self.brake_sample_count,
-            time_growth=self.brake_time_growth,
-            target_z=self.depth_emergency_target_z,
-            z_rate=self.depth_emergency_z_rate,
-            min_command_z=self.min_command_z,
-            max_command_z=self.max_command_z,
-        )
+    def build_and_evaluate_brake_candidate(self, depth_m, brake_bundle=None, brake_generation_latency_ms=0.0):
+        if brake_bundle is None:
+            brake_bundle = self.build_constrained_brake_command()
+            brake_generation_latency_ms = float(brake_bundle[-1])
+        command, start_pos, start_vel, start_acc, bundle_generation_ms = brake_bundle
+        brake_generation_latency_ms = float(brake_generation_latency_ms if brake_generation_latency_ms is not None else bundle_generation_ms)
         endstate_w = np.zeros((1, 3, 3), dtype=np.float32)
         endstate_w[0, :, 0] = command.end_pos - start_pos
         endstate_w[0, :, 1] = command.end_vel
@@ -1129,6 +1129,9 @@ class OARMNet:
         risk_upper = float(self.brake_verified_risk_upper) if dynamic_feasible and geometry_admissible else 1.0
         info = {
             "command": command,
+            "start_pos": start_pos,
+            "start_vel": start_vel,
+            "start_acc": start_acc,
             "endstate_w": endstate_w,
             "traj_time": traj_time,
             "dynamic_feasible": dynamic_feasible,
@@ -1138,10 +1141,11 @@ class OARMNet:
             "feasible": bool(dynamic_feasible and geometry_admissible),
             "risk_upper_bound": risk_upper,
             "risk_source": "geometry_dynamic_proxy",
+            "brake_generation_latency_ms": brake_generation_latency_ms,
             **geometry,
             **diagnostics,
         }
-        self.last_brake_candidate_info = {key: value for key, value in info.items() if key not in {"command", "endstate_w", "traj_time"}}
+        self.last_brake_candidate_info = {key: value for key, value in info.items() if key not in {"command", "start_pos", "start_vel", "start_acc", "endstate_w", "traj_time"}}
         self.last_brake_command = command
         return info
 
@@ -1731,6 +1735,8 @@ class OARMNet:
         candidate_decode_ms=0.0,
         selection_ms=0.0,
         total_latency_ms=0.0,
+        brake_generation_latency_ms=0.0,
+        total_planning_latency_ms=0.0,
     ):
         if self.log_jsonl_file is None:
             return
@@ -1840,6 +1846,8 @@ class OARMNet:
             "brake_sample_count": int(self.brake_sample_count),
             "brake_verified_risk_upper": float(self.brake_verified_risk_upper),
             "brake_require_visible_stop_distance": bool(self.brake_require_visible_stop_distance),
+            "brake_generation_latency_ms": float(brake_generation_latency_ms),
+            "total_planning_latency_ms": float(total_planning_latency_ms),
             "brake_candidate_info": self.last_brake_candidate_info,
             "brake_dynamic_feasible": None if self.last_brake_candidate_info is None else bool(self.last_brake_candidate_info.get("dynamic_feasible", False)),
             "brake_geometry_admissible": None if self.last_brake_candidate_info is None else bool(self.last_brake_candidate_info.get("geometry_admissible", False)),
@@ -1947,6 +1955,7 @@ class OARMNet:
             "candidate_decode_ms": float(candidate_decode_ms),
             "selection_ms": float(selection_ms),
             "total_latency_ms": float(total_latency_ms),
+            "planner_total_latency_ms": float(total_planning_latency_ms),
             "goal_distance": None if self.last_goal_distance is None else float(self.last_goal_distance),
             "min_goal_distance": None if self.min_goal_distance is None else float(self.min_goal_distance),
             "arrival_distance": float(self.arrival_distance),
