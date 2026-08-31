@@ -3,6 +3,7 @@ from torch import nn
 
 from OARM.config import oarm_cfg
 from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
+from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial
 from OARM.policy.oarm_rm_critic import CandidateRMCritic, risk_logit_from_window, two_stage_risk_logit
 from OARM.policy.oarm_types import OARMCandidate
 from OARM.utils.yopo_compat import ensure_yopo_path
@@ -50,6 +51,8 @@ class YOPOPreserveOARMNetwork(nn.Module):
         self.utility_delta_scale = float(utility_delta_scale)
         self.enable_rm_critic = bool(enable_rm_critic)
         self.rm_critic_hazard_max_time_s = max(float(rm_critic_hazard_max_time_s), 1e-3)
+        self.rm_critic_trajectory_samples = 8
+        self.rm_critic_geometry_dim = 9 + 1 + 3 + 3 * self.rm_critic_trajectory_samples
         self.state_transform = StateTransform()
         self.lattice_primitive = LatticePrimitive.get_instance()
         segment_time = float(self.lattice_primitive.segment_time)
@@ -82,6 +85,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
         if self.enable_rm_critic:
             self.rm_critic = CandidateRMCritic(
                 candidate_feature_dim=hidden_state + observation_dim,
+                geometry_feature_dim=self.rm_critic_geometry_dim,
                 hidden_dim=rm_critic_hidden_dim,
                 hazard_bins=rm_critic_hazard_bins,
             )
@@ -130,9 +134,17 @@ class YOPOPreserveOARMNetwork(nn.Module):
         if any(key.startswith("preserve_network.") for key in adapted):
             prefix = "preserve_network."
 
+        critic_input_weight = prefix + "rm_critic.mlp.0.weight"
         critic_final_weight = prefix + "rm_critic.mlp.4.weight"
         critic_final_bias = prefix + "rm_critic.mlp.4.bias"
         own_state = self.state_dict()
+        if critic_input_weight in adapted and critic_input_weight in own_state:
+            src_w = adapted[critic_input_weight]
+            dst_w = own_state[critic_input_weight]
+            if src_w.shape != dst_w.shape and src_w.ndim == dst_w.ndim == 2 and src_w.shape[0] == dst_w.shape[0] and src_w.shape[1] <= dst_w.shape[1]:
+                new_w = torch.zeros_like(dst_w)
+                new_w[:, : src_w.shape[1]] = src_w.to(device=new_w.device, dtype=new_w.dtype)
+                adapted[critic_input_weight] = new_w
         if critic_final_weight in adapted and critic_final_weight in own_state:
             src_w = adapted[critic_final_weight]
             dst_w = own_state[critic_final_weight]
@@ -210,14 +222,39 @@ class YOPOPreserveOARMNetwork(nn.Module):
             brake_gate_raw = gate_map.flatten(1).gather(1, top1_id[:, None]).reshape(-1, 1, 1, 1)
             brake_gate_raw = brake_gate_raw.expand(-1, -1, margin_risk.shape[2], margin_risk.shape[3])
             aux = torch.cat((aux, brake_gate_raw), dim=1)
-        critic = None
-        if return_critic and self.rm_critic is not None:
-            b, c, v, h = detached_features.shape
-            candidate_feature = detached_features.permute(0, 2, 3, 1).reshape(b, v * h, c)
-            critic = self.rm_critic(candidate_feature, yopo_cost=score_pred.reshape(b, v * h))
         if return_critic:
-            return endstate_pred, score_pred, aux, critic
+            return endstate_pred, score_pred, aux, detached_features
         return endstate_pred, score_pred, aux
+
+    def rm_critic_geometry_features(self, end_state_b: torch.Tensor, traj_time: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
+        b, _, v, h = end_state_b.shape
+        n = v * h
+        device = end_state_b.device
+        dtype = end_state_b.dtype
+        end_flat = end_state_b.permute(0, 2, 3, 1).reshape(b * n, 9).detach()
+        time_flat = traj_time.reshape(b * n).to(device=device, dtype=dtype).detach().clamp_min(1e-3)
+        vel0 = obs[:, 0:3].to(device=device, dtype=dtype).detach()[:, None, :].expand(b, n, 3).reshape(b * n, 3)
+        acc0 = obs[:, 3:6].to(device=device, dtype=dtype).detach()[:, None, :].expand(b, n, 3).reshape(b * n, 3)
+        pos0 = torch.zeros_like(vel0)
+        start_state = torch.stack((pos0, vel0, acc0), dim=1)
+        end_state = torch.stack((end_flat[:, 0:3], end_flat[:, 3:6], end_flat[:, 6:9]), dim=1)
+        coeff = quintic_coefficients(start_state, end_state, time_flat)
+        sampled_pos, _, _, _ = sample_polynomial(
+            coeff,
+            time_flat,
+            eval_points=self.rm_critic_trajectory_samples,
+            include_zero=False,
+        )
+        geometry = torch.cat(
+            (
+                end_flat,
+                time_flat[:, None],
+                vel0,
+                sampled_pos.reshape(b * n, -1),
+            ),
+            dim=-1,
+        )
+        return geometry.reshape(b, n, self.rm_critic_geometry_dim)
 
     def deterministic_brake_candidate(self, obs: torch.Tensor, dtype: torch.dtype, device: torch.device):
         vel_b = obs[:, 0:3].to(device=device, dtype=dtype)
@@ -236,7 +273,7 @@ class YOPOPreserveOARMNetwork(nn.Module):
     def inference(self, depth: torch.Tensor, obs: torch.Tensor) -> OARMCandidate:
         obs_norm = self.state_transform.normalize_obs(obs.clone())
         obs_prepared = self.state_transform.prepare_input(obs_norm)
-        endstate_pred, score_pred, aux, critic = self.forward(depth, obs_prepared, return_critic=True)
+        endstate_pred, score_pred, aux, critic_features = self.forward(depth, obs_prepared, return_critic=True)
         end_state_b = self.state_transform.pred_to_endstate(endstate_pred)
 
         b, _, v, h = end_state_b.shape
@@ -255,6 +292,16 @@ class YOPOPreserveOARMNetwork(nn.Module):
         rm_insufficient_logit = None
         zero_window_logit = None
         hazard_logits = None
+        critic = None
+        if self.rm_critic is not None:
+            _, c_feat, _, _ = critic_features.shape
+            candidate_feature = critic_features.permute(0, 2, 3, 1).reshape(b, v * h, c_feat)
+            candidate_geometry = self.rm_critic_geometry_features(end_state_b, traj_time, obs)
+            critic = self.rm_critic(
+                candidate_feature,
+                yopo_cost=score_pred.reshape(b, v * h),
+                candidate_geometry=candidate_geometry,
+            )
         if critic is not None:
             reaction_window_mean = critic["reaction_window_mean"].reshape(b, 1, v, h)
             reaction_window_logvar = critic["reaction_window_logvar"].reshape(b, 1, v, h)

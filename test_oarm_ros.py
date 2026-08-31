@@ -221,6 +221,7 @@ class OARMNet:
         )
         self.last_latency_budget = None
         self.warned_latency_risk_unavailable = False
+        self.warned_latency_brake_unavailable = False
         validity_fusion_cfg = self.config.get("use_validity_risk_fusion", None)
         self.use_validity_risk_fusion = self.enable_rm_critic if validity_fusion_cfg is None else bool(validity_fusion_cfg)
         self.validity_unknown_risk = float(self.config.get("validity_unknown_risk", 0.5))
@@ -522,10 +523,42 @@ class OARMNet:
             except Exception:
                 sensor_age_s = None
         velocity_body = obs.detach().cpu().numpy()[0, :3]
+        start_acc = obs.detach().cpu().numpy()[0, 3:6]
+        goal_body = obs.detach().cpu().numpy()[0, 6:9]
+        brake_duration_s = None
+        brake_distance_m = None
+        try:
+            brake_command = constrained_brake_command(
+                np.zeros(3, dtype=np.float32),
+                velocity_body,
+                start_acc=start_acc,
+                goal=goal_body,
+                min_time=float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time)),
+                brake_accel=self.brake_decel_mps2,
+                max_time=self.brake_max_time,
+                max_accel=self.brake_max_accel_mps2,
+                max_jerk=self.brake_max_jerk_mps3,
+                max_thrust_accel=self.brake_max_thrust_accel_mps2,
+                max_tilt_deg=self.brake_max_tilt_deg,
+                sample_count=self.brake_sample_count,
+                time_growth=self.brake_time_growth,
+                target_z=goal_body[2] if goal_body.size >= 3 else None,
+                z_rate=self.depth_emergency_z_rate,
+                min_command_z=self.min_command_z,
+                max_command_z=self.max_command_z,
+            )
+            brake_duration_s = float(brake_command.duration)
+            brake_distance_m = float(brake_command.diagnostics.stop_distance)
+        except Exception as exc:
+            if not getattr(self, "warned_latency_brake_unavailable", False):
+                rospy.logwarn(f"Could not compute constrained brake duration for latency budget; using speed/brake_accel fallback: {exc}")
+                self.warned_latency_brake_unavailable = True
         budget = self.latency_model.estimate(
             velocity_body_mps=velocity_body,
             inference_latency_s=float(inference_latency_s),
             sensor_age_s=sensor_age_s,
+            maneuver_latency_s=brake_duration_s,
+            brake_distance_m=brake_distance_m,
         )
         self.last_latency_budget = budget
         return budget
@@ -613,7 +646,8 @@ class OARMNet:
         raw_risk_prob_t = risk_prob_t.clamp(1e-6, 1.0 - 1e-6)
         validity_prob_t = None if validity_logit_t is None else torch.sigmoid(validity_logit_t)
         validity_fused_risk_t = raw_risk_prob_t
-        if self.use_validity_risk_fusion and validity_prob_t is not None:
+        risk_already_interaction_conditioned = hazard_risk_prob_t is not None
+        if self.use_validity_risk_fusion and validity_prob_t is not None and not risk_already_interaction_conditioned:
             unknown = torch.full_like(raw_risk_prob_t, self.validity_unknown_risk)
             validity_fused_risk_t = validity_prob_t * raw_risk_prob_t + (1.0 - validity_prob_t) * unknown
             risk_source = risk_source + "+validity"

@@ -85,7 +85,7 @@ class OARMLatencyModel:
         self.queue_history.update(queue_latency_s)
         self.control_history.update(control_latency_s)
 
-    def estimate(self, speed_parallel_mps: Optional[float] = None, velocity_body_mps: Optional[Iterable[float]] = None, inference_latency_s: Optional[float] = None, sensor_age_s: Optional[float] = None, queue_latency_s: Optional[float] = None, selector_latency_s: Optional[float] = None, control_latency_s: Optional[float] = None, actuation_latency_s: Optional[float] = None, reaction_margin_s: Optional[float] = None) -> LatencyBudget:
+    def estimate(self, speed_parallel_mps: Optional[float] = None, velocity_body_mps: Optional[Iterable[float]] = None, inference_latency_s: Optional[float] = None, sensor_age_s: Optional[float] = None, queue_latency_s: Optional[float] = None, selector_latency_s: Optional[float] = None, control_latency_s: Optional[float] = None, actuation_latency_s: Optional[float] = None, reaction_margin_s: Optional[float] = None, maneuver_latency_s: Optional[float] = None, brake_distance_m: Optional[float] = None) -> LatencyBudget:
         self.update(inference_latency_s, queue_latency_s, control_latency_s)
         if speed_parallel_mps is None:
             speed_parallel_mps = self._norm3(velocity_body_mps or ())
@@ -101,7 +101,11 @@ class OARMLatencyModel:
         actuation = self.actuation_latency_s if actuation_latency_s is None else max(float(actuation_latency_s), 0.0)
         reaction_margin = self.reaction_margin_s if reaction_margin_s is None else max(float(reaction_margin_s), 0.0)
         tau_fixed = sensor_age + queue + inference + selector + control + actuation
-        maneuver = speed_parallel_mps / self.brake_accel_mps2
+        if maneuver_latency_s is None:
+            maneuver = speed_parallel_mps / self.brake_accel_mps2
+        else:
+            maneuver = max(float(maneuver_latency_s), 0.0)
         tau_total = tau_fixed + maneuver + reaction_margin
-        brake_distance = speed_parallel_mps * (tau_fixed + reaction_margin) + speed_parallel_mps * speed_parallel_mps / (2.0 * self.brake_accel_mps2)
+        fallback_distance = speed_parallel_mps * (tau_fixed + reaction_margin) + speed_parallel_mps * speed_parallel_mps / (2.0 * self.brake_accel_mps2)
+        brake_distance = fallback_distance if brake_distance_m is None else max(float(brake_distance_m), 0.0)
         return LatencyBudget(sensor_age, queue, inference, selector, control, actuation, maneuver, reaction_margin, tau_fixed, tau_total, brake_distance, speed_parallel_mps)

@@ -33,18 +33,24 @@ def bearing_to_point_camera_frame(observer_pos: torch.Tensor, points: torch.Tens
     pitch = torch.atan2(z, dist_xy)
     return yaw, pitch, rel_c.norm(dim=-1), x > 0.0
 
-def hard_fov_mask(observer_pos, yaw_ref, points, horizon_fov_rad, vertical_fov_rad, pitch_ref=None, camera_rot_w=None):
+def hard_fov_mask(observer_pos, yaw_ref, points, horizon_fov_rad, vertical_fov_rad, pitch_ref=None, camera_rot_w=None, max_range_m=None):
     if camera_rot_w is not None:
-        yaw_to_point, pitch_to_point, _, in_front = bearing_to_point_camera_frame(observer_pos, points, camera_rot_w)
+        yaw_to_point, pitch_to_point, distance, in_front = bearing_to_point_camera_frame(observer_pos, points, camera_rot_w)
         yaw_err = yaw_to_point.abs()
         pitch_err = pitch_to_point.abs()
-        return in_front & (yaw_err <= 0.5 * horizon_fov_rad) & (pitch_err <= 0.5 * vertical_fov_rad)
+        mask = in_front & (yaw_err <= 0.5 * horizon_fov_rad) & (pitch_err <= 0.5 * vertical_fov_rad)
+        if max_range_m is not None and float(max_range_m) > 0.0:
+            mask = mask & (distance <= float(max_range_m))
+        return mask
     if pitch_ref is None:
         pitch_ref = torch.zeros_like(yaw_ref)
-    yaw_to_point, pitch_to_point, _ = bearing_to_point(observer_pos, points)
+    yaw_to_point, pitch_to_point, distance = bearing_to_point(observer_pos, points)
     yaw_err = wrap_to_pi(yaw_to_point - yaw_ref[..., None]).abs()
     pitch_err = (pitch_to_point - pitch_ref[..., None]).abs()
-    return (yaw_err <= 0.5 * horizon_fov_rad) & (pitch_err <= 0.5 * vertical_fov_rad)
+    mask = (yaw_err <= 0.5 * horizon_fov_rad) & (pitch_err <= 0.5 * vertical_fov_rad)
+    if max_range_m is not None and float(max_range_m) > 0.0:
+        mask = mask & (distance <= float(max_range_m))
+    return mask
 
 def soft_fov_score(observer_pos, yaw_ref, points, horizon_fov_rad, vertical_fov_rad, pitch_ref=None, softness=0.08, camera_rot_w=None):
     if camera_rot_w is not None:

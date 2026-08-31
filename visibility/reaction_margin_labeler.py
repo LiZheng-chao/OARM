@@ -20,6 +20,7 @@ class ReactionMarginLabeler:
         risk_arrival_radius_m: float = oarm_cfg.risk_arrival_radius_m,
         no_arrival_margin_s: float = oarm_cfg.no_arrival_margin_s,
         softmin_tau: float = 0.15,
+        visibility_max_range_m: float = oarm_cfg.visibility_max_range_m,
     ):
         self.horizon_fov_rad = horizon_fov_rad
         self.vertical_fov_rad = vertical_fov_rad
@@ -27,6 +28,7 @@ class ReactionMarginLabeler:
         self.risk_arrival_radius_m = risk_arrival_radius_m
         self.no_arrival_margin_s = no_arrival_margin_s
         self.softmin_tau = softmin_tau
+        self.visibility_max_range_m = visibility_max_range_m
 
     def __call__(
         self,
@@ -49,6 +51,7 @@ class ReactionMarginLabeler:
             visibility_mask=visibility_mask,
             max_arrival_distance_m=self.risk_arrival_radius_m,
             camera_rot_w=camera_rot_w,
+            max_range_m=self.visibility_max_range_m,
         )
         point_margin = components['reaction_margin_points']
         point_window = components['observation_lead_time']
@@ -122,6 +125,7 @@ class ReactionMarginLabeler:
             'rm_interaction_valid_gt': candidate_interaction_valid,
             'rm_timely_visible_gt': candidate_timely_visible,
             'rm_right_censored_gt': candidate_right_censored,
+            'rm_blind_at_entry_gt': candidate_right_censored,
             'rm_no_entry_gt': candidate_no_entry,
             'risk_visible_at_t0_gt': candidate_visible_at_t0,
             'critical_risk_point_id': critical_idx,

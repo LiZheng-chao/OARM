@@ -26,7 +26,13 @@ REACTION_WINDOW_KEYS = ("reaction_window_gt", "reaction_window", "selected_react
 REACTION_BUDGET_KEYS = ("reaction_budget_s", "latency_tau_total_s", "tau_total_s", "reaction_budget", "selected_reaction_budget_s")
 EPISODE_LEVEL_LABEL_KEYS = {"collision", "collision_flag", "success", "success_flag", "arrive"}
 GENERIC_LABEL_KEYS = {"risk_label", "selected_risk_label", "label"}
-AUTO_RAW_RISK_KEYS = (
+TWO_STAGE_RISK_KEYS = (
+    "hazard_risk_prob",
+    "selected_hazard_risk_prob",
+    "two_stage_risk_prob",
+    "selected_two_stage_risk_prob",
+)
+AUTO_RAW_RISK_KEYS = TWO_STAGE_RISK_KEYS + (
     "raw_risk_prob",
     "selected_raw_risk_prob",
     "risk_logit_prob",
@@ -34,7 +40,7 @@ AUTO_RAW_RISK_KEYS = (
     "risk_prob",
     "selected_risk_prob",
 )
-AUTO_FUSED_RISK_KEYS = (
+AUTO_FUSED_RISK_KEYS = TWO_STAGE_RISK_KEYS + (
     "validity_fused_risk_prob",
     "selected_validity_fused_risk_prob",
     "raw_risk_prob",
@@ -45,7 +51,7 @@ AUTO_FUSED_RISK_KEYS = (
 AUTO_VALIDITY_KEYS = ("validity_prob", "selected_validity_prob")
 
 
-def _first_number(row: Dict, keys: Iterable[str]) -> Optional[float]:
+def _first_number_with_key(row: Dict, keys: Iterable[str]) -> Tuple[Optional[str], Optional[float]]:
     for key in keys:
         if key in row and row[key] is not None:
             try:
@@ -53,8 +59,13 @@ def _first_number(row: Dict, keys: Iterable[str]) -> Optional[float]:
             except (TypeError, ValueError):
                 continue
             if math.isfinite(value):
-                return value
-    return None
+                return key, value
+    return None, None
+
+
+def _first_number(row: Dict, keys: Iterable[str]) -> Optional[float]:
+    _, value = _first_number_with_key(row, keys)
+    return value
 
 
 def _first_label(row: Dict, keys: Iterable[str]) -> Optional[float]:
@@ -132,6 +143,7 @@ def _extract_arrays(
         "episode_count": 0,
         "missing_reaction_window": 0,
         "missing_reaction_budget": 0,
+        "validity_fusion_skipped_two_stage": 0,
     }
     risk_keys = (risk_key,) if risk_key else (AUTO_RAW_RISK_KEYS if use_validity_fusion else AUTO_FUSED_RISK_KEYS)
     validity_keys = (validity_key,) if validity_key else AUTO_VALIDITY_KEYS
@@ -172,12 +184,15 @@ def _extract_arrays(
                 if label is None:
                     stats["missing_label"] += 1
                     continue
-            risk = _first_number(record, risk_keys)
+            risk_key_used, risk = _first_number_with_key(record, risk_keys)
             if risk is None:
                 stats["missing_risk"] += 1
                 continue
             risk = min(max(risk, 0.0), 1.0)
-            if use_validity_fusion:
+            skip_validity_fusion = risk_key_used in TWO_STAGE_RISK_KEYS
+            if use_validity_fusion and skip_validity_fusion:
+                stats["validity_fusion_skipped_two_stage"] += 1
+            elif use_validity_fusion:
                 validity = _first_number(record, validity_keys)
                 if validity is None:
                     stats["missing_validity"] += 1

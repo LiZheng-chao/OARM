@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import tempfile
 
@@ -24,6 +25,7 @@ from OARM.policy.oarm_rm_critic import (
 from OARM.policy.oarm_trainer import OARMTrainer
 from OARM.train_oarm import parser, resolve_training_options
 from OARM.utils.checkpoint import make_oarm_checkpoint, validate_checkpoint_metadata
+from OARM.visibility.first_visible_time import first_visible_time
 from OARM.visibility.reaction_margin_labeler import ReactionMarginLabeler
 
 
@@ -109,6 +111,7 @@ def check_labeler_window_semantics():
     assert bool(labels["reaction_margin_valid"][0])
     assert not bool(labels["rm_event_valid_gt"][0])
     assert bool(labels["rm_right_censored_gt"][0])
+    assert bool(labels["rm_blind_at_entry_gt"][0])
     assert not bool(labels["rm_no_entry_gt"][0])
     assert torch.allclose(labels["reaction_window_gt"][0], torch.tensor(0.0), atol=1e-5)
     assert torch.allclose(
@@ -123,6 +126,22 @@ def check_labeler_window_semantics():
         + labels["rm_no_entry_gt"].int()
     )
     assert bool((mask_sum <= 1).all())
+
+    origin = torch.zeros((1, 1, 3), dtype=torch.float32)
+    t0 = torch.zeros((1, 1), dtype=torch.float32)
+    yaw0 = torch.zeros((1, 1), dtype=torch.float32)
+    far_point = torch.tensor([[[6.0, 0.0, 0.0]]], dtype=torch.float32)
+    visible_limited = first_visible_time(origin, t0, yaw0, far_point, math.radians(90.0), math.radians(90.0), max_range_m=5.0)
+    visible_unlimited = first_visible_time(origin, t0, yaw0, far_point, math.radians(90.0), math.radians(90.0), max_range_m=None)
+    assert torch.isinf(visible_limited).all()
+    assert torch.isfinite(visible_unlimited).all()
+
+    interp_pos = torch.zeros((1, 2, 3), dtype=torch.float32)
+    interp_time = torch.tensor([[0.0, 1.0]], dtype=torch.float32)
+    interp_yaw = torch.tensor([[0.0, math.pi / 2.0]], dtype=torch.float32)
+    side_point = torch.tensor([[[1.0, 2.0, 0.0]]], dtype=torch.float32)
+    visible_interp = first_visible_time(interp_pos, interp_time, interp_yaw, side_point, math.radians(90.0), math.radians(90.0), max_range_m=None)
+    assert 0.0 < float(visible_interp[0, 0]) < 1.0
 
 
 def check_loss_fail_fast():
@@ -146,6 +165,19 @@ def check_two_stage_hazard_risk_model():
     critic_out = critic(torch.zeros(2, 5, 3))
     assert critic_out["hazard_logits"].shape == (2, 5, 4)
     assert torch.allclose(critic_out["zero_window_logit"], critic_out["insufficient_margin_logit"])
+
+    geom_critic = CandidateRMCritic(candidate_feature_dim=3, geometry_feature_dim=2, hidden_dim=4)
+    with torch.no_grad():
+        for param in geom_critic.parameters():
+            param.zero_()
+        geom_critic.mlp[0].weight[0, 4] = 1.0
+        geom_critic.mlp[2].weight[0, 0] = 1.0
+        geom_critic.mlp[-1].weight[0, 0] = 1.0
+    same_feature = torch.zeros(1, 1, 3)
+    same_cost = torch.zeros(1, 1)
+    out_a = geom_critic(same_feature, yopo_cost=same_cost, candidate_geometry=torch.zeros(1, 1, 2))["reaction_window_mean"]
+    out_b = geom_critic(same_feature, yopo_cost=same_cost, candidate_geometry=torch.ones(1, 1, 2))["reaction_window_mean"]
+    assert not torch.allclose(out_a, out_b)
 
     hazard_logits = torch.tensor([[-4.0, 3.0, -4.0, -4.0]], dtype=torch.float32)
     cdf_early = hazard_cdf_from_logits(hazard_logits, 0.25, max_time_s=2.0)
@@ -175,10 +207,12 @@ def check_two_stage_hazard_risk_model():
     labels = {
         "reaction_window": torch.tensor([0.0, 0.5, 1.2, 0.0]),
         "rm_interaction_valid": torch.tensor([True, True, True, False]),
-        "rm_timely_visible": torch.tensor([True, True, True, False]),
-        "rm_event_valid": torch.tensor([True, True, True, False]),
+        "rm_timely_visible": torch.tensor([False, True, True, False]),
+        "rm_event_valid": torch.tensor([False, True, True, False]),
+        "rm_right_censored": torch.tensor([True, False, False, False]),
+        "rm_blind_at_entry": torch.tensor([True, False, False, False]),
         "rm_no_entry": torch.tensor([False, False, False, True]),
-        "risk_visible_at_t0": torch.tensor([True, False, False, False]),
+        "risk_visible_at_t0": torch.tensor([False, False, False, False]),
     }
     loss_dict = loss.probabilistic_rm_critic_loss(candidate_flat, labels)
     assert loss_dict["rm_critic_zero_bce"] > 0.0
@@ -201,6 +235,9 @@ def check_latency_budget_margin():
     assert abs(budget.maneuver_latency_s - 1.0) < 1e-6
     assert abs(budget.tau_fixed_s - 0.21) < 1e-6
     assert abs(budget.tau_total_s - 1.31) < 1e-6
+    override = model.estimate(speed_parallel_mps=2.0, inference_latency_s=0.01, maneuver_latency_s=1.7, brake_distance_m=3.4)
+    assert abs(override.maneuver_latency_s - 1.7) < 1e-6
+    assert abs(override.brake_distance_m - 3.4) < 1e-6
     assert budget.log_fields_ms()["reaction_margin_ms"] == 100.0
 
 
@@ -374,6 +411,14 @@ def check_fit_risk_calibration_cli_core():
         assert derived["input_stats"]["missing_reaction_window"] == 0
         assert derived["input_stats"]["missing_reaction_budget"] == 0
 
+        hazard_path = os.path.join(tmpdir, "hazard_calib.jsonl")
+        with open(hazard_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"split": "calibration", "episode_id": "ep_h0", "candidates": [{"hazard_risk_prob": 0.05, "validity_prob": 0.1, "insufficient_reaction_gt": 0}]}) + "\n")
+            f.write(json.dumps({"split": "calibration", "episode_id": "ep_h1", "candidates": [{"hazard_risk_prob": 0.90, "validity_prob": 0.1, "insufficient_reaction_gt": 1}]}) + "\n")
+        hazard_payload = fit_calibration_from_jsonl([hazard_path], os.path.join(tmpdir, "hazard.json"), label_key="insufficient_reaction_gt", empirical_upper_alpha=0.25, max_iter=5)
+        assert hazard_payload["input_stats"]["validity_fusion_skipped_two_stage"] == 2
+        assert hazard_payload["input_stats"]["missing_validity"] == 0
+
         bad_path = os.path.join(tmpdir, "bad_collision.jsonl")
         with open(bad_path, "w", encoding="utf-8") as f:
             f.write(json.dumps({"split": "calibration", "episode_id": "ep_bad", "candidates": [{"raw_risk_prob": 0.4, "validity_prob": 1.0, "collision": True}]}) + "\n")
@@ -529,7 +574,7 @@ def check_end_to_end_mini_batch():
     assert torch.isfinite(loss_dict["rm_critic_loss"])
     assert loss_dict["rm_interaction_valid_rate"].item() > 0.99
     assert loss_dict["rm_critic_positive_event_rate"].item() > 0.0
-    assert loss_dict["rm_zero_window_rate"].item() >= 0.0
+    assert loss_dict["rm_zero_window_rate"].item() > 0.0
     optimizer.zero_grad(set_to_none=True)
     loss_dict["rm_critic_loss"].backward()
 

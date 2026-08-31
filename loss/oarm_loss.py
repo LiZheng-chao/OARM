@@ -436,6 +436,7 @@ class OARMLoss(nn.Module):
             "rm_critic_two_stage_risk_mean": zero,
             "rm_event_valid_rate": zero,
             "rm_right_censored_rate": zero,
+            "rm_blind_at_entry_rate": zero,
             "rm_no_entry_rate": zero,
             "risk_visible_at_t0_rate": zero,
             "rm_critic_validity_recall": zero,
@@ -476,11 +477,12 @@ class OARMLoss(nn.Module):
             progress_mask = candidate_type == OARMCandidateGenerator.PROGRESS
         finite = torch.isfinite(window) & torch.isfinite(candidate_flat["reaction_window_mean"])
         interaction_mask = interaction_valid & (~no_entry) & progress_mask & finite
-        visible_at_t0 = labels.get("risk_visible_at_t0")
-        if visible_at_t0 is None:
-            zero_target_bool = interaction_mask & timely_visible & (window <= 1e-6)
+        blind_at_entry = labels.get("rm_blind_at_entry", labels.get("rm_right_censored"))
+        if blind_at_entry is None:
+            blind_at_entry = interaction_mask & (~timely_visible)
         else:
-            zero_target_bool = visible_at_t0.to(device=window.device).reshape_as(window).bool() & interaction_mask
+            blind_at_entry = blind_at_entry.to(device=window.device).reshape_as(window).bool()
+        zero_target_bool = interaction_mask & (blind_at_entry | (timely_visible & (window <= 1e-6)))
         positive_event_mask = interaction_mask & timely_visible & (~zero_target_bool) & (window > 1e-6)
 
         logvar = candidate_flat["reaction_window_logvar"].reshape_as(window).float().clamp(min=-12.0, max=8.0)
@@ -583,6 +585,7 @@ class OARMLoss(nn.Module):
         out["rm_zero_window_rate"] = zero_target_bool.float().mean()
         for src, dst in (
             ("rm_right_censored", "rm_right_censored_rate"),
+            ("rm_blind_at_entry", "rm_blind_at_entry_rate"),
             ("rm_no_entry", "rm_no_entry_rate"),
             ("risk_visible_at_t0", "risk_visible_at_t0_rate"),
         ):

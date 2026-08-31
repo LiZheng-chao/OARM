@@ -90,6 +90,7 @@ class OARMConfig:
     visibility_endpoint_guard_m: float = 0.30
     visibility_occupancy_margin_m: float = 0.05
     visibility_clearance_m: float = 0.25
+    visibility_max_range_m: float = 20.0
     occlusion_weight: float = 0.25
     margin_weight: float = 0.25
     risk_bce_weight: float = 0.2

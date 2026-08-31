@@ -50,6 +50,7 @@ def generate_reaction_margin_labels(
             "rm_interaction_valid",
             "rm_timely_visible",
             "rm_right_censored",
+            "rm_blind_at_entry",
             "rm_no_entry",
             "risk_visible_at_t0",
             "critical_risk_point_id",
@@ -114,6 +115,7 @@ def generate_reaction_margin_labels(
     flat_labels["rm_interaction_valid"] = margin_labels["rm_interaction_valid_gt"].detach()
     flat_labels["rm_timely_visible"] = margin_labels["rm_timely_visible_gt"].detach()
     flat_labels["rm_right_censored"] = margin_labels["rm_right_censored_gt"].detach()
+    flat_labels["rm_blind_at_entry"] = margin_labels["rm_blind_at_entry_gt"].detach()
     flat_labels["rm_no_entry"] = margin_labels["rm_no_entry_gt"].detach()
     flat_labels["risk_visible_at_t0"] = margin_labels["risk_visible_at_t0_gt"].detach()
     flat_labels["critical_risk_point_id"] = margin_labels["critical_risk_point_id"].detach()
