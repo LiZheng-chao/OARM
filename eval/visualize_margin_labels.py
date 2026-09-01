@@ -5,6 +5,7 @@ import os
 
 import torch
 
+from OARM.config import oarm_cfg
 from OARM.dataset import OARMDataset
 from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
 from OARM.policy.oarm_network import OARMNetwork
@@ -28,6 +29,15 @@ TYPE_NAMES = {
 }
 
 
+def checkpoint_training_option(metadata, key, default=None):
+    training_options = (metadata or {}).get("training_options") or {}
+    if key in training_options and training_options[key] is not None:
+        return training_options[key]
+    if metadata and metadata.get(key) is not None:
+        return metadata[key]
+    return default
+
+
 def load_policy(
     checkpoint,
     device,
@@ -38,14 +48,29 @@ def load_policy(
     deployed_yaw_mode="goal",
     enable_rm_critic=False,
 ):
+    state_dict = None
+    checkpoint_metadata = {}
+    if checkpoint:
+        state_dict, checkpoint_metadata = load_oarm_checkpoint(checkpoint, map_location=device)
+    rm_critic_hazard_bins = int(checkpoint_training_option(
+        checkpoint_metadata,
+        "rm_critic_hazard_bins",
+        oarm_cfg.rm_critic_hazard_bins,
+    ))
+    rm_critic_hazard_max_time_s = float(checkpoint_training_option(
+        checkpoint_metadata,
+        "rm_critic_hazard_max_time_s",
+        oarm_cfg.rm_critic_hazard_max_time_s,
+    ))
     policy = OARMNetwork(
         candidate_mode=candidate_mode,
         backbone_mode=backbone_mode,
         enable_yield_candidates=enable_yield_candidates,
         enable_rm_critic=enable_rm_critic,
+        rm_critic_hazard_bins=rm_critic_hazard_bins,
+        rm_critic_hazard_max_time_s=rm_critic_hazard_max_time_s,
     ).to(device)
     if checkpoint:
-        state_dict, checkpoint_metadata = load_oarm_checkpoint(checkpoint, map_location=device)
         validate_checkpoint_metadata(
             checkpoint_metadata,
             candidate_mode,
