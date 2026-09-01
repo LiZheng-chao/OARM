@@ -777,8 +777,7 @@ class OARMNet:
                 self.last_deterministic_brake_terminal_acc_norm = None
                 self.last_deterministic_brake_diagnostics = None
                 end_pos = start_pos + endstate_w[action_id, :, 0]
-                if not self.yopo_preserve_mode:
-                    end_pos[2] = float(np.clip(end_pos[2], self.min_command_z, self.max_command_z))
+                end_pos[2] = float(np.clip(end_pos[2], self.min_command_z, self.max_command_z))
                 end_vel = endstate_w[action_id, :, 1]
                 end_acc = endstate_w[action_id, :, 2]
             self.optimal_poly_x = Poly5Solver(
@@ -1772,7 +1771,11 @@ class OARMNet:
         selected_end_vel = endstate_w[action_id, :, 1]
         selected_end_acc = endstate_w[action_id, :, 2]
         deterministic_brake = bool(self.last_deterministic_brake_stop)
-        commanded_end_pos = np.array(self.last_depth_emergency_target, dtype=np.float32) if deterministic_brake and self.last_depth_emergency_target is not None else selected_end_pos
+        if deterministic_brake and self.last_depth_emergency_target is not None:
+            commanded_end_pos = np.array(self.last_depth_emergency_target, dtype=np.float32)
+        else:
+            commanded_end_pos = selected_end_pos.copy()
+            commanded_end_pos[2] = float(np.clip(commanded_end_pos[2], self.min_command_z, self.max_command_z))
         commanded_end_vel = np.zeros(3, dtype=np.float32) if deterministic_brake else selected_end_vel
         commanded_end_acc = np.zeros(3, dtype=np.float32) if deterministic_brake else selected_end_acc
         selected_goal_distance_drop = None

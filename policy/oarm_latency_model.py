@@ -88,7 +88,8 @@ class OARMLatencyModel:
     def estimate(self, speed_parallel_mps: Optional[float] = None, velocity_body_mps: Optional[Iterable[float]] = None, inference_latency_s: Optional[float] = None, sensor_age_s: Optional[float] = None, queue_latency_s: Optional[float] = None, selector_latency_s: Optional[float] = None, control_latency_s: Optional[float] = None, actuation_latency_s: Optional[float] = None, reaction_margin_s: Optional[float] = None, maneuver_latency_s: Optional[float] = None, brake_distance_m: Optional[float] = None) -> LatencyBudget:
         self.update(inference_latency_s, queue_latency_s, control_latency_s)
         if speed_parallel_mps is None:
-            speed_parallel_mps = self._norm3(velocity_body_mps or ())
+            velocity_values = () if velocity_body_mps is None else velocity_body_mps
+            speed_parallel_mps = self._norm3(velocity_values)
         speed_parallel_mps = max(float(speed_parallel_mps), 0.0)
         sensor_age = self.sensor_age_s if sensor_age_s is None else max(float(sensor_age_s), 0.0)
         queue_p95 = self.queue_history.quantile(self.quantile)
