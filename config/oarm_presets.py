@@ -1,7 +1,17 @@
 from dataclasses import dataclass
 from typing import Dict
 
+from OARM.utils.yopo_compat import ensure_yopo_path
+
 from .oarm_config import oarm_cfg
+
+
+ensure_yopo_path()
+from config.config import cfg
+
+
+def _yopo_candidate_horizon_s() -> float:
+    return float(cfg["sgm_time"])
 
 
 @dataclass(frozen=True)
@@ -141,6 +151,7 @@ OARM_TRAINING_PRESETS: Dict[str, OARMTrainingPreset] = {
         train_reaction_margin=False,
         train_probabilistic_rm_critic=True,
         rm_critic_hazard_bins=8,
+        rm_critic_hazard_max_time_s=_yopo_candidate_horizon_s(),
         train_margin_ranking=False,
         risk_label_source="gt_pointcloud",
         use_privileged_risk_filter=True,
