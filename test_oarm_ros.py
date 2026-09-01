@@ -33,7 +33,7 @@ if YOPO_DIR not in sys.path:
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
 from OARM.policy.oarm_brake import constrained_brake_command, deterministic_brake_endpoint
-from OARM.policy.oarm_latency_model import OARMLatencyModel
+from OARM.policy.oarm_latency_model import OARMLatencyModel, is_sensor_frame_stale
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration, calibrated_probability, risk_upper_bound
 from OARM.policy.oarm_rm_critic import risk_probability_from_window, two_stage_risk_probability
 from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
@@ -99,6 +99,10 @@ class OARMNet:
         self.depth_clearance_gate = bool(self.config.get("depth_clearance_gate", False))
         self.depth_clearance_samples = int(self.config.get("depth_clearance_samples", 9))
         self.depth_clearance_pixel_radius = int(self.config.get("depth_clearance_pixel_radius", 1))
+        self.use_depth_header_sensor_age = bool(self.config.get("use_depth_header_sensor_age", True))
+        self.max_depth_sensor_age_s = max(float(self.config.get("max_depth_sensor_age_ms", 250.0)), 0.0) / 1000.0
+        self.stale_depth_drop_count = 0
+        self.last_depth_sensor_age_s = None
         self.depth_emergency_stop = bool(self.config.get("depth_emergency_stop", False))
         self.depth_emergency_clearance = float(self.config.get("depth_emergency_clearance", self.depth_clearance_min))
         self.depth_emergency_critical_clearance = float(self.config.get("depth_emergency_critical_clearance", 0.15))
@@ -170,6 +174,8 @@ class OARMNet:
         self.first_arrival_time = None
         self.min_goal_distance = None
         self.run_id = self.config.get("run_id") or time.strftime("%Y%m%d_%H%M%S")
+        self.data_split = str(self.config.get("data_split", "adhoc"))
+        self.episode_id = self.config.get("episode_id") or self.run_id
         self.method = self.config.get("method", "oarm")
         self.scenario = self.config.get("scenario", "unknown")
         self.seed = int(self.config.get("seed", 0))
@@ -227,7 +233,10 @@ class OARMNet:
         self.validity_unknown_risk = float(self.config.get("validity_unknown_risk", 0.5))
         self.use_calibrated_risk = bool(self.config.get("use_calibrated_risk", False))
         calibration_file = self.config.get("calibration_file", "") or ""
+        self.calibration_metadata = {}
         if calibration_file:
+            with open(calibration_file, "r", encoding="utf-8") as calibration_stream:
+                self.calibration_metadata = json.load(calibration_stream)
             self.risk_calibration = TemperatureCalibration.from_file(calibration_file)
             self.calibration_version = os.path.basename(calibration_file)
         else:
@@ -236,10 +245,42 @@ class OARMNet:
         if self.config.get("risk_conformal_slack", None) is not None:
             self.risk_calibration.conformal_slack = float(self.config.get("risk_conformal_slack"))
         self.enable_intervention_selector = bool(self.config.get("enable_intervention_selector", False))
+        risk_threshold_keep = float(self.config.get("risk_threshold_keep", 0.10))
+        risk_threshold_safe = float(self.config.get("risk_threshold_safe", 0.20))
+        if not 0.0 <= risk_threshold_keep <= risk_threshold_safe <= 1.0:
+            raise ValueError(
+                "Intervention risk thresholds must satisfy "
+                f"0 <= keep <= safe <= 1, got keep={risk_threshold_keep}, safe={risk_threshold_safe}"
+            )
+        if self.main_experiment and self.enable_intervention_selector:
+            if not calibration_file or not self.use_calibrated_risk:
+                raise ValueError(
+                    "Formal intervention requires --calibration-file and --use-calibrated-risk. "
+                    "Collect a held-out calibration split first; omit --main-experiment only for a diagnostic smoke."
+                )
+            allowed_labels = {
+                "reaction_window_lt_budget",
+                "insufficient_reaction_gt",
+                "rm_violation_gt",
+                "selected_rm_violation_gt",
+            }
+            calibration_stats = self.calibration_metadata.get("input_stats") or {}
+            if (
+                int(self.calibration_metadata.get("sample_count", 0)) <= 0
+                or self.calibration_metadata.get("label_key") not in allowed_labels
+                or self.calibration_metadata.get("calibration_split") != "calibration"
+                or not bool(self.calibration_metadata.get("require_split", False))
+                or not bool(self.calibration_metadata.get("require_episode_id", False))
+                or int(calibration_stats.get("episode_count", 0)) < 2
+            ):
+                raise ValueError(
+                    "Formal intervention calibration must contain candidate-level reaction-risk labels, "
+                    "the calibration split, and at least two explicitly identified episodes."
+                )
         self.intervention_selector = OARMInterventionSelector(
             InterventionSelectorConfig(
-                delta_keep=float(self.config.get("risk_threshold_keep", 0.10)),
-                delta_safe=float(self.config.get("risk_threshold_safe", 0.20)),
+                delta_keep=risk_threshold_keep,
+                delta_safe=risk_threshold_safe,
                 risk_improvement_min=float(self.config.get("risk_improvement_min", 0.02)),
                 lambda_risk=float(self.config.get("selector_lambda_risk", 1.0)),
             )
@@ -377,7 +418,7 @@ class OARMNet:
             self.config["odom_topic"], Odometry, self.callback_odometry, queue_size=1, tcp_nodelay=True
         )
         self.depth_sub = rospy.Subscriber(
-            self.config["depth_topic"], Image, self.callback_depth, queue_size=1, tcp_nodelay=True
+            self.config["depth_topic"], Image, self.callback_depth, queue_size=1, buff_size=2 ** 24, tcp_nodelay=True
         )
         self.goal_sub = rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.callback_set_goal, queue_size=1)
 
@@ -542,15 +583,23 @@ class OARMNet:
         generation_latency_ms = 1000.0 * (time.time() - generation_start)
         return command, start_pos, start_vel, start_acc, generation_latency_ms
 
-    def estimate_reaction_budget(self, depth_msg, obs, inference_latency_s, brake_bundle=None, brake_generation_latency_ms=0.0):
+    def depth_sensor_age_s(self, depth_msg):
         sensor_age_s = None
-        if self.config.get("use_depth_header_sensor_age", True) and getattr(depth_msg, "header", None) is not None:
+        if self.use_depth_header_sensor_age and getattr(depth_msg, "header", None) is not None:
             try:
                 stamp = depth_msg.header.stamp
                 if stamp is not None and not stamp.is_zero():
                     sensor_age_s = max(0.0, (rospy.Time.now() - stamp).to_sec())
             except Exception:
                 sensor_age_s = None
+        return sensor_age_s
+
+    def estimate_reaction_budget(
+        self, depth_msg, obs, inference_latency_s, brake_bundle=None, brake_generation_latency_ms=0.0,
+        sensor_age_s=None,
+    ):
+        if sensor_age_s is None:
+            sensor_age_s = self.depth_sensor_age_s(depth_msg)
         velocity_body = obs.detach().cpu().numpy()[0, :3]
         speed_parallel_mps = None
         brake_duration_s = None
@@ -581,6 +630,19 @@ class OARMNet:
         if self.arrive:
             if self.hover_on_arrival and not self.yopo_preserve_mode:
                 self.publish_arrival_hover()
+            return
+
+        sensor_age_s = self.depth_sensor_age_s(data)
+        self.last_depth_sensor_age_s = sensor_age_s
+        if is_sensor_frame_stale(sensor_age_s, self.max_depth_sensor_age_s):
+            self.stale_depth_drop_count += 1
+            rospy.logwarn_throttle(
+                2.0,
+                "Dropping stale depth frame: age=%.1f ms exceeds max=%.1f ms (dropped=%d)",
+                1000.0 * sensor_age_s,
+                1000.0 * self.max_depth_sensor_age_s,
+                self.stale_depth_drop_count,
+            )
             return
 
         time0 = time.time()
@@ -617,6 +679,7 @@ class OARMNet:
             forward_latency_s,
             brake_bundle=brake_bundle,
             brake_generation_latency_ms=brake_generation_latency_ms,
+            sensor_age_s=sensor_age_s,
         )
         endstate = flat["end_state_b"].detach().cpu().numpy()
         utility = flat["utility_score"].detach().cpu().numpy()
@@ -1798,6 +1861,8 @@ class OARMNet:
         now = float(time.time())
         row = {
             "run_id": self.run_id,
+            "split": self.data_split,
+            "episode_id": self.episode_id,
             "goal_segment_id": int(self.goal_segment_id),
             "method": self.method,
             "scenario": self.scenario,
@@ -1819,6 +1884,10 @@ class OARMNet:
             "use_validity_risk_fusion": bool(self.use_validity_risk_fusion),
             "reaction_budget_margin_ms": float(self.config.get("reaction_budget_margin_ms", 0.0)),
             "validity_unknown_risk": float(self.validity_unknown_risk),
+            "use_depth_header_sensor_age": bool(self.use_depth_header_sensor_age),
+            "max_depth_sensor_age_ms": 1000.0 * self.max_depth_sensor_age_s,
+            "depth_sensor_age_ms": None if self.last_depth_sensor_age_s is None else 1000.0 * self.last_depth_sensor_age_s,
+            "stale_depth_drop_count": int(self.stale_depth_drop_count),
             "calibration_temperature": float(self.risk_calibration.temperature),
             "calibration_conformal_slack": float(self.risk_calibration.conformal_slack),
             "calibration_version": self.calibration_version,
@@ -2062,6 +2131,8 @@ class OARMNet:
         speed = float(np.linalg.norm(odom_vel))
         row = {
             "run_id": self.run_id,
+            "split": self.data_split,
+            "episode_id": self.episode_id,
             "goal_segment_id": int(self.goal_segment_id),
             "method": self.method,
             "scenario": self.scenario,
@@ -2165,6 +2236,10 @@ def parser():
     parser.add_argument("--sensor-age-ms", type=float, default=0.0)
     parser.add_argument("--queue-latency-ms", type=float, default=0.0)
     parser.add_argument("--selector-latency-ms", type=float, default=0.0)
+    depth_age = parser.add_mutually_exclusive_group()
+    depth_age.add_argument("--use-depth-header-sensor-age", dest="use_depth_header_sensor_age", action="store_true", default=True)
+    depth_age.add_argument("--disable-depth-header-sensor-age", dest="use_depth_header_sensor_age", action="store_false")
+    parser.add_argument("--max-depth-sensor-age-ms", type=float, default=250.0, help="drop depth frames older than this; <=0 disables dropping")
     parser.add_argument("--control-latency-ms", type=float, default=20.0)
     parser.add_argument("--actuation-latency-ms", type=float, default=30.0)
     parser.add_argument("--reaction-budget-margin-ms", type=float, default=0.0)
@@ -2242,6 +2317,8 @@ def parser():
     parser.add_argument("--append-logs", action="store_true", help="append to existing JSONL logs instead of overwriting")
     parser.add_argument("--log-candidate-table", action="store_true", help="store all per-candidate scores/endpoints in benchmark JSONL for offline oracle analysis")
     parser.add_argument("--run-id", type=str, default="", help="stable id shared by planner and execution logs")
+    parser.add_argument("--data-split", choices=["train", "calibration", "validation", "test", "adhoc"], default="adhoc")
+    parser.add_argument("--episode-id", type=str, default="", help="episode identity used to enforce calibration/test separation")
     parser.add_argument("--method", type=str, default="oarm", help="method label for benchmark grouping")
     parser.add_argument("--scenario", type=str, default="unknown", help="scenario label written into logs")
     parser.add_argument("--seed", type=int, default=0, help="run seed or map variant id written into logs")
@@ -2288,6 +2365,8 @@ if __name__ == "__main__":
         "sensor_age_ms": args.sensor_age_ms,
         "queue_latency_ms": args.queue_latency_ms,
         "selector_latency_ms": args.selector_latency_ms,
+        "use_depth_header_sensor_age": args.use_depth_header_sensor_age,
+        "max_depth_sensor_age_ms": args.max_depth_sensor_age_ms,
         "control_latency_ms": args.control_latency_ms,
         "actuation_latency_ms": args.actuation_latency_ms,
         "reaction_budget_margin_ms": args.reaction_budget_margin_ms,
@@ -2362,6 +2441,8 @@ if __name__ == "__main__":
         "append_logs": args.append_logs,
         "log_candidate_table": args.log_candidate_table,
         "run_id": args.run_id,
+        "data_split": args.data_split,
+        "episode_id": args.episode_id,
         "method": args.method,
         "scenario": args.scenario,
         "seed": args.seed,

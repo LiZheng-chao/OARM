@@ -90,8 +90,9 @@ def write_jsonl(path, rows):
 
 
 @lru_cache(maxsize=16)
-def load_pointcloud(map_id, dataset_dir):
-    path = os.path.join(dataset_dir, f"pointcloud-{int(map_id)}.ply")
+def load_pointcloud(map_id, dataset_dir, pointcloud_pattern="pointcloud-{map_id}.ply"):
+    filename = str(pointcloud_pattern).format(map_id=int(map_id))
+    path = os.path.join(dataset_dir, filename)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"GT pointcloud not found: {path}")
     import open3d as o3d
@@ -171,7 +172,9 @@ def candidate_reaction_margin_gt(row, candidate, line_of_sight, args, device, ma
     sampled_pos, sampled_time, yaw_ref = build_candidate_trajectory(
         row, candidate, args.eval_points, device, args.deployed_yaw_mode
     )
-    min_clearance = trajectory_min_clearance(sampled_pos, map_id, args.dataset_dir)
+    min_clearance = trajectory_min_clearance(
+        sampled_pos, map_id, args.dataset_dir, args.pointcloud_pattern
+    )
     result = {
         "min_clearance_gt": min_clearance,
         "collision_gt": bool(min_clearance < args.collision_clearance),
@@ -182,6 +185,7 @@ def candidate_reaction_margin_gt(row, candidate, line_of_sight, args, device, ma
         args.dataset_dir,
         args.risk_radius,
         args.max_risk_points,
+        args.pointcloud_pattern,
     )
     if risk_points is None:
         result.update({
@@ -272,8 +276,10 @@ def candidate_reaction_margin_gt(row, candidate, line_of_sight, args, device, ma
     return result
 
 
-def select_gt_risk_points(sampled_pos, map_id, dataset_dir, risk_radius, max_points):
-    points, tree = load_pointcloud(map_id, dataset_dir)
+def select_gt_risk_points(
+    sampled_pos, map_id, dataset_dir, risk_radius, max_points, pointcloud_pattern="pointcloud-{map_id}.ply"
+):
+    points, tree = load_pointcloud(map_id, dataset_dir, pointcloud_pattern)
     traj_np = sampled_pos.detach().cpu().numpy().reshape(-1, 3)
     index_set = set()
     for point in traj_np:
@@ -287,8 +293,10 @@ def select_gt_risk_points(sampled_pos, map_id, dataset_dir, risk_radius, max_poi
     return risk_points[order]
 
 
-def trajectory_min_clearance(sampled_pos, map_id, dataset_dir):
-    _points, tree = load_pointcloud(map_id, dataset_dir)
+def trajectory_min_clearance(
+    sampled_pos, map_id, dataset_dir, pointcloud_pattern="pointcloud-{map_id}.ply"
+):
+    _points, tree = load_pointcloud(map_id, dataset_dir, pointcloud_pattern)
     traj_np = sampled_pos.detach().cpu().numpy().reshape(-1, 3)
     distances, _ = tree.query(traj_np, k=1)
     return float(np.min(distances))
@@ -300,7 +308,9 @@ def annotate_row(row, line_of_sight, args, device):
         return row
     map_id = int(row.get("map_id", args.map_id))
     sampled_pos, sampled_time, yaw_ref = build_selected_trajectory(row, args.eval_points, device, args.deployed_yaw_mode)
-    min_clearance = trajectory_min_clearance(sampled_pos, map_id, args.dataset_dir)
+    min_clearance = trajectory_min_clearance(
+        sampled_pos, map_id, args.dataset_dir, args.pointcloud_pattern
+    )
     selected_collision = bool(min_clearance < args.collision_clearance)
     row["selected_traj_min_clearance_gt"] = min_clearance
     row["selected_traj_collision_gt"] = selected_collision
@@ -312,6 +322,7 @@ def annotate_row(row, line_of_sight, args, device):
         args.dataset_dir,
         args.risk_radius,
         args.max_risk_points,
+        args.pointcloud_pattern,
     )
     if risk_points is None:
         row.update(
@@ -454,7 +465,12 @@ def parser():
     p = argparse.ArgumentParser()
     p.add_argument("--input", required=True, help="ROS benchmark JSONL from test_oarm_ros.py --log-jsonl")
     p.add_argument("--output", required=True, help="annotated JSONL output")
-    p.add_argument("--dataset-dir", default="dataset", help="directory containing pointcloud-*.ply")
+    p.add_argument("--dataset-dir", default="dataset", help="directory containing GT pointcloud PLY files")
+    p.add_argument(
+        "--pointcloud-pattern",
+        default="pointcloud-{map_id}.ply",
+        help="PLY filename pattern inside --dataset-dir; may be a fixed filename for a single-scene run",
+    )
     p.add_argument("--map-id", type=int, default=0, help="fallback map id when rows do not contain map_id")
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     p.add_argument("--eval-points", type=int, default=40)

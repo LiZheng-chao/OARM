@@ -4,6 +4,13 @@ from dataclasses import asdict, dataclass
 from typing import Deque, Dict, Iterable, Optional
 
 
+def is_sensor_frame_stale(sensor_age_s: Optional[float], max_sensor_age_s: float) -> bool:
+    if sensor_age_s is None or max_sensor_age_s <= 0.0:
+        return False
+    age = float(sensor_age_s)
+    return math.isfinite(age) and age > float(max_sensor_age_s)
+
+
 @dataclass
 class LatencyBudget:
     sensor_age_s: float
