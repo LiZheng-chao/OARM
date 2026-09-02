@@ -13,9 +13,24 @@ from OARM.policy.oarm_poly_solver import quintic_coefficients, sample_polynomial
 from OARM.visibility.esdf_visibility import ESDFLineOfSight
 from OARM.visibility.first_visible_time import reaction_margin_components
 from OARM.utils.yopo_compat import ensure_yopo_path
+from OARM.utils.yopo_dataset_context import yopo_dataset_cfg
 
 ensure_yopo_path()
 from config.config import cfg
+
+
+def reaction_budget_for_row(row, fallback_s):
+    for key, scale in (("reaction_budget_ms", 1e-3), ("tau_total_s", 1.0)):
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            budget_s = float(value) * scale
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(budget_s) and budget_s >= 0.0:
+            return budget_s, key
+    return float(fallback_s), "config_reaction_time"
 
 
 def parse_vector(row, key, length=3):
@@ -175,9 +190,12 @@ def candidate_reaction_margin_gt(row, candidate, line_of_sight, args, device, ma
     min_clearance = trajectory_min_clearance(
         sampled_pos, map_id, args.dataset_dir, args.pointcloud_pattern
     )
+    reaction_budget_s, reaction_budget_source = reaction_budget_for_row(row, args.reaction_time)
     result = {
         "min_clearance_gt": min_clearance,
         "collision_gt": bool(min_clearance < args.collision_clearance),
+        "reaction_budget_gt_s": reaction_budget_s,
+        "reaction_budget_gt_source": reaction_budget_source,
     }
     risk_points = select_gt_risk_points(
         sampled_pos,
@@ -215,7 +233,7 @@ def candidate_reaction_margin_gt(row, candidate, line_of_sight, args, device, ma
         risk_points_t,
         horizon_fov_rad=math.radians(args.horizon_fov_deg),
         vertical_fov_rad=math.radians(args.vertical_fov_deg),
-        reaction_time=args.reaction_time,
+        reaction_time=reaction_budget_s,
         visibility_mask=visibility_mask,
         max_arrival_distance_m=args.arrival_radius,
     )
@@ -306,12 +324,15 @@ def annotate_row(row, line_of_sight, args, device):
     if "selected_end_pos_w" not in row:
         row["gt_annotation_status"] = "missing_geometry_fields"
         return row
-    map_id = int(row.get("map_id", args.map_id))
+    map_id = int(args.map_id if args.force_map_id else row.get("map_id", args.map_id))
     sampled_pos, sampled_time, yaw_ref = build_selected_trajectory(row, args.eval_points, device, args.deployed_yaw_mode)
     min_clearance = trajectory_min_clearance(
         sampled_pos, map_id, args.dataset_dir, args.pointcloud_pattern
     )
     selected_collision = bool(min_clearance < args.collision_clearance)
+    reaction_budget_s, reaction_budget_source = reaction_budget_for_row(row, args.reaction_time)
+    row["reaction_budget_gt_s"] = reaction_budget_s
+    row["reaction_budget_gt_source"] = reaction_budget_source
     row["selected_traj_min_clearance_gt"] = min_clearance
     row["selected_traj_collision_gt"] = selected_collision
     row["min_clearance_gt"] = min_clearance
@@ -353,7 +374,7 @@ def annotate_row(row, line_of_sight, args, device):
         risk_points_t,
         horizon_fov_rad=math.radians(args.horizon_fov_deg),
         vertical_fov_rad=math.radians(args.vertical_fov_deg),
-        reaction_time=args.reaction_time,
+        reaction_time=reaction_budget_s,
         visibility_mask=visibility_mask,
         max_arrival_distance_m=args.arrival_radius,
     )
@@ -442,7 +463,11 @@ def annotate(args):
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
     device = torch.device(args.device)
-    line_of_sight = ESDFLineOfSight(device=device) if args.use_esdf_los else None
+    if args.use_esdf_los:
+        with yopo_dataset_cfg(args.dataset_dir):
+            line_of_sight = ESDFLineOfSight(device=device)
+    else:
+        line_of_sight = None
     rows = [annotate_row(row, line_of_sight, args, device) for row in read_jsonl(args.input)]
     write_jsonl(args.output, rows)
     ok = sum(1 for row in rows if row.get("gt_annotation_status") == "ok")
@@ -472,6 +497,11 @@ def parser():
         help="PLY filename pattern inside --dataset-dir; may be a fixed filename for a single-scene run",
     )
     p.add_argument("--map-id", type=int, default=0, help="fallback map id when rows do not contain map_id")
+    p.add_argument(
+        "--force-map-id",
+        action="store_true",
+        help="use --map-id even when log rows contain another id, for exported single-scene GT datasets",
+    )
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     p.add_argument("--eval-points", type=int, default=40)
     p.add_argument("--risk-radius", type=float, default=2.0)

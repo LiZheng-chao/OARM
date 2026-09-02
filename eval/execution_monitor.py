@@ -23,8 +23,9 @@ def write_jsonl(path, rows):
 
 
 @lru_cache(maxsize=16)
-def load_pointcloud(map_id, dataset_dir):
-    path = os.path.join(dataset_dir, f"pointcloud-{int(map_id)}.ply")
+def load_pointcloud(map_id, dataset_dir, pointcloud_pattern="pointcloud-{map_id}.ply"):
+    filename = str(pointcloud_pattern).format(map_id=int(map_id))
+    path = os.path.join(dataset_dir, filename)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"GT pointcloud not found: {path}")
     import open3d as o3d
@@ -64,6 +65,13 @@ def parse_bool(value):
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def first_present(rows, key):
+    for row in rows:
+        if key in row and row.get(key) not in (None, ""):
+            return row.get(key)
+    return None
 
 
 def active_rows(rows):
@@ -203,7 +211,7 @@ def first_collision_event(rows, args, map_id):
     times = [row_time(row) for row in rows] if len(rows) == raw_positions.shape[0] else None
     goals = [row_goal_distance(row) for row in rows] if len(rows) == raw_positions.shape[0] else None
     positions, dense_times, dense_goals = densify_trajectory(raw_positions, times, goals, args.clearance_sample_step)
-    _points, tree = load_pointcloud(map_id, args.dataset_dir)
+    _points, tree = load_pointcloud(map_id, args.dataset_dir, args.pointcloud_pattern)
     distances, _ = tree.query(positions, k=1)
     hit_indices = np.flatnonzero(distances < args.collision_clearance)
     if hit_indices.size == 0:
@@ -414,7 +422,7 @@ def execution_summary(rows, args):
     min_clearance_raw_goal_distance = None
     collision_exec = False
     if positions.shape[0] > 0:
-        _points, tree = load_pointcloud(map_id, args.dataset_dir)
+        _points, tree = load_pointcloud(map_id, args.dataset_dir, args.pointcloud_pattern)
         distances, _ = tree.query(positions, k=1)
         dense_min_index = int(np.argmin(distances))
         min_clearance = float(distances[dense_min_index])
@@ -585,6 +593,11 @@ def parser():
     p.add_argument("--run-id", default="", help="optional run_id filter; defaults to the latest run_id in the log")
     p.add_argument("--goal-segment-id", default="", help="optional goal_segment_id filter; defaults to the latest segment")
     p.add_argument("--dataset-dir", default="dataset", help="directory containing pointcloud-*.ply")
+    p.add_argument(
+        "--pointcloud-pattern",
+        default="pointcloud-{map_id}.ply",
+        help="PLY filename pattern inside --dataset-dir; may be a fixed filename for a single-scene run",
+    )
     p.add_argument("--map-id", type=int, default=0, help="fallback map id when rows do not contain map_id")
     p.add_argument("--collision-clearance", type=float, default=0.25)
     p.add_argument("--success-distance", type=float, default=1.0)

@@ -247,6 +247,17 @@ def source_value(rows, key, fallback):
     return str(value)
 
 
+def run_identity(rows, path):
+    run_id = first_present(rows, "run_id")
+    if run_id in (None, ""):
+        return ("__path__", os.path.abspath(path))
+    return (
+        str(first_present(rows, "method") or ""),
+        str(run_id),
+        str(first_present(rows, "goal_segment_id") or ""),
+    )
+
+
 def group_key_for_rows(rows, path, args):
     scenario = args.scenario or first_present(rows, "scenario") or scenario_from_path(path, args.default_scenario)
     method = args.method or first_present(rows, "method")
@@ -535,12 +546,25 @@ def benchmark(args):
         )
         return
 
-    logs = discover_logs(args.logs)
-    grouped = defaultdict(list)
+    excluded_outputs = {
+        os.path.abspath(path)
+        for path in (args.output, args.csv_output)
+        if path
+    }
+    logs = [path for path in discover_logs(args.logs) if os.path.abspath(path) not in excluded_outputs]
+    candidates_by_run = defaultdict(list)
     for path in logs:
         rows = parse_rows(path)
-        group_key = group_key_for_rows(rows, path, args)
-        grouped[group_key].append(summarize_run(rows))
+        if len(rows) == 1 and rows[0].get("benchmark") and rows[0].get("metrics") is not None:
+            continue
+        candidates_by_run[run_identity(rows, path)].append((path, rows, summarize_run(rows)))
+
+    grouped = defaultdict(list)
+    for candidates in candidates_by_run.values():
+        monitored = [item for item in candidates if item[2].get("execution_metrics_available")]
+        for path, rows, summary in monitored or candidates:
+            group_key = group_key_for_rows(rows, path, args)
+            grouped[group_key].append(summary)
     invalid = [
         f"{scenario}[run={idx}]: {summary.get('benchmark_warnings')}"
         for scenario, summaries in grouped.items()
@@ -548,7 +572,11 @@ def benchmark(args):
         if summary.get("benchmark_warnings")
     ]
     if args.require_exec_metrics and invalid:
-        raise ValueError("Invalid execution metrics for paper benchmark: " + " | ".join(invalid))
+        raise ValueError(
+            "Invalid execution metrics for paper benchmark: "
+            + " | ".join(invalid)
+            + ". Run OARM.eval.execution_monitor first and benchmark its annotated output, not raw planner/exec logs."
+        )
 
     summaries = {scenario: aggregate(runs) for scenario, runs in grouped.items()}
     output = {
