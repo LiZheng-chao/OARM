@@ -319,6 +319,9 @@ def check_brake_intervention_latch():
     held = latch.update(rerank, 0.7, 0.5, True, 0.0, 0.1)
     assert held.intervention_reason == BRAKE_LATCH_HOLD
     assert latch.safe_release_frames == 0
+    no_evidence = latch.update(rerank, 0.75, 0.1, True, 0.0, 0.1, release_evidence=False)
+    assert no_evidence.intervention_reason == BRAKE_LATCH_HOLD
+    assert latch.safe_release_frames == 0
     assert latch.update(rerank, 0.8, 0.1, True, 0.0, 0.1).intervention_reason == BRAKE_LATCH_HOLD
     assert latch.update(rerank, 0.9, 0.1, True, 0.0, 0.1).intervention_reason == BRAKE_LATCH_HOLD
     released = latch.update(rerank, 1.0, 0.1, True, 0.0, 0.1)

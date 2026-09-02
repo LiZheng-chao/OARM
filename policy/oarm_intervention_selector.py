@@ -45,6 +45,7 @@ class BrakeLatchConfig:
     release_speed_mps: float = 0.25
     release_frames: int = 3
     release_risk: float = 0.10
+    require_release_evidence: bool = True
 
 
 class BrakeInterventionLatch:
@@ -64,6 +65,7 @@ class BrakeInterventionLatch:
         selected_admissible: bool,
         brake_duration_s: float,
         brake_risk_upper_bound: Optional[float],
+        release_evidence: bool = True,
     ) -> InterventionSelection:
         if not self.config.enabled:
             return decision
@@ -78,6 +80,7 @@ class BrakeInterventionLatch:
             now_s >= self.hold_until_s
             and float(speed_mps) <= float(self.config.release_speed_mps)
             and selected_admissible
+            and (release_evidence or not self.config.require_release_evidence)
             and decision.risk_after is not None
             and float(decision.risk_after) <= float(self.config.release_risk)
         )

@@ -233,6 +233,36 @@ def first_collision_event(rows, args, map_id):
     }, source
 
 
+def first_timeout_event(rows, max_time):
+    if float(max_time) <= 0.0:
+        return None
+    timed_rows = [(row_time(row), row) for row in rows]
+    timed_rows = [(time_s, row) for time_s, row in timed_rows if time_s is not None]
+    if not timed_rows:
+        return None
+    first_time = min(time_s for time_s, _row in timed_rows)
+    last_time = max(time_s for time_s, _row in timed_rows)
+    timeout_time = float(first_time) + float(max_time)
+    if last_time + 1e-6 < timeout_time:
+        return None
+    timeout_row = min(timed_rows, key=lambda item: abs(item[0] - timeout_time))[1]
+    position, _source = parse_vector(
+        timeout_row,
+        (
+            ("odom_pos_w", "executed_odom_to_gt_pointcloud"),
+            ("position_w", "position_field_to_gt_pointcloud"),
+            ("pos_w", "position_field_to_gt_pointcloud"),
+            ("start_pos_w", "reference_or_planner_start_to_gt_pointcloud"),
+        ),
+    )
+    return {
+        "event": "timeout",
+        "time": timeout_time,
+        "position": position,
+        "goal_distance": row_goal_distance(timeout_row),
+    }
+
+
 def event_position_list(event):
     if not event:
         return None
@@ -244,12 +274,14 @@ def event_position_list(event):
     return position
 
 
-def choose_terminal_event(arrival_event, collision_event, args):
+def choose_terminal_event(arrival_event, collision_event, timeout_event, args):
     candidates = []
     if arrival_event is not None and not args.keep_after_arrival:
         candidates.append(arrival_event)
     if collision_event is not None and not args.keep_after_collision:
         candidates.append(collision_event)
+    if timeout_event is not None:
+        candidates.append(timeout_event)
     if not candidates:
         return None
     timed = [event for event in candidates if event.get("time") is not None]
@@ -402,8 +434,9 @@ def execution_summary(rows, args):
     map_id = int(rows[0].get("map_id", args.map_id)) if rows else int(args.map_id)
     arrival_event = first_arrival_event(rows, args.success_distance)
     collision_event, clearance_source = first_collision_event(rows, args, map_id)
+    timeout_event = first_timeout_event(rows, args.max_time)
     motion_event = first_motion_event(rows, args)
-    terminal_event = choose_terminal_event(arrival_event, collision_event, args)
+    terminal_event = choose_terminal_event(arrival_event, collision_event, timeout_event, args)
     if terminal_event is not None:
         rows = trim_at_time(rows, terminal_event.get("time"))
 
@@ -457,8 +490,12 @@ def execution_summary(rows, args):
     path_time = (max(times) - min(times)) if times else 0.0
     if terminal_time is not None and times:
         path_time = max(0.0, float(terminal_time) - min(times))
-    timeout_exec = bool(args.max_time > 0.0 and path_time >= args.max_time)
-    reached_goal = bool(event_happened_before_or_at(arrival_event, terminal_event))
+    effective_collision_event = (
+        collision_event if event_happened_before_or_at(collision_event, terminal_event) else None)
+    effective_arrival_event = (
+        arrival_event if event_happened_before_or_at(arrival_event, terminal_event) else None)
+    timeout_exec = bool(terminal_event is not None and terminal_event.get("event") == "timeout")
+    reached_goal = bool(effective_arrival_event is not None)
     success_exec = bool(reached_goal and not collision_exec and not timeout_exec)
 
     speeds = [row_speed(row) for row in rows]
@@ -470,8 +507,8 @@ def execution_summary(rows, args):
     motion_speeds = [speed for speed in motion_speeds if speed is not None]
 
     first_time = min(times) if times else None
-    first_collision_time = collision_event.get("time") if collision_event else None
-    first_arrival_time = arrival_event.get("time") if arrival_event else None
+    first_collision_time = effective_collision_event.get("time") if effective_collision_event else None
+    first_arrival_time = effective_arrival_event.get("time") if effective_arrival_event else None
     time_to_collision = None
     if first_time is not None and first_collision_time is not None:
         time_to_collision = max(0.0, float(first_collision_time) - first_time)
@@ -490,8 +527,9 @@ def execution_summary(rows, args):
     first_collision_speed = row_speed(collision_row) if collision_row is not None else None
     first_arrival_speed = row_speed(arrival_row) if arrival_row is not None else None
     progress_at_collision = None
-    if motion_start_goal_distance is not None and collision_event is not None and collision_event.get("goal_distance") is not None:
-        progress_at_collision = float(motion_start_goal_distance - collision_event.get("goal_distance"))
+    if (motion_start_goal_distance is not None and effective_collision_event is not None
+            and effective_collision_event.get("goal_distance") is not None):
+        progress_at_collision = float(motion_start_goal_distance - effective_collision_event.get("goal_distance"))
     progress_at_terminal = None
     if motion_start_goal_distance is not None and goal_distance_final is not None:
         progress_at_terminal = float(motion_start_goal_distance - goal_distance_final)
@@ -523,12 +561,12 @@ def execution_summary(rows, args):
         "exec_clearance_sample_step": float(args.clearance_sample_step),
         "goal_segment_id": rows[0].get("goal_segment_id") if rows else None,
         "first_arrival_time_exec": first_arrival_time,
-        "first_arrival_position_w": event_position_list(arrival_event),
+        "first_arrival_position_w": event_position_list(effective_arrival_event),
         "first_arrival_speed_exec": first_arrival_speed,
         "first_collision_time_exec": first_collision_time,
-        "first_collision_position_w": event_position_list(collision_event),
-        "first_collision_goal_distance": collision_event.get("goal_distance") if collision_event else None,
-        "first_collision_clearance": collision_event.get("clearance") if collision_event else None,
+        "first_collision_position_w": event_position_list(effective_collision_event),
+        "first_collision_goal_distance": effective_collision_event.get("goal_distance") if effective_collision_event else None,
+        "first_collision_clearance": effective_collision_event.get("clearance") if effective_collision_event else None,
         "first_collision_speed_exec": first_collision_speed,
         "time_to_collision_exec": time_to_collision,
         "motion_start_time_exec": motion_start_time,
@@ -545,6 +583,8 @@ def execution_summary(rows, args):
         "distance_travelled_before_terminal_exec": distance_before_terminal,
         "monitor_terminal_event": terminal_event.get("event") if terminal_event else None,
         "monitor_terminal_time": terminal_time,
+        "monitor_terminal_position_w": event_position_list(terminal_event),
+        "monitor_terminal_goal_distance": terminal_event.get("goal_distance") if terminal_event else None,
         "monitor_trimmed_at_terminal": bool(terminal_event is not None),
         "monitor_collision_clearance": float(args.collision_clearance),
         "monitor_success_distance": float(args.success_distance),

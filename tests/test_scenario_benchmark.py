@@ -44,6 +44,34 @@ def test_execution_monitor_accepts_fixed_pointcloud_pattern():
     assert annotate_gt_reaction_margin.reaction_budget_for_row({}, 0.35) == (0.35, "config_reaction_time")
 
 
+def test_execution_monitor_uses_max_time_as_terminal_event():
+    rows = [
+        {"time": 10.0, "odom_pos_w": [0.0, 0.0, 1.5], "goal_distance": 10.0},
+        {"time": 40.0, "odom_pos_w": [1.0, 0.0, 1.5], "goal_distance": 9.0},
+        {"time": 70.0, "odom_pos_w": [2.0, 0.0, 1.5], "goal_distance": 8.0},
+    ]
+    timeout = execution_monitor.first_timeout_event(rows, 30.0)
+    args = SimpleNamespace(keep_after_arrival=False, keep_after_collision=False)
+
+    assert timeout["event"] == "timeout"
+    assert timeout["time"] == 40.0
+    terminal = execution_monitor.choose_terminal_event(
+        {"event": "arrival", "time": 60.0},
+        {"event": "collision", "time": 50.0},
+        timeout,
+        args,
+    )
+    assert terminal["event"] == "timeout"
+
+    terminal = execution_monitor.choose_terminal_event(
+        None,
+        {"event": "collision", "time": 20.0},
+        timeout,
+        args,
+    )
+    assert terminal["event"] == "collision"
+
+
 def test_benchmark_prefers_monitored_log_for_same_run(tmp_path):
     identity = {
         "method": "oarm",

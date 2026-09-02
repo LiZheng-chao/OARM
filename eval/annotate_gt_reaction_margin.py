@@ -123,9 +123,10 @@ def build_selected_trajectory(row, eval_points, device, deployed_yaw_mode):
     start_pos = parse_vector(row, "start_pos_w")
     start_vel = parse_vector(row, "start_vel_w")
     start_acc = parse_vector(row, "start_acc_w")
-    end_pos = parse_vector(row, "selected_end_pos_w")
-    end_vel = parse_vector(row, "selected_end_vel_w")
-    end_acc = parse_vector(row, "selected_end_acc_w")
+    endpoint_prefix = "commanded" if "commanded_end_pos_w" in row else "selected"
+    end_pos = parse_vector(row, f"{endpoint_prefix}_end_pos_w")
+    end_vel = parse_vector(row, f"{endpoint_prefix}_end_vel_w")
+    end_acc = parse_vector(row, f"{endpoint_prefix}_end_acc_w")
     traj_time = parse_float(row, "selected_time")
     yaw0 = parse_float(row, "yaw0", 0.0)
     yaw_terminal = parse_float(row, "selected_yaw_terminal", yaw0)

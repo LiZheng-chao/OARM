@@ -1,6 +1,6 @@
 {
   "protocol": "oarm3_phase3_locked",
-  "version": 1,
+  "version": 2,
   "status": "code_ready_closed_loop_validation_pending",
   "checkpoint": "OARM/saved/OARM_53/last.pth",
   "calibration_file": "OARM/results/oarm3_calibration/ceiling_gate_v1_s0/risk_calibration.json",
@@ -30,11 +30,17 @@
     "min_hold_s": 0.6,
     "release_speed_mps": 0.25,
     "release_frames": 3,
-    "release_risk": 0.45
+    "release_risk": 0.45,
+    "fixed_anchor": true,
+    "require_release_evidence": true,
+    "probe_enabled": true,
+    "probe_yaw_deg": 30.0,
+    "probe_period_s": 2.0,
+    "probe_min_stationary_s": 2.0
   },
   "validation": {
     "scene": "oarm_blind_gate_v4_s0",
-    "next_seed": 74,
+    "next_seed": 75,
     "data_split": "validation"
   },
   "held_out_test": {
@@ -46,6 +52,7 @@
     "execution_metrics_required": true,
     "collision_exec_rate": 0.0,
     "success_exec_rate": 1.0,
+    "safe_timeout_is_non_collision_diagnostic": true,
     "stale_depth_drop_count": 0,
     "require_finite_planner_outputs": true,
     "require_yopo_frozen": true,

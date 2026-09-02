@@ -7,6 +7,7 @@ Simulator/src/config/config.yaml so the change remains config-only.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 from pathlib import Path
@@ -27,6 +28,27 @@ def parse_scalar_yaml(path: Path) -> dict[str, str]:
             raise ValueError(f"{path}:{line_no}: expected non-empty key and value")
         values[key] = value
     return values
+
+
+def resolve_portable_paths(values: dict[str, str], project_root: Path) -> dict[str, str]:
+    resolved = dict(values)
+    raw_ply = resolved.get("ply_file")
+    if raw_ply is None:
+        return resolved
+
+    unquoted = raw_ply.strip().strip('"').strip("'")
+    workspace_prefix = "/workspace/YOPO/"
+    if unquoted.startswith(workspace_prefix):
+        ply_path = project_root / unquoted[len(workspace_prefix):]
+    else:
+        ply_path = Path(unquoted)
+    if not ply_path.is_absolute():
+        ply_path = project_root / ply_path
+    ply_path = ply_path.resolve()
+    if not ply_path.is_file():
+        raise FileNotFoundError(f"Scenario pointcloud not found: {ply_path}")
+    resolved["ply_file"] = json.dumps(str(ply_path))
+    return resolved
 
 
 def patch_config(config_text: str, values: dict[str, str]) -> tuple[str, list[str], list[str]]:
@@ -63,6 +85,7 @@ def main() -> None:
     scenario = args.scenario
     config = args.config
     values = parse_scalar_yaml(scenario)
+    values = resolve_portable_paths(values, Path(__file__).resolve().parents[2])
     original = config.read_text(encoding="utf-8")
     updated, changed, missing = patch_config(original, values)
 

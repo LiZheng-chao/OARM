@@ -134,8 +134,17 @@ class OARMNet:
                 release_speed_mps=float(self.config.get("brake_latch_release_speed_mps", 0.25)),
                 release_frames=int(self.config.get("brake_latch_release_frames", 3)),
                 release_risk=float(self.config.get("risk_threshold_keep", 0.10)),
+                require_release_evidence=bool(self.config.get("brake_latch_require_release_evidence", True)),
             )
         )
+        self.brake_probe_enabled = bool(self.config.get("brake_probe_enabled", True))
+        self.brake_probe_yaw_amplitude_rad = np.deg2rad(float(self.config.get("brake_probe_yaw_deg", 30.0)))
+        self.brake_probe_period_s = max(float(self.config.get("brake_probe_period_s", 2.0)), 0.1)
+        self.brake_probe_min_stationary_s = max(float(self.config.get("brake_probe_min_stationary_s", 2.0)), 0.0)
+        self.brake_latch_anchor_w = None
+        self.brake_latch_anchor_time_s = None
+        self.brake_probe_stationary_start_s = None
+        self.brake_probe_yaw_center = None
         self.last_depth_emergency_stop = False
         self.last_depth_emergency_reason = None
         self.last_depth_emergency_target = None
@@ -293,6 +302,11 @@ class OARMNet:
                 )
         if self.main_experiment and self.enable_intervention_selector and not self.brake_latch.config.enabled:
             raise ValueError("Formal intervention requires the brake latch; remove --disable-brake-latch.")
+        if self.main_experiment and self.enable_intervention_selector and (
+            not self.brake_probe_enabled or not self.brake_latch.config.require_release_evidence
+        ):
+            raise ValueError(
+                "Formal intervention requires the stationary visibility probe before releasing BRAKE.")
         self.intervention_selector = OARMInterventionSelector(
             InterventionSelectorConfig(
                 delta_keep=risk_threshold_keep,
@@ -494,6 +508,13 @@ class OARMNet:
         self.last_selected_time = None
         self.last_selected_end_norm = None
         self.reset_executed_path()
+        self.brake_latch.active = False
+        self.brake_latch.hold_until_s = 0.0
+        self.brake_latch.safe_release_frames = 0
+        self.brake_latch_anchor_w = None
+        self.brake_latch_anchor_time_s = None
+        self.brake_probe_stationary_start_s = None
+        self.brake_probe_yaw_center = None
         if self.odom_init:
             self.desire_pos = np.array(
                 (self.odom.pose.pose.position.x, self.odom.pose.pose.position.y, self.odom.pose.pose.position.z)
@@ -792,6 +813,7 @@ class OARMNet:
         intervention = None
         intervention_brake = False
         brake_candidate = None
+        brake_anchor_created = False
         if self.enable_intervention_selector:
             brake_candidate = self.build_and_evaluate_brake_candidate(
                 depth_m,
@@ -810,6 +832,13 @@ class OARMNet:
                 brake_candidate=brake_candidate,
             )
             intervention_brake = intervention is not None and intervention.intervention_type == "BRAKE"
+            if intervention_brake and self.brake_latch.active and self.brake_latch_anchor_w is None:
+                if brake_candidate is not None:
+                    self.brake_latch_anchor_w = np.asarray(
+                        brake_candidate["command"].end_pos, dtype=np.float32
+                    ).copy()
+                    self.brake_latch_anchor_time_s = time.time()
+                    brake_anchor_created = True
         else:
             self.last_brake_candidate_info = None
             self.last_brake_command = None
@@ -834,11 +863,29 @@ class OARMNet:
                         brake_command, start_pos, start_vel, start_acc, _brake_generation_ms = brake_bundle
                     else:
                         brake_command, start_pos, start_vel, start_acc, brake_generation_latency_ms = self.build_constrained_brake_command()
-                selected_time = brake_command.duration
-                end_pos = brake_command.end_pos
-                end_vel = brake_command.end_vel
-                end_acc = brake_command.end_acc
-                diagnostics = brake_command.diagnostics.to_dict()
+                if self.brake_latch.active and self.brake_latch_anchor_w is None:
+                    self.brake_latch_anchor_w = np.asarray(brake_command.end_pos, dtype=np.float32).copy()
+                    self.brake_latch_anchor_time_s = time.time()
+                    brake_anchor_created = True
+                if self.brake_latch.active and self.brake_latch_anchor_w is not None and not brake_anchor_created:
+                    selected_time = max(float(self.depth_emergency_traj_time), 0.3)
+                    end_pos = np.asarray(self.brake_latch_anchor_w, dtype=np.float32).copy()
+                    end_vel = np.zeros(3, dtype=np.float32)
+                    end_acc = np.zeros(3, dtype=np.float32)
+                    diagnostics = brake_command.diagnostics.to_dict()
+                    diagnostics.update(
+                        {
+                            "duration": float(selected_time),
+                            "stop_distance": float(np.linalg.norm(end_pos - start_pos)),
+                            "latched_anchor_hold": True,
+                        }
+                    )
+                else:
+                    selected_time = brake_command.duration
+                    end_pos = brake_command.end_pos
+                    end_vel = brake_command.end_vel
+                    end_acc = brake_command.end_acc
+                    diagnostics = brake_command.diagnostics.to_dict()
                 self.last_depth_emergency_target = end_pos.astype(float).tolist()
                 self.last_deterministic_brake_stop = True
                 self.last_deterministic_brake_reason = (
@@ -1003,7 +1050,23 @@ class OARMNet:
             self.desire_acc = np.array([control_msg.acceleration.x, control_msg.acceleration.y, control_msg.acceleration.z])
 
             goal_dir = self.goal - self.desire_pos
-            yaw, yaw_dot = calculate_yaw(self.desire_vel, goal_dir, self.last_yaw, self.ctrl_dt)
+            probe_active = bool(
+                self.brake_probe_enabled
+                and self.brake_latch.active
+                and self.brake_probe_stationary_start_s is not None
+                and self.brake_probe_yaw_center is not None
+            )
+            if probe_active:
+                probe_elapsed_s = max(0.0, time.time() - self.brake_probe_stationary_start_s)
+                probe_omega = 2.0 * np.pi / self.brake_probe_period_s
+                yaw = self.brake_probe_yaw_center + self.brake_probe_yaw_amplitude_rad * np.sin(
+                    probe_omega * probe_elapsed_s
+                )
+                yaw_dot = self.brake_probe_yaw_amplitude_rad * probe_omega * np.cos(
+                    probe_omega * probe_elapsed_s
+                )
+            else:
+                yaw, yaw_dot = calculate_yaw(self.desire_vel, goal_dir, self.last_yaw, self.ctrl_dt)
             self.last_yaw = yaw
             control_msg.yaw = yaw
             control_msg.yaw_dot = yaw_dot
@@ -1452,14 +1515,40 @@ class OARMNet:
             and geometry_admissible[int(release_index)]
         )
         brake_duration_s = 0.0 if brake_candidate is None else float(brake_candidate.get("duration", 0.0))
+        now_s = time.time()
+        speed_mps = float(np.linalg.norm(self.get_start_vel()))
+        if self.brake_latch.active and speed_mps <= self.brake_latch.config.release_speed_mps:
+            if self.brake_probe_stationary_start_s is None:
+                self.brake_probe_stationary_start_s = now_s
+                try:
+                    self.brake_probe_yaw_center = float(self.get_odom_state()[2])
+                except Exception:
+                    self.brake_probe_yaw_center = float(self.last_yaw)
+        else:
+            self.brake_probe_stationary_start_s = None
+        release_evidence = bool(
+            not self.brake_latch.config.require_release_evidence
+            or (
+                self.brake_probe_enabled
+                and self.brake_probe_stationary_start_s is not None
+                and now_s - self.brake_probe_stationary_start_s >= self.brake_probe_min_stationary_s
+            )
+        )
+        latch_was_active = bool(self.brake_latch.active)
         decision = self.brake_latch.update(
             decision=decision,
-            now_s=time.time(),
-            speed_mps=float(np.linalg.norm(self.get_start_vel())),
+            now_s=now_s,
+            speed_mps=speed_mps,
             selected_admissible=release_admissible,
             brake_duration_s=brake_duration_s,
             brake_risk_upper_bound=brake_risk_upper,
+            release_evidence=release_evidence,
         )
+        if latch_was_active and not self.brake_latch.active:
+            self.brake_latch_anchor_w = None
+            self.brake_latch_anchor_time_s = None
+            self.brake_probe_stationary_start_s = None
+            self.brake_probe_yaw_center = None
         selection_score = utility.astype(np.float32).copy()
         selected = decision.selected_index
         if decision.intervention_type == "BRAKE":
@@ -1869,6 +1958,14 @@ class OARMNet:
         selected_end_vel = endstate_w[action_id, :, 1]
         selected_end_acc = endstate_w[action_id, :, 2]
         deterministic_brake = bool(self.last_deterministic_brake_stop)
+        probe_execution = bool(
+            deterministic_brake
+            and self.brake_probe_enabled
+            and self.brake_latch.active
+            and self.brake_probe_stationary_start_s is not None
+        )
+        executed_time = float(self.selected_traj_time) if deterministic_brake else float(traj_time[action_id])
+        executed_type = "probe" if probe_execution else ("brake" if deterministic_brake else selected_type)
         if deterministic_brake and self.last_depth_emergency_target is not None:
             commanded_end_pos = np.array(self.last_depth_emergency_target, dtype=np.float32)
         else:
@@ -1961,6 +2058,16 @@ class OARMNet:
             "brake_latch_release_speed_mps": float(self.brake_latch.config.release_speed_mps),
             "brake_latch_release_frames": int(self.brake_latch.config.release_frames),
             "brake_latch_release_risk": float(self.brake_latch.config.release_risk),
+            "brake_latch_require_release_evidence": bool(
+                self.brake_latch.config.require_release_evidence),
+            "brake_latch_anchor_w": (
+                None if self.brake_latch_anchor_w is None
+                else np.asarray(self.brake_latch_anchor_w, dtype=float).tolist()),
+            "brake_probe_enabled": bool(self.brake_probe_enabled),
+            "brake_probe_active": bool(probe_execution),
+            "brake_probe_stationary_elapsed_s": (
+                None if self.brake_probe_stationary_start_s is None
+                else max(0.0, now - self.brake_probe_stationary_start_s)),
             "brake_generation_latency_ms": float(brake_generation_latency_ms),
             "total_planning_latency_ms": float(total_planning_latency_ms),
             "brake_candidate_info": self.last_brake_candidate_info,
@@ -2021,9 +2128,11 @@ class OARMNet:
             "depth_count": int(self.depth_count),
             "map_id": int(self.config.get("map_id", 0)),
             "selected_id": int(action_id),
-            "selected_type": selected_type,
-            "candidate_type": selected_type,
-            "selected_time": float(traj_time[action_id]),
+            "selected_type": executed_type,
+            "candidate_type": executed_type,
+            "nominal_candidate_type": selected_type,
+            "selected_time": executed_time,
+            "nominal_selected_time": float(traj_time[action_id]),
             "selected_utility": float(utility[action_id]),
             "selected_selection_score": float(selection_score[action_id]),
             "selected_oarm_margin_bonus": float(self.oarm_margin_alpha * margin_pred[action_id]),
@@ -2330,6 +2439,16 @@ def parser():
     parser.add_argument("--brake-latch-min-hold-s", type=float, default=0.6)
     parser.add_argument("--brake-latch-release-speed-mps", type=float, default=0.25)
     parser.add_argument("--brake-latch-release-frames", type=int, default=3)
+    parser.add_argument(
+        "--disable-brake-release-evidence",
+        dest="brake_latch_require_release_evidence",
+        action="store_false",
+        default=True,
+    )
+    parser.add_argument("--disable-brake-probe", dest="brake_probe_enabled", action="store_false", default=True)
+    parser.add_argument("--brake-probe-yaw-deg", type=float, default=30.0)
+    parser.add_argument("--brake-probe-period-s", type=float, default=2.0)
+    parser.add_argument("--brake-probe-min-stationary-s", type=float, default=2.0)
     parser.add_argument("--selector-min-traj-z", type=float, default=None)
     parser.add_argument("--selector-max-traj-z", type=float, default=None)
     parser.add_argument("--altitude-band-weight", type=float, default=0.0)
@@ -2461,6 +2580,11 @@ if __name__ == "__main__":
         "brake_latch_min_hold_s": args.brake_latch_min_hold_s,
         "brake_latch_release_speed_mps": args.brake_latch_release_speed_mps,
         "brake_latch_release_frames": args.brake_latch_release_frames,
+        "brake_latch_require_release_evidence": args.brake_latch_require_release_evidence,
+        "brake_probe_enabled": args.brake_probe_enabled,
+        "brake_probe_yaw_deg": args.brake_probe_yaw_deg,
+        "brake_probe_period_s": args.brake_probe_period_s,
+        "brake_probe_min_stationary_s": args.brake_probe_min_stationary_s,
         "selector_min_traj_z": args.selector_min_traj_z,
         "selector_max_traj_z": args.selector_max_traj_z,
         "altitude_band_weight": args.altitude_band_weight,
