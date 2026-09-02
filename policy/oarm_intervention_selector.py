@@ -9,6 +9,7 @@ PROBE_VISIBILITY_GAIN = "PROBE_VISIBILITY_GAIN"
 BRAKE_NO_SAFE_CANDIDATE = "BRAKE_NO_SAFE_CANDIDATE"
 BRAKE_HIGH_UNCERTAINTY = "BRAKE_HIGH_UNCERTAINTY"
 BRAKE_LATENCY_SPIKE = "BRAKE_LATENCY_SPIKE"
+BRAKE_LATCH_HOLD = "BRAKE_LATCH_HOLD"
 NO_VERIFIED_SAFE_ACTION = "NO_VERIFIED_SAFE_ACTION"
 
 
@@ -35,6 +36,85 @@ class InterventionSelection:
     risk_after: Optional[float]
     score: Optional[float] = None
     metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BrakeLatchConfig:
+    enabled: bool = True
+    min_hold_s: float = 0.6
+    release_speed_mps: float = 0.25
+    release_frames: int = 3
+    release_risk: float = 0.10
+
+
+class BrakeInterventionLatch:
+    """Hold a selected brake long enough to stop before accepting a new trajectory."""
+
+    def __init__(self, config: BrakeLatchConfig = None):
+        self.config = config or BrakeLatchConfig()
+        self.active = False
+        self.hold_until_s = 0.0
+        self.safe_release_frames = 0
+
+    def update(
+        self,
+        decision: InterventionSelection,
+        now_s: float,
+        speed_mps: float,
+        selected_admissible: bool,
+        brake_duration_s: float,
+        brake_risk_upper_bound: Optional[float],
+    ) -> InterventionSelection:
+        if not self.config.enabled:
+            return decision
+        now_s = float(now_s)
+        if decision.intervention_type == "BRAKE":
+            self.arm(now_s, brake_duration_s)
+            return decision
+        if not self.active:
+            return decision
+
+        release_safe = bool(
+            now_s >= self.hold_until_s
+            and float(speed_mps) <= float(self.config.release_speed_mps)
+            and selected_admissible
+            and decision.risk_after is not None
+            and float(decision.risk_after) <= float(self.config.release_risk)
+        )
+        self.safe_release_frames = self.safe_release_frames + 1 if release_safe else 0
+        if self.safe_release_frames >= max(int(self.config.release_frames), 1):
+            self.active = False
+            self.safe_release_frames = 0
+            return decision
+
+        metadata = dict(decision.metadata or {})
+        metadata.update(
+            {
+                "latched_from_intervention": decision.intervention_type,
+                "latch_hold_until_s": self.hold_until_s,
+                "latch_safe_release_frames": self.safe_release_frames,
+            }
+        )
+        return InterventionSelection(
+            None,
+            "BRAKE",
+            BRAKE_LATCH_HOLD,
+            decision.risk_before,
+            None if brake_risk_upper_bound is None else float(brake_risk_upper_bound),
+            metadata=metadata,
+        )
+
+    def arm(self, now_s: float, brake_duration_s: float) -> None:
+        if not self.config.enabled:
+            return
+        if not self.active:
+            hold_s = max(float(brake_duration_s), float(self.config.min_hold_s), 0.0)
+            self.hold_until_s = float(now_s) + hold_s
+        self.active = True
+        self.safe_release_frames = 0
+
+    def remaining_s(self, now_s: float) -> float:
+        return max(0.0, float(self.hold_until_s) - float(now_s)) if self.active else 0.0
 
 
 def _as_list(values: Optional[Iterable], default_len: int = 0, default: float = 0.0) -> List:

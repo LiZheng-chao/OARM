@@ -1,0 +1,54 @@
+{
+  "protocol": "oarm3_phase3_locked",
+  "version": 1,
+  "status": "code_ready_closed_loop_validation_pending",
+  "checkpoint": "OARM/saved/OARM_53/last.pth",
+  "calibration_file": "OARM/results/oarm3_calibration/ceiling_gate_v1_s0/risk_calibration.json",
+  "candidate_mode": "yopo_preserve",
+  "backbone_mode": "yopo_original",
+  "risk": {
+    "use_calibrated_risk": true,
+    "use_validity_risk_fusion": true,
+    "keep_threshold": 0.45,
+    "safe_threshold": 0.55,
+    "risk_improvement_min": 0.01,
+    "selector_lambda_risk": 1.0
+  },
+  "geometry": {
+    "depth_clearance_gate": true,
+    "depth_clearance_min_m": 0.35,
+    "depth_clearance_samples": 17,
+    "depth_clearance_pixel_radius": 2,
+    "depth_emergency_stop": true,
+    "depth_emergency_clearance_m": 0.35,
+    "depth_emergency_critical_clearance_m": 0.15,
+    "selector_min_traj_z_m": 1.0,
+    "selector_max_traj_z_m": 3.0
+  },
+  "brake_latch": {
+    "enabled": true,
+    "min_hold_s": 0.6,
+    "release_speed_mps": 0.25,
+    "release_frames": 3,
+    "release_risk": 0.45
+  },
+  "validation": {
+    "scene": "oarm_blind_gate_v4_s0",
+    "next_seed": 74,
+    "data_split": "validation"
+  },
+  "held_out_test": {
+    "scene": "oarm_ceiling_gate_v1_s1",
+    "data_split": "test",
+    "threshold_tuning_allowed": false
+  },
+  "acceptance": {
+    "execution_metrics_required": true,
+    "collision_exec_rate": 0.0,
+    "success_exec_rate": 1.0,
+    "stale_depth_drop_count": 0,
+    "require_finite_planner_outputs": true,
+    "require_yopo_frozen": true,
+    "require_brake_latch_diagnostics": true
+  }
+}

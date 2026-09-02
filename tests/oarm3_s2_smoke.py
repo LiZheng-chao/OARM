@@ -12,7 +12,14 @@ from OARM.eval.check_episode_splits import check_episode_splits
 from OARM.eval.fit_risk_calibration import fit_calibration_from_jsonl
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_brake import brake_visible_clearance_margin, constrained_brake_command, deterministic_brake_endpoint, evaluate_brake_trajectory
-from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
+from OARM.policy.oarm_intervention_selector import (
+    BRAKE_LATCH_HOLD,
+    BrakeInterventionLatch,
+    BrakeLatchConfig,
+    InterventionSelection,
+    InterventionSelectorConfig,
+    OARMInterventionSelector,
+)
 from OARM.policy.oarm_latency_model import OARMLatencyModel
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration
@@ -297,6 +304,26 @@ def check_intervention_selector_excludes_top1_rerank():
     assert decision.intervention_reason == "NO_VERIFIED_SAFE_ACTION"
     assert decision.selected_index == 1
     assert decision.metadata["brake_feasible"] is False
+
+
+def check_brake_intervention_latch():
+    latch = BrakeInterventionLatch(
+        BrakeLatchConfig(min_hold_s=0.6, release_speed_mps=0.25, release_frames=3, release_risk=0.45)
+    )
+    brake = InterventionSelection(None, "BRAKE", "BRAKE_NO_SAFE_CANDIDATE", 0.7, 0.1)
+    rerank = InterventionSelection(1, "RERANK", "RERANK_TOP1_UNSAFE", 0.6, 0.44)
+
+    assert latch.update(brake, 0.0, 1.0, False, 0.4, 0.1).intervention_type == "BRAKE"
+    assert latch.active
+    assert latch.update(rerank, 0.3, 0.1, True, 0.0, 0.1).intervention_reason == BRAKE_LATCH_HOLD
+    held = latch.update(rerank, 0.7, 0.5, True, 0.0, 0.1)
+    assert held.intervention_reason == BRAKE_LATCH_HOLD
+    assert latch.safe_release_frames == 0
+    assert latch.update(rerank, 0.8, 0.1, True, 0.0, 0.1).intervention_reason == BRAKE_LATCH_HOLD
+    assert latch.update(rerank, 0.9, 0.1, True, 0.0, 0.1).intervention_reason == BRAKE_LATCH_HOLD
+    released = latch.update(rerank, 1.0, 0.1, True, 0.0, 0.1)
+    assert released.intervention_type == "RERANK"
+    assert not latch.active
 
 
 def check_deterministic_brake_endpoint():
@@ -638,6 +665,7 @@ def main():
     check_two_stage_hazard_risk_model()
     check_latency_budget_margin()
     check_intervention_selector_excludes_top1_rerank()
+    check_brake_intervention_latch()
     check_deterministic_brake_endpoint()
     check_constrained_brake_trajectory()
     check_brake_visible_clearance_margin()

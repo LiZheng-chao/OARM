@@ -31,7 +31,12 @@ if YOPO_DIR not in sys.path:
     sys.path.insert(0, YOPO_DIR)
 
 from OARM.policy.oarm_network import OARMNetwork
-from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
+from OARM.policy.oarm_intervention_selector import (
+    BrakeInterventionLatch,
+    BrakeLatchConfig,
+    InterventionSelectorConfig,
+    OARMInterventionSelector,
+)
 from OARM.policy.oarm_brake import brake_visible_clearance_margin, constrained_brake_command, deterministic_brake_endpoint
 from OARM.policy.oarm_latency_model import OARMLatencyModel, is_sensor_frame_stale
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration, calibrated_probability, risk_upper_bound
@@ -122,6 +127,15 @@ class OARMNet:
         self.brake_time_growth = float(self.config.get("brake_time_growth", 1.25))
         self.brake_verified_risk_upper = float(self.config.get("brake_verified_risk_upper", self.config.get("risk_threshold_keep", 0.10)))
         self.brake_require_visible_stop_distance = bool(self.config.get("brake_require_visible_stop_distance", True))
+        self.brake_latch = BrakeInterventionLatch(
+            BrakeLatchConfig(
+                enabled=bool(self.config.get("brake_latch_enabled", True)),
+                min_hold_s=float(self.config.get("brake_latch_min_hold_s", 0.6)),
+                release_speed_mps=float(self.config.get("brake_latch_release_speed_mps", 0.25)),
+                release_frames=int(self.config.get("brake_latch_release_frames", 3)),
+                release_risk=float(self.config.get("risk_threshold_keep", 0.10)),
+            )
+        )
         self.last_depth_emergency_stop = False
         self.last_depth_emergency_reason = None
         self.last_depth_emergency_target = None
@@ -277,6 +291,8 @@ class OARMNet:
                     "Formal intervention calibration must contain candidate-level reaction-risk labels, "
                     "the calibration split, and at least two explicitly identified episodes."
                 )
+        if self.main_experiment and self.enable_intervention_selector and not self.brake_latch.config.enabled:
+            raise ValueError("Formal intervention requires the brake latch; remove --disable-brake-latch.")
         self.intervention_selector = OARMInterventionSelector(
             InterventionSelectorConfig(
                 delta_keep=risk_threshold_keep,
@@ -294,8 +310,6 @@ class OARMNet:
                 self.agile_time_penalty,
                 self.agile_stop_penalty,
                 self.depth_clearance_weight,
-                float(self.depth_clearance_gate),
-                float(self.depth_emergency_stop),
                 self.oarm_margin_alpha,
                 self.oarm_risk_beta,
             )
@@ -800,8 +814,11 @@ class OARMNet:
             self.last_brake_candidate_info = None
             self.last_brake_command = None
         selected_time = float(np.clip(traj_time[action_id], 0.1, 10.0))
-        emergency_stop = self.should_depth_emergency_stop(depth_clearance, action_id) or intervention_brake
-
+        depth_emergency_stop = self.should_depth_emergency_stop(depth_clearance, action_id)
+        emergency_stop = depth_emergency_stop or intervention_brake
+        if depth_emergency_stop and not intervention_brake and self.enable_intervention_selector:
+            latch_duration_s = 0.0 if brake_candidate is None else float(brake_candidate.get("duration", 0.0))
+            self.brake_latch.arm(time.time(), latch_duration_s)
         with self.lock:
             start_pos = self.get_start_pos()
             start_vel = self.get_start_vel()
@@ -1193,6 +1210,8 @@ class OARMNet:
         )
         risk_upper = float(self.brake_verified_risk_upper) if dynamic_feasible and geometry_admissible else 1.0
         info = {
+            **geometry,
+            **diagnostics,
             "command": command,
             "start_pos": start_pos,
             "start_vel": start_vel,
@@ -1207,8 +1226,6 @@ class OARMNet:
             "risk_upper_bound": risk_upper,
             "risk_source": "geometry_dynamic_proxy",
             "brake_generation_latency_ms": brake_generation_latency_ms,
-            **geometry,
-            **diagnostics,
         }
         self.last_brake_candidate_info = {key: value for key, value in info.items() if key not in {"command", "start_pos", "start_vel", "start_acc", "endstate_w", "traj_time"}}
         self.last_brake_command = command
@@ -1427,6 +1444,21 @@ class OARMNet:
             brake_feasible=brake_feasible,
             brake_risk_upper_bound=brake_risk_upper,
             top1_index=original_yopo_top1,
+        )
+        release_index = decision.selected_index
+        release_admissible = bool(
+            release_index is not None
+            and 0 <= int(release_index) < geometry_admissible.size
+            and geometry_admissible[int(release_index)]
+        )
+        brake_duration_s = 0.0 if brake_candidate is None else float(brake_candidate.get("duration", 0.0))
+        decision = self.brake_latch.update(
+            decision=decision,
+            now_s=time.time(),
+            speed_mps=float(np.linalg.norm(self.get_start_vel())),
+            selected_admissible=release_admissible,
+            brake_duration_s=brake_duration_s,
+            brake_risk_upper_bound=brake_risk_upper,
         )
         selection_score = utility.astype(np.float32).copy()
         selected = decision.selected_index
@@ -1921,6 +1953,14 @@ class OARMNet:
             "brake_sample_count": int(self.brake_sample_count),
             "brake_verified_risk_upper": float(self.brake_verified_risk_upper),
             "brake_require_visible_stop_distance": bool(self.brake_require_visible_stop_distance),
+            "brake_latch_enabled": bool(self.brake_latch.config.enabled),
+            "brake_latch_active": bool(self.brake_latch.active),
+            "brake_latch_remaining_s": float(self.brake_latch.remaining_s(time.time())),
+            "brake_latch_safe_release_frames": int(self.brake_latch.safe_release_frames),
+            "brake_latch_min_hold_s": float(self.brake_latch.config.min_hold_s),
+            "brake_latch_release_speed_mps": float(self.brake_latch.config.release_speed_mps),
+            "brake_latch_release_frames": int(self.brake_latch.config.release_frames),
+            "brake_latch_release_risk": float(self.brake_latch.config.release_risk),
             "brake_generation_latency_ms": float(brake_generation_latency_ms),
             "total_planning_latency_ms": float(total_planning_latency_ms),
             "brake_candidate_info": self.last_brake_candidate_info,
@@ -2286,6 +2326,10 @@ def parser():
     parser.add_argument("--brake-verified-risk-upper", type=float, default=0.10)
     parser.add_argument("--disable-brake-visible-stop-distance-check", dest="brake_require_visible_stop_distance", action="store_false", default=True)
     parser.add_argument("--brake-time-growth", type=float, default=1.25)
+    parser.add_argument("--disable-brake-latch", dest="brake_latch_enabled", action="store_false", default=True)
+    parser.add_argument("--brake-latch-min-hold-s", type=float, default=0.6)
+    parser.add_argument("--brake-latch-release-speed-mps", type=float, default=0.25)
+    parser.add_argument("--brake-latch-release-frames", type=int, default=3)
     parser.add_argument("--selector-min-traj-z", type=float, default=None)
     parser.add_argument("--selector-max-traj-z", type=float, default=None)
     parser.add_argument("--altitude-band-weight", type=float, default=0.0)
@@ -2413,6 +2457,10 @@ if __name__ == "__main__":
         "brake_verified_risk_upper": args.brake_verified_risk_upper,
         "brake_require_visible_stop_distance": args.brake_require_visible_stop_distance,
         "brake_time_growth": args.brake_time_growth,
+        "brake_latch_enabled": args.brake_latch_enabled,
+        "brake_latch_min_hold_s": args.brake_latch_min_hold_s,
+        "brake_latch_release_speed_mps": args.brake_latch_release_speed_mps,
+        "brake_latch_release_frames": args.brake_latch_release_frames,
         "selector_min_traj_z": args.selector_min_traj_z,
         "selector_max_traj_z": args.selector_max_traj_z,
         "altitude_band_weight": args.altitude_band_weight,
