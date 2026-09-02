@@ -591,10 +591,15 @@ class OARMNet:
 
     def build_constrained_brake_command(self):
         generation_start = time.time()
-        start_pos = self.get_start_pos().astype(np.float32)
-        start_vel = self.get_start_vel().astype(np.float32)
-        start_acc = self.desire_acc if self.desire_acc is not None else np.zeros(3, dtype=np.float32)
-        start_acc = np.asarray(start_acc, dtype=np.float32).reshape(3)
+        # BRAKE is an executed maneuver, so its state and latency budget must use
+        # measured vehicle motion rather than the potentially leading reference.
+        odom_pos, odom_vel, _odom_yaw = self.get_odom_state()
+        start_pos = np.asarray(odom_pos, dtype=np.float32).reshape(3)
+        start_vel = np.asarray(odom_vel, dtype=np.float32).reshape(3)
+        # Odometry has no acceleration measurement. Zero is a stable, explicit
+        # boundary condition and avoids feeding reference acceleration back into
+        # the emergency trajectory after plan_from_reference has advanced it.
+        start_acc = np.zeros(3, dtype=np.float32)
         min_brake_time = float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time))
         command = constrained_brake_command(
             start_pos,
@@ -1015,7 +1020,12 @@ class OARMNet:
         if self.arrive and self.hover_on_arrival:
             self.publish_arrival_hover()
             return
-        if self.ctrl_time is None or self.ctrl_time > self.selected_traj_time:
+        brake_anchor_hold = bool(
+            self.brake_latch.active
+            and self.brake_latch_anchor_w is not None
+            and self.brake_probe_stationary_start_s is not None
+        )
+        if self.ctrl_time is None or (self.ctrl_time > self.selected_traj_time and not brake_anchor_hold):
             return
         if self.ctrl_pub.get_num_connections() == 0:
             if not rospy.is_shutdown() and not self.warned_no_ctrl_subscriber:
@@ -1033,18 +1043,30 @@ class OARMNet:
                 control_msg.trajectory_flag = control_msg.TRAJECTORY_STATUS_EMPTY
             else:
                 control_msg.trajectory_flag = control_msg.TRAJECTORY_STATUS_READY
-            control_msg.position.x = self.optimal_poly_x.get_position(self.ctrl_time)
-            control_msg.position.y = self.optimal_poly_y.get_position(self.ctrl_time)
-            position_z = self.optimal_poly_z.get_position(self.ctrl_time)
-            if not self.yopo_preserve_mode:
-                position_z = float(np.clip(position_z, self.min_command_z, self.max_command_z))
-            control_msg.position.z = position_z
-            control_msg.velocity.x = self.optimal_poly_x.get_velocity(self.ctrl_time)
-            control_msg.velocity.y = self.optimal_poly_y.get_velocity(self.ctrl_time)
-            control_msg.velocity.z = self.optimal_poly_z.get_velocity(self.ctrl_time)
-            control_msg.acceleration.x = self.optimal_poly_x.get_acceleration(self.ctrl_time)
-            control_msg.acceleration.y = self.optimal_poly_y.get_acceleration(self.ctrl_time)
-            control_msg.acceleration.z = self.optimal_poly_z.get_acceleration(self.ctrl_time)
+            if brake_anchor_hold:
+                anchor = np.asarray(self.brake_latch_anchor_w, dtype=np.float32)
+                control_msg.position.x = float(anchor[0])
+                control_msg.position.y = float(anchor[1])
+                control_msg.position.z = float(anchor[2])
+                control_msg.velocity.x = 0.0
+                control_msg.velocity.y = 0.0
+                control_msg.velocity.z = 0.0
+                control_msg.acceleration.x = 0.0
+                control_msg.acceleration.y = 0.0
+                control_msg.acceleration.z = 0.0
+            else:
+                control_msg.position.x = self.optimal_poly_x.get_position(self.ctrl_time)
+                control_msg.position.y = self.optimal_poly_y.get_position(self.ctrl_time)
+                position_z = self.optimal_poly_z.get_position(self.ctrl_time)
+                if not self.yopo_preserve_mode:
+                    position_z = float(np.clip(position_z, self.min_command_z, self.max_command_z))
+                control_msg.position.z = position_z
+                control_msg.velocity.x = self.optimal_poly_x.get_velocity(self.ctrl_time)
+                control_msg.velocity.y = self.optimal_poly_y.get_velocity(self.ctrl_time)
+                control_msg.velocity.z = self.optimal_poly_z.get_velocity(self.ctrl_time)
+                control_msg.acceleration.x = self.optimal_poly_x.get_acceleration(self.ctrl_time)
+                control_msg.acceleration.y = self.optimal_poly_y.get_acceleration(self.ctrl_time)
+                control_msg.acceleration.z = self.optimal_poly_z.get_acceleration(self.ctrl_time)
             self.desire_pos = np.array([control_msg.position.x, control_msg.position.y, control_msg.position.z])
             self.desire_vel = np.array([control_msg.velocity.x, control_msg.velocity.y, control_msg.velocity.z])
             self.desire_acc = np.array([control_msg.acceleration.x, control_msg.acceleration.y, control_msg.acceleration.z])
@@ -1516,7 +1538,8 @@ class OARMNet:
         )
         brake_duration_s = 0.0 if brake_candidate is None else float(brake_candidate.get("duration", 0.0))
         now_s = time.time()
-        speed_mps = float(np.linalg.norm(self.get_start_vel()))
+        _odom_pos, odom_vel, _odom_yaw = self.get_odom_state()
+        speed_mps = float(np.linalg.norm(odom_vel))
         if self.brake_latch.active and speed_mps <= self.brake_latch.config.release_speed_mps:
             if self.brake_probe_stationary_start_s is None:
                 self.brake_probe_stationary_start_s = now_s
@@ -2438,7 +2461,7 @@ def parser():
     parser.add_argument("--disable-brake-latch", dest="brake_latch_enabled", action="store_false", default=True)
     parser.add_argument("--brake-latch-min-hold-s", type=float, default=0.6)
     parser.add_argument("--brake-latch-release-speed-mps", type=float, default=0.25)
-    parser.add_argument("--brake-latch-release-frames", type=int, default=3)
+    parser.add_argument("--brake-latch-release-frames", type=int, default=10)
     parser.add_argument(
         "--disable-brake-release-evidence",
         dest="brake_latch_require_release_evidence",

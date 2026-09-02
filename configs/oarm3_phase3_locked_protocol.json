@@ -1,6 +1,6 @@
 {
   "protocol": "oarm3_phase3_locked",
-  "version": 2,
+  "version": 3,
   "status": "code_ready_closed_loop_validation_pending",
   "checkpoint": "OARM/saved/OARM_53/last.pth",
   "calibration_file": "OARM/results/oarm3_calibration/ceiling_gate_v1_s0/risk_calibration.json",
@@ -29,7 +29,7 @@
     "enabled": true,
     "min_hold_s": 0.6,
     "release_speed_mps": 0.25,
-    "release_frames": 3,
+    "release_frames": 10,
     "release_risk": 0.45,
     "fixed_anchor": true,
     "require_release_evidence": true,
@@ -40,7 +40,7 @@
   },
   "validation": {
     "scene": "oarm_blind_gate_v4_s0",
-    "next_seed": 75,
+    "next_seed": 76,
     "data_split": "validation"
   },
   "held_out_test": {
