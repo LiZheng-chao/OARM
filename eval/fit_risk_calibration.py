@@ -143,6 +143,7 @@ def _extract_arrays(
         "episode_count": 0,
         "missing_reaction_window": 0,
         "missing_reaction_budget": 0,
+        "no_entry_negative_labels": 0,
         "validity_fusion_skipped_two_stage": 0,
     }
     risk_keys = (risk_key,) if risk_key else (AUTO_RAW_RISK_KEYS if use_validity_fusion else AUTO_FUSED_RISK_KEYS)
@@ -169,16 +170,21 @@ def _extract_arrays(
             else:
                 episode_ids.add(str(episode_id))
             if label_key == "reaction_window_lt_budget":
-                window = _first_number(record, REACTION_WINDOW_KEYS)
-                budget = _first_number(record, REACTION_BUDGET_KEYS)
-                if window is None:
-                    stats["missing_reaction_window"] += 1
-                if budget is None:
-                    stats["missing_reaction_budget"] += 1
-                if window is None or budget is None:
-                    stats["missing_label"] += 1
-                    continue
-                label = 1.0 if window < budget else 0.0
+                no_entry = _first_label(record, ("rm_no_entry_gt",))
+                if no_entry == 1.0:
+                    label = 0.0
+                    stats["no_entry_negative_labels"] += 1
+                else:
+                    window = _first_number(record, REACTION_WINDOW_KEYS)
+                    budget = _first_number(record, REACTION_BUDGET_KEYS)
+                    if window is None:
+                        stats["missing_reaction_window"] += 1
+                    if budget is None:
+                        stats["missing_reaction_budget"] += 1
+                    if window is None or budget is None:
+                        stats["missing_label"] += 1
+                        continue
+                    label = 1.0 if window < budget else 0.0
             else:
                 label = _first_label(record, (label_key,))
                 if label is None:
@@ -279,9 +285,16 @@ def fit_calibration_from_jsonl(
     logits = _logit_from_prob(probs)
     before = binary_calibration_metrics(probs, labels, n_bins=n_bins)
     calibration = fit_temperature_scaling(logits, labels, max_iter=max_iter)
-    calibrated = torch.sigmoid(logits / max(float(calibration.temperature), 1e-6))
+    calibrated = torch.sigmoid(
+        logits / max(float(calibration.temperature), 1e-6) + float(calibration.bias)
+    )
     after = binary_calibration_metrics(calibrated, labels, n_bins=n_bins)
-    slack = fit_conformal_slack(calibrated, labels, alpha=empirical_upper_alpha)
+    slack = fit_conformal_slack(
+        calibrated,
+        labels,
+        alpha=empirical_upper_alpha,
+        n_bins=n_bins,
+    )
     calibration.conformal_slack = float(slack)
     calibration.fitted_on = ",".join(str(p) for p in paths)
     upper = torch.clamp(calibrated + float(slack), min=0.0, max=1.0)
@@ -290,8 +303,9 @@ def fit_calibration_from_jsonl(
     payload = calibration.state_dict()
     payload.update(
         {
-            "calibration_version": "temperature_empirical_upper_v1",
+            "calibration_version": "platt_empirical_upper_v2",
             "empirical_upper_alpha": float(empirical_upper_alpha),
+            "empirical_upper_method": "binned_hoeffding_gap_v1",
             "validity_fusion": bool(use_validity_fusion),
             "validity_unknown_risk": float(validity_unknown_risk),
             "label_key": label_key,
@@ -303,11 +317,13 @@ def fit_calibration_from_jsonl(
             "split_manifest_check": split_check,
             "sample_count": int(labels.numel()),
             "metrics_before": before.__dict__,
+            "metrics_after_platt": after.__dict__,
             "metrics_after_temperature": after.__dict__,
             "metrics_after_empirical_upper": upper_metrics.__dict__,
+            "reliability_bins_after_platt": reliability_bins(calibrated, labels, n_bins=n_bins),
             "reliability_bins_after_temperature": reliability_bins(calibrated, labels, n_bins=n_bins),
             "input_stats": stats,
-            "note": "conformal_slack is an empirical conservative risk upper slack, not a formal conformal guarantee unless the calibration split/protocol justifies it.",
+            "note": "conformal_slack is a binned one-sided empirical calibration-gap bound, not a formal conformal guarantee.",
         }
     )
     out_path = Path(output)
@@ -374,9 +390,10 @@ def main() -> None:
         "output": args.output,
         "sample_count": payload["sample_count"],
         "temperature": payload["temperature"],
+        "bias": payload["bias"],
         "empirical_conservative_upper_slack": payload["conformal_slack"],
         "metrics_before": payload["metrics_before"],
-        "metrics_after_temperature": payload["metrics_after_temperature"],
+        "metrics_after_platt": payload["metrics_after_platt"],
         "metrics_after_empirical_upper": payload["metrics_after_empirical_upper"],
         "input_stats": payload["input_stats"],
     }

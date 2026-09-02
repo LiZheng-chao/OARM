@@ -376,6 +376,7 @@ def check_fit_risk_calibration_cli_core():
             "candidates": [
                 {"raw_risk_prob": 0.05, "validity_prob": 0.9, "insufficient_reaction_gt": 0, "reaction_window_gt": 1.0, "reaction_budget_s": 0.5},
                 {"raw_risk_prob": 0.80, "validity_prob": 0.8, "insufficient_reaction_gt": 1, "reaction_window_gt": 0.2, "reaction_budget_s": 0.5},
+                {"raw_risk_prob": 0.10, "validity_prob": 0.9, "rm_no_entry_gt": True, "reaction_budget_s": 0.5},
             ]
         },
         {
@@ -401,13 +402,15 @@ def check_fit_risk_calibration_cli_core():
         assert payload["conformal_slack"] >= 0.0
         loaded = TemperatureCalibration.from_file(out_path)
         assert loaded.temperature == payload["temperature"]
+        assert loaded.bias == payload["bias"]
         assert loaded.conformal_slack == payload["conformal_slack"]
         assert os.path.exists(out_path)
 
         derived_path = os.path.join(tmpdir, "derived_calibration.json")
         derived = fit_calibration_from_jsonl([in_path], derived_path, label_key="reaction_window_lt_budget", empirical_upper_alpha=0.25, max_iter=10)
-        assert derived["sample_count"] == 4
+        assert derived["sample_count"] == 5
         assert derived["label_key"] == "reaction_window_lt_budget"
+        assert derived["input_stats"]["no_entry_negative_labels"] == 1
         assert derived["input_stats"]["missing_reaction_window"] == 0
         assert derived["input_stats"]["missing_reaction_budget"] == 0
 

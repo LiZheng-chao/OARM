@@ -19,6 +19,7 @@ class CalibrationMetrics:
 @dataclass
 class TemperatureCalibration:
     temperature: float = 1.0
+    bias: float = 0.0
     conformal_slack: float = 0.0
     fitted_on: str = "calibration"
 
@@ -47,7 +48,7 @@ def _tensor(values) -> torch.Tensor:
 
 def calibrated_probability(logits, calibration: TemperatureCalibration) -> torch.Tensor:
     temperature = max(float(calibration.temperature), 1e-6)
-    return torch.sigmoid(_tensor(logits) / temperature)
+    return torch.sigmoid(_tensor(logits) / temperature + float(calibration.bias))
 
 
 def risk_upper_bound(probabilities, calibration: TemperatureCalibration, max_prob: float = 1.0) -> torch.Tensor:
@@ -86,24 +87,48 @@ def fit_temperature_scaling(logits, labels, max_iter: int = 100, initial_tempera
     if x.numel() == 0:
         return TemperatureCalibration(temperature=float(initial_temperature))
     log_temp = torch.tensor([math.log(max(float(initial_temperature), 1e-6))], requires_grad=True)
-    optimizer = torch.optim.LBFGS([log_temp], lr=0.1, max_iter=int(max_iter), line_search_fn="strong_wolfe")
+    bias = torch.zeros(1, requires_grad=True)
+    optimizer = torch.optim.LBFGS([log_temp, bias], lr=0.1, max_iter=int(max_iter), line_search_fn="strong_wolfe")
     def closure():
         optimizer.zero_grad()
         temp = torch.exp(log_temp).clamp(min=1e-6, max=1e6)
-        loss = F.binary_cross_entropy_with_logits(x / temp, y)
+        loss = F.binary_cross_entropy_with_logits(x / temp + bias, y)
         loss.backward()
         return loss
     optimizer.step(closure)
-    return TemperatureCalibration(temperature=float(torch.exp(log_temp).detach().cpu()))
+    return TemperatureCalibration(
+        temperature=float(torch.exp(log_temp).detach().cpu()),
+        bias=float(bias.detach().cpu()),
+    )
 
 
-def fit_conformal_slack(probabilities, labels, alpha: float = 0.1) -> float:
-    probs = _tensor(probabilities)
+def fit_conformal_slack(probabilities, labels, alpha: float = 0.1, n_bins: int = 15) -> float:
+    probs = torch.clamp(_tensor(probabilities), min=0.0, max=1.0)
     y = _tensor(labels).clamp(0.0, 1.0)
-    violations = torch.clamp(y - probs, min=0.0)
-    if violations.numel() == 0:
+    if probs.numel() != y.numel():
+        raise ValueError(f"probabilities/labels size mismatch: {probs.numel()} vs {y.numel()}")
+    if probs.numel() == 0:
         return 0.0
-    return float(torch.quantile(violations, min(max(1.0 - float(alpha), 0.0), 1.0)).detach().cpu())
+
+    alpha = min(max(float(alpha), 1e-6), 1.0)
+    n_bins = max(int(n_bins), 1)
+    min_bin_count = max(30, int(math.ceil(probs.numel() / (n_bins * 20.0))))
+    edges = torch.linspace(0.0, 1.0, n_bins + 1, device=probs.device)
+    upper_gaps = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (probs >= lo) & (probs <= hi) if hi >= 1.0 else (probs >= lo) & (probs < hi)
+        count = int(mask.sum().detach().cpu())
+        if count < min_bin_count:
+            continue
+        calibration_gap = y[mask].mean() - probs[mask].mean()
+        radius = math.sqrt(math.log(max(n_bins / alpha, 1.0)) / (2.0 * count))
+        upper_gaps.append(float(calibration_gap.detach().cpu()) + radius)
+
+    if not upper_gaps:
+        calibration_gap = float((y.mean() - probs.mean()).detach().cpu())
+        radius = math.sqrt(math.log(1.0 / alpha) / (2.0 * probs.numel()))
+        upper_gaps.append(calibration_gap + radius)
+    return min(max(max(upper_gaps), 0.0), 1.0)
 
 
 def reliability_bins(probabilities, labels, n_bins: int = 15) -> List[Dict[str, float]]:

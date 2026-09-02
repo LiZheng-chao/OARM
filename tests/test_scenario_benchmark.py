@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from OARM.eval import annotate_gt_reaction_margin
 from OARM.eval import execution_monitor
 from OARM.eval import scenario_benchmark
+from OARM.policy.oarm_risk_calibrator import calibrated_probability, fit_conformal_slack, fit_temperature_scaling
 
 
 def write_jsonl(path, rows):
@@ -94,3 +95,19 @@ def test_benchmark_prefers_monitored_log_for_same_run(tmp_path):
     assert metrics["input_log_count"] == 1
     assert metrics["success_exec_rate"] == 1.0
     assert metrics["exec_metrics_valid"] == 1.0
+
+
+def test_platt_bias_corrects_shifted_base_rate():
+    calibration = fit_temperature_scaling([-0.4, -0.3, -0.2, -0.1], [1.0, 1.0, 1.0, 0.0])
+    calibrated = calibrated_probability([-0.4, -0.3, -0.2, -0.1], calibration)
+
+    assert calibration.bias > 0.0
+    assert float(calibrated.mean()) > 0.65
+
+
+def test_binned_upper_slack_does_not_collapse_on_calibrated_population():
+    probabilities = [0.5] * 1000
+    labels = [0.0, 1.0] * 500
+    slack = fit_conformal_slack(probabilities, labels, alpha=0.1, n_bins=15)
+
+    assert 0.0 < slack < 0.1
