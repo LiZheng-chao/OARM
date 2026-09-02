@@ -32,7 +32,7 @@ if YOPO_DIR not in sys.path:
 
 from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
-from OARM.policy.oarm_brake import constrained_brake_command, deterministic_brake_endpoint
+from OARM.policy.oarm_brake import brake_visible_clearance_margin, constrained_brake_command, deterministic_brake_endpoint
 from OARM.policy.oarm_latency_model import OARMLatencyModel, is_sensor_frame_stale
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration, calibrated_probability, risk_upper_bound
 from OARM.policy.oarm_rm_critic import risk_probability_from_window, two_stage_risk_probability
@@ -1182,7 +1182,10 @@ class OARMNet:
         dynamic_feasible = bool(diagnostics.get("feasible", False))
         visible_stop_margin = None
         if geometry.get("depth_clearance") is not None:
-            visible_stop_margin = float(geometry["depth_clearance"]) - float(diagnostics.get("stop_distance", 0.0))
+            visible_stop_margin = brake_visible_clearance_margin(
+                geometry["depth_clearance"],
+                self.depth_clearance_min,
+            )
         visible_stop_ok = True if visible_stop_margin is None else visible_stop_margin >= 0.0
         geometry_admissible = bool(
             geometry["geometry_admissible"]

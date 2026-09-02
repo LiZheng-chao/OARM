@@ -11,7 +11,7 @@ from OARM.config import get_oarm_training_preset
 from OARM.eval.check_episode_splits import check_episode_splits
 from OARM.eval.fit_risk_calibration import fit_calibration_from_jsonl
 from OARM.loss import OARMLoss
-from OARM.policy.oarm_brake import constrained_brake_command, deterministic_brake_endpoint, evaluate_brake_trajectory
+from OARM.policy.oarm_brake import brake_visible_clearance_margin, constrained_brake_command, deterministic_brake_endpoint, evaluate_brake_trajectory
 from OARM.policy.oarm_intervention_selector import InterventionSelectorConfig, OARMInterventionSelector
 from OARM.policy.oarm_latency_model import OARMLatencyModel
 from OARM.policy.oarm_network import OARMNetwork
@@ -368,6 +368,11 @@ def check_constrained_brake_trajectory():
     assert fast.diagnostics.max_jerk == 80.0
 
 
+def check_brake_visible_clearance_margin():
+    assert abs(brake_visible_clearance_margin(0.40, 0.35) - 0.05) < 1e-6
+    assert brake_visible_clearance_margin(0.30, 0.35) < 0.0
+
+
 def check_fit_risk_calibration_cli_core():
     rows = [
         {
@@ -635,6 +640,7 @@ def main():
     check_intervention_selector_excludes_top1_rerank()
     check_deterministic_brake_endpoint()
     check_constrained_brake_trajectory()
+    check_brake_visible_clearance_margin()
     check_fit_risk_calibration_cli_core()
     check_episode_split_manifest_guard()
     check_trainable_contract()

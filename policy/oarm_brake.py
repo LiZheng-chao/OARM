@@ -33,6 +33,10 @@ class BrakeCommand:
     diagnostics: BrakeTrajectoryDiagnostics
 
 
+def brake_visible_clearance_margin(residual_clearance: float, required_clearance: float) -> float:
+    return float(residual_clearance) - max(float(required_clearance), 0.0)
+
+
 def _as_vec3(values) -> np.ndarray:
     return np.asarray(values, dtype=np.float32).reshape(3)
 
