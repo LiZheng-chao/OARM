@@ -11,7 +11,7 @@ from OARM.config import get_oarm_training_preset
 from OARM.eval.check_episode_splits import check_episode_splits
 from OARM.eval.fit_risk_calibration import fit_calibration_from_jsonl
 from OARM.loss import OARMLoss
-from OARM.policy.oarm_brake import brake_visible_clearance_margin, constrained_brake_command, deterministic_brake_endpoint, evaluate_brake_trajectory
+from OARM.policy.oarm_brake import brake_depth_admissible, brake_visible_clearance_margin, constrained_brake_command, deterministic_brake_endpoint, evaluate_brake_trajectory
 from OARM.policy.oarm_intervention_selector import (
     BRAKE_LATCH_HOLD,
     BrakeInterventionLatch,
@@ -401,7 +401,36 @@ def check_constrained_brake_trajectory():
 def check_brake_visible_clearance_margin():
     assert abs(brake_visible_clearance_margin(0.40, 0.35) - 0.05) < 1e-6
     assert brake_visible_clearance_margin(0.30, 0.35) < 0.0
+    assert brake_depth_admissible(float("inf"), 0.35, 0.01)
+    assert not brake_depth_admissible(float("inf"), 0.35, 0.50)
+    assert brake_depth_admissible(0.40, 0.35, 1.0)
 
+
+
+def check_candidate_progress_admissibility():
+    from OARM.test_oarm_ros import OARMNet
+
+    node = object.__new__(OARMNet)
+    node.plan_from_reference = True
+    node.desire_pos = np.zeros(3, dtype=np.float32)
+    node.desire_vel = np.zeros(3, dtype=np.float32)
+    node.desire_acc = np.zeros(3, dtype=np.float32)
+    node.goal = np.array([10.0, 0.0, 0.0], dtype=np.float32)
+    node.selector_min_goal_drop_rate = 0.10
+    node.selector_max_lateral_rate = None
+    node.selector_max_goal_retreat_m = 0.05
+    node.selector_progress_samples = 17
+
+    endstate = np.zeros((2, 3, 3), dtype=np.float32)
+    endstate[0, :, 0] = [0.62, -1.18, 0.64]
+    endstate[0, :, 1] = [2.02, -0.19, 1.44]
+    endstate[0, :, 2] = [2.33, 0.99, 1.26]
+    endstate[1, 0, 0] = 1.0
+    traj_time = np.array([1.67, 1.67], dtype=np.float32)
+
+    valid = node.compute_candidate_selector_admissibility(endstate, traj_time)
+    assert valid.tolist() == [False, True]
+    assert node.last_candidate_min_goal_progress[0] < -0.05
 
 def check_fit_risk_calibration_cli_core():
     rows = [
@@ -592,6 +621,7 @@ def check_end_to_end_mini_batch():
         "rm_right_censored": torch.zeros(window_shape, dtype=torch.bool, device=device),
         "rm_no_entry": torch.zeros(window_shape, dtype=torch.bool, device=device),
     }
+    check_candidate_progress_admissibility()
     labels["rm_event_valid"].reshape(-1)[0] = False
     labels["rm_timely_visible"].reshape(-1)[0] = False
     labels["rm_right_censored"].reshape(-1)[0] = True

@@ -37,6 +37,17 @@ def brake_visible_clearance_margin(residual_clearance: float, required_clearance
     return float(residual_clearance) - max(float(required_clearance), 0.0)
 
 
+def brake_depth_admissible(residual_clearance, required_clearance: float, stop_distance: float) -> bool:
+    """Accept a projected stop, or an unprojected near-stationary hold."""
+    if residual_clearance is None:
+        return True
+    clearance = float(residual_clearance)
+    required = max(float(required_clearance), 0.0)
+    if np.isfinite(clearance):
+        return clearance >= required
+    return bool(np.isposinf(clearance) and float(stop_distance) <= required)
+
+
 def _as_vec3(values) -> np.ndarray:
     return np.asarray(values, dtype=np.float32).reshape(3)
 

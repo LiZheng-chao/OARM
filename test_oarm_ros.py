@@ -37,7 +37,7 @@ from OARM.policy.oarm_intervention_selector import (
     InterventionSelectorConfig,
     OARMInterventionSelector,
 )
-from OARM.policy.oarm_brake import brake_visible_clearance_margin, constrained_brake_command, deterministic_brake_endpoint
+from OARM.policy.oarm_brake import brake_depth_admissible, brake_visible_clearance_margin, constrained_brake_command, deterministic_brake_endpoint
 from OARM.policy.oarm_latency_model import OARMLatencyModel, is_sensor_frame_stale
 from OARM.policy.oarm_risk_calibrator import TemperatureCalibration, calibrated_probability, risk_upper_bound
 from OARM.policy.oarm_rm_critic import risk_probability_from_window, two_stage_risk_probability
@@ -99,6 +99,8 @@ class OARMNet:
         self.oarm_risk_beta = float(self.config.get("oarm_risk_beta", 0.0))
         self.selector_min_goal_drop_rate = self.config.get("selector_min_goal_drop_rate", None)
         self.selector_max_lateral_rate = self.config.get("selector_max_lateral_rate", None)
+        self.selector_max_goal_retreat_m = self.config.get("selector_max_goal_retreat_m", None)
+        self.selector_progress_samples = max(3, int(self.config.get("selector_progress_samples", 17)))
         self.depth_clearance_weight = float(self.config.get("depth_clearance_weight", 0.0))
         self.depth_clearance_min = float(self.config.get("depth_clearance_min", 0.35))
         self.depth_clearance_gate = bool(self.config.get("depth_clearance_gate", False))
@@ -600,6 +602,9 @@ class OARMNet:
         # boundary condition and avoids feeding reference acceleration back into
         # the emergency trajectory after plan_from_reference has advanced it.
         start_acc = np.zeros(3, dtype=np.float32)
+        brake_target_z = (
+            float(start_pos[2]) if self.depth_emergency_target_z is None else self.depth_emergency_target_z
+        )
         min_brake_time = float(np.clip(self.depth_emergency_traj_time, 0.1, self.brake_max_time))
         command = constrained_brake_command(
             start_pos,
@@ -615,7 +620,7 @@ class OARMNet:
             max_tilt_deg=self.brake_max_tilt_deg,
             sample_count=self.brake_sample_count,
             time_growth=self.brake_time_growth,
-            target_z=self.depth_emergency_target_z,
+            target_z=brake_target_z,
             z_rate=self.depth_emergency_z_rate,
             min_command_z=self.min_command_z,
             max_command_z=self.max_command_z,
@@ -1258,13 +1263,21 @@ class OARMNet:
                 setattr(self, key, value)
         clearance_value = None if depth_clearance is None else float(depth_clearance[0])
         altitude_value = None if altitude_violation is None else float(altitude_violation[0])
-        depth_ok = True if depth_clearance is None else bool(np.isfinite(depth_clearance[0]) and depth_clearance[0] >= self.depth_clearance_min)
+        stop_distance = float(np.linalg.norm(endstate_w[0, :, 0]))
+        depth_ok = brake_depth_admissible(
+            clearance_value,
+            self.depth_clearance_min,
+            stop_distance,
+        )
+        unprojected_stationary_hold = bool(
+            clearance_value is not None and np.isposinf(clearance_value) and depth_ok)
         altitude_ok = True if altitude_violation is None else bool(altitude_violation[0] <= 1e-6)
         return {
             "depth_clearance": clearance_value,
             "altitude_violation": altitude_value,
             "depth_admissible": depth_ok,
             "altitude_admissible": altitude_ok,
+            "unprojected_stationary_hold": unprojected_stationary_hold,
             "geometry_admissible": bool(depth_ok and altitude_ok),
         }
 
@@ -1356,6 +1369,69 @@ class OARMNet:
             return True
         return False
 
+    def compute_candidate_selector_admissibility(self, endstate_w, traj_time):
+        self.last_candidate_min_goal_progress = None
+        if (
+            self.selector_min_goal_drop_rate is None
+            and self.selector_max_lateral_rate is None
+            and self.selector_max_goal_retreat_m is None
+        ):
+            return None
+
+        start_pos = self.get_start_pos()
+        goal_delta = self.goal - start_pos
+        goal_norm = float(np.linalg.norm(goal_delta))
+        if goal_norm <= 1e-3:
+            return np.ones((endstate_w.shape[0],), dtype=bool)
+
+        goal_dir = goal_delta / goal_norm
+        endpoint_offset = endstate_w[:, :, 0]
+        time_safe = np.clip(traj_time, 0.1, 10.0)
+        endpoint_pos = start_pos[None, :] + endpoint_offset
+        goal_distance_drop_rate = (
+            goal_norm - np.linalg.norm(endpoint_pos - self.goal[None, :], axis=1)
+        ) / time_safe
+        progress = np.dot(endpoint_offset, goal_dir)
+        lateral_offset = endpoint_offset - progress[:, None] * goal_dir[None, :]
+        lateral_rate = np.linalg.norm(lateral_offset, axis=1) / time_safe
+
+        valid = np.ones((endstate_w.shape[0],), dtype=bool)
+        if self.selector_min_goal_drop_rate is not None:
+            valid &= goal_distance_drop_rate >= float(self.selector_min_goal_drop_rate)
+        if self.selector_max_lateral_rate is not None:
+            valid &= lateral_rate <= float(self.selector_max_lateral_rate)
+
+        if self.selector_max_goal_retreat_m is not None:
+            start_vel = self.get_start_vel()
+            start_acc = self.desire_acc if self.desire_acc is not None else np.zeros(3, dtype=np.float32)
+            min_progress = np.zeros((endstate_w.shape[0],), dtype=np.float32)
+            for i in range(endstate_w.shape[0]):
+                tf = float(time_safe[i])
+                t_values = np.linspace(0.0, tf, self.selector_progress_samples)
+                positions = np.stack(
+                    [
+                        Poly5Solver(
+                            start_pos[axis],
+                            start_vel[axis],
+                            start_acc[axis],
+                            start_pos[axis] + endstate_w[i, axis, 0],
+                            endstate_w[i, axis, 1],
+                            endstate_w[i, axis, 2],
+                            tf,
+                        ).get_position(t_values)
+                        for axis in range(3)
+                    ],
+                    axis=-1,
+                )
+                sampled_progress = np.dot(positions - start_pos[None, :], goal_dir)
+                min_progress[i] = float(np.min(sampled_progress))
+            self.last_candidate_min_goal_progress = min_progress
+            valid &= min_progress >= -max(float(self.selector_max_goal_retreat_m), 0.0)
+
+        self.last_selector_total_count = int(valid.size)
+        self.last_selector_valid_count = int(np.count_nonzero(valid))
+        return valid
+
     def select_action(
         self,
         utility,
@@ -1416,6 +1492,11 @@ class OARMNet:
                     selector_valid &= lateral_rate <= float(self.selector_max_lateral_rate)
                 self.last_selector_total_count = int(selector_valid.size)
                 self.last_selector_valid_count = int(np.count_nonzero(selector_valid))
+
+        candidate_selector_valid = self.compute_candidate_selector_admissibility(endstate_w, traj_time)
+        if candidate_selector_valid is not None:
+            selector_valid = (
+                candidate_selector_valid if selector_valid is None else selector_valid & candidate_selector_valid)
 
         depth_valid = None
         if depth_clearance is not None:
@@ -1508,6 +1589,9 @@ class OARMNet:
         geometry_admissible = np.ones_like(utility, dtype=bool)
         if candidate_type is not None:
             geometry_admissible &= (candidate_type != 2) & (candidate_type != 3)
+        candidate_selector_valid = self.compute_candidate_selector_admissibility(endstate_w, traj_time)
+        if candidate_selector_valid is not None:
+            geometry_admissible &= candidate_selector_valid
         if depth_clearance is not None:
             geometry_admissible &= np.isfinite(depth_clearance) & (depth_clearance >= self.depth_clearance_min)
         if altitude_violation is not None:
@@ -2142,6 +2226,11 @@ class OARMNet:
             "selected_max_z": selected_max_z,
             "selector_min_goal_drop_rate": self.selector_min_goal_drop_rate,
             "selector_max_lateral_rate": self.selector_max_lateral_rate,
+            "selector_max_goal_retreat_m": self.selector_max_goal_retreat_m,
+            "selector_progress_samples": int(self.selector_progress_samples),
+            "selected_min_goal_progress": (
+                None if self.last_candidate_min_goal_progress is None
+                else float(self.last_candidate_min_goal_progress[action_id])),
             "selector_valid_count": self.last_selector_valid_count,
             "selector_total_count": self.last_selector_total_count,
             "agile_time_penalty": float(self.agile_time_penalty),
@@ -2431,6 +2520,8 @@ def parser():
     parser.add_argument("--progress-bonus-weight", type=float, default=0.0)
     parser.add_argument("--agile-progress-weight", type=float, default=0.0)
     parser.add_argument("--agile-goal-distance-weight", type=float, default=0.0)
+    parser.add_argument("--selector-max-goal-retreat-m", type=float, default=None)
+    parser.add_argument("--selector-progress-samples", type=int, default=17)
     parser.add_argument("--agile-lateral-penalty", type=float, default=0.0)
     parser.add_argument("--selector-min-goal-drop-rate", type=float, default=None)
     parser.add_argument("--selector-max-lateral-rate", type=float, default=None)
@@ -2567,6 +2658,8 @@ if __name__ == "__main__":
         "enable_intervention_selector": args.enable_intervention_selector,
         "risk_threshold_keep": args.risk_threshold_keep,
         "risk_threshold_safe": args.risk_threshold_safe,
+        "selector_max_goal_retreat_m": args.selector_max_goal_retreat_m,
+        "selector_progress_samples": args.selector_progress_samples,
         "risk_improvement_min": args.risk_improvement_min,
         "selector_lambda_risk": args.selector_lambda_risk,
         "progress_bonus_weight": args.progress_bonus_weight,
