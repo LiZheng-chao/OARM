@@ -10,6 +10,11 @@ import torch
 from OARM.config import get_oarm_training_preset
 from OARM.eval.check_episode_splits import check_episode_splits
 from OARM.eval.fit_risk_calibration import fit_calibration_from_jsonl
+from OARM.eval.oracle_rescue_phase3 import (
+    binary_probability_metrics,
+    phase3_oracle_masks,
+    unsafe_safe_pairwise_counts,
+)
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_brake import brake_depth_admissible, brake_visible_clearance_margin, constrained_brake_command, deterministic_brake_endpoint, evaluate_brake_trajectory
 from OARM.policy.oarm_intervention_selector import (
@@ -29,7 +34,7 @@ from OARM.policy.oarm_rm_critic import (
     risk_probability_from_window,
     two_stage_risk_probability,
 )
-from OARM.policy.oarm_trainer import OARMTrainer
+from OARM.policy.oarm_trainer import OARMTrainer, validation_metric_improved
 from OARM.train_oarm import parser, resolve_training_options
 from OARM.utils.checkpoint import make_oarm_checkpoint, validate_checkpoint_metadata
 from OARM.visibility.first_visible_time import first_visible_time
@@ -42,6 +47,7 @@ def check_preset_route():
     assert preset.backbone_mode == "yopo_original"
     assert preset.train_probabilistic_rm_critic is True
     assert preset.rm_critic_hazard_bins == 8
+    assert math.isclose(preset.rm_critic_hazard_max_time_s, 5.0 / 3.0)
     assert preset.train_reaction_margin is False
     assert preset.train_margin_ranking is False
 
@@ -50,6 +56,44 @@ def check_preset_route():
     assert options["train_probabilistic_rm_critic"] is True
     assert options["rm_critic_hazard_bins"] == 8
     assert options["train_reaction_margin"] is False
+    assert args.early_stopping_patience == 0
+    assert not validation_metric_improved(1.0, 1.0, min_delta=0.0)
+    assert validation_metric_improved(0.89, 1.0, min_delta=0.1)
+    assert not validation_metric_improved(float("nan"), 1.0, min_delta=0.0)
+
+    from OARM.test_oarm_ros import parser as ros_parser
+
+    ros_args = ros_parser().parse_args(["--main-experiment", "--disable-brake-probe"])
+    assert ros_args.main_experiment is True
+    assert ros_args.brake_probe_enabled is False
+    assert ros_args.brake_latch_require_release_evidence is True
+
+
+def check_offline_probability_and_oracle_metrics():
+    metrics = binary_probability_metrics(
+        [0.9, 0.1, 0.8, 0.2],
+        [1.0, 0.0, 1.0, 0.0],
+    )
+    assert metrics["auprc"] == 1.0
+    assert metrics["balanced_accuracy_05"] == 1.0
+    assert math.isclose(metrics["brier"], 0.025, abs_tol=1e-12)
+    assert math.isclose(metrics["probability_separation"], 0.7, abs_tol=1e-12)
+
+    interaction = torch.tensor([[True, False]])
+    no_entry = torch.tensor([[False, True]])
+    progress = torch.ones_like(interaction)
+    window = torch.tensor([[0.2, float("inf")]])
+    known, unsafe, safe = phase3_oracle_masks(interaction, no_entry, progress, window, tau=0.5)
+    assert known.tolist() == [[True, True]]
+    assert unsafe.tolist() == [[True, False]]
+    assert safe.tolist() == [[False, True]]
+    correct, pair_count = unsafe_safe_pairwise_counts(
+        torch.tensor([[0.8, 0.2]]),
+        unsafe,
+        safe,
+    )
+    assert correct == 1.0
+    assert pair_count == 1
 
 
 def check_bad_route_rejected():
@@ -622,6 +666,7 @@ def check_end_to_end_mini_batch():
         "rm_no_entry": torch.zeros(window_shape, dtype=torch.bool, device=device),
     }
     check_candidate_progress_admissibility()
+    check_offline_probability_and_oracle_metrics()
     labels["rm_event_valid"].reshape(-1)[0] = False
     labels["rm_timely_visible"].reshape(-1)[0] = False
     labels["rm_right_censored"].reshape(-1)[0] = True

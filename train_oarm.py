@@ -122,6 +122,18 @@ def parser():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--max-train-batches", type=int, default=None)
     p.add_argument("--max-val-batches", type=int, default=None)
+    p.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="stop after this many validation epochs without improvement; <=0 disables",
+    )
+    p.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.0,
+        help="minimum validation-metric decrease counted as an improvement",
+    )
     p.add_argument("--train-risk-point-guidance", action="store_true")
     p.add_argument("--train-occlusion-risk", action="store_true")
     p.add_argument("--train-reaction-margin", action="store_true")
@@ -318,6 +330,8 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         max_train_batches=args.max_train_batches,
         max_val_batches=args.max_val_batches,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
         dataset_root=args.dataset_root or None,
         **training_options,
         experiment_options={
@@ -337,6 +351,8 @@ if __name__ == "__main__":
             "num_workers": args.num_workers,
             "max_train_batches": args.max_train_batches,
             "max_val_batches": args.max_val_batches,
+            "early_stopping_patience": args.early_stopping_patience,
+            "early_stopping_min_delta": args.early_stopping_min_delta,
             "dataset_root": args.dataset_root,
             "grad_clip_norm": args.grad_clip_norm,
             "use_fused_adamw": args.use_fused_adamw,

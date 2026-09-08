@@ -20,6 +20,7 @@ from OARM.eval.eval_dataset import (
 from OARM.loss import OARMLoss
 from OARM.policy.oarm_candidate_generator import OARMCandidateGenerator
 from OARM.policy.oarm_network import OARMNetwork
+from OARM.policy.oarm_rm_critic import two_stage_risk_probability
 from OARM.utils.checkpoint import load_oarm_checkpoint, validate_checkpoint_metadata
 from OARM.utils.yopo_dataset_context import yopo_dataset_cfg
 from OARM.visibility.reaction_margin_labeler import ReactionMarginLabeler
@@ -54,6 +55,82 @@ def _quantiles(values):
         "p75": float(qs[3]),
         "p95": float(qs[4]),
     }
+
+
+def binary_probability_metrics(prob_values, label_values, bins=10):
+    if not prob_values:
+        return {"sample_count": 0}
+    prob = torch.tensor(prob_values, dtype=torch.float64).clamp(0.0, 1.0)
+    label = torch.tensor(label_values, dtype=torch.float64) > 0.5
+    pos = label
+    neg = ~label
+    positive_rate = float(pos.double().mean())
+    order = torch.argsort(prob, descending=True)
+    sorted_pos = pos[order].double()
+    tp = torch.cumsum(sorted_pos, dim=0)
+    fp = torch.cumsum(1.0 - sorted_pos, dim=0)
+    precision = tp / (tp + fp).clamp(min=1.0)
+    recall = tp / pos.double().sum().clamp(min=1.0)
+    recall_prev = torch.cat((torch.zeros(1, dtype=recall.dtype), recall[:-1]))
+    auprc = float(((recall - recall_prev) * precision).sum()) if bool(pos.any()) else None
+    auroc = None
+    if bool(pos.any()) and bool(neg.any()):
+        ascending = torch.argsort(prob)
+        ranks = torch.empty_like(prob)
+        ranks[ascending] = torch.arange(1, prob.numel() + 1, dtype=prob.dtype)
+        pos_count = pos.double().sum()
+        neg_count = neg.double().sum()
+        auroc = float((ranks[pos].sum() - pos_count * (pos_count + 1.0) * 0.5) / (pos_count * neg_count))
+    pred_pos = prob >= 0.5
+    balanced_accuracy = None
+    if bool(pos.any()) and bool(neg.any()):
+        recall_pos = (pred_pos & pos).double().sum() / pos.double().sum()
+        recall_neg = ((~pred_pos) & neg).double().sum() / neg.double().sum()
+        balanced_accuracy = float(0.5 * (recall_pos + recall_neg))
+    edges = torch.linspace(0.0, 1.0, max(int(bins), 1) + 1, dtype=prob.dtype)
+    ece = torch.zeros((), dtype=prob.dtype)
+    for index in range(edges.numel() - 1):
+        upper_inclusive = index == edges.numel() - 2
+        mask = (prob >= edges[index]) & ((prob <= edges[index + 1]) if upper_inclusive else (prob < edges[index + 1]))
+        if bool(mask.any()):
+            ece += mask.double().mean() * (prob[mask].mean() - label[mask].double().mean()).abs()
+    unsafe_mean = float(prob[pos].mean()) if bool(pos.any()) else None
+    safe_mean = float(prob[neg].mean()) if bool(neg.any()) else None
+    return {
+        "sample_count": int(prob.numel()),
+        "positive_rate": positive_rate,
+        "auroc": auroc,
+        "auprc": auprc,
+        "auprc_lift_over_prior": None if auprc is None or positive_rate <= 0.0 else auprc / positive_rate,
+        "brier": float((prob - label.double()).square().mean()),
+        "ece": float(ece),
+        "balanced_accuracy_05": balanced_accuracy,
+        "positive_probability_mean": unsafe_mean,
+        "negative_probability_mean": safe_mean,
+        "probability_separation": None if unsafe_mean is None or safe_mean is None else unsafe_mean - safe_mean,
+    }
+
+
+def phase3_oracle_masks(interaction_valid, no_entry, progress_mask, reaction_window, tau):
+    known = progress_mask & (interaction_valid | no_entry)
+    unsafe = progress_mask & interaction_valid & (~no_entry) & torch.isfinite(reaction_window) & (reaction_window < tau)
+    safe = known & (~unsafe)
+    return known, unsafe, safe
+
+
+def unsafe_safe_pairwise_counts(risk_prob, unsafe, safe):
+    correct = 0.0
+    pair_count = 0
+    for frame_risk, frame_unsafe, frame_safe in zip(risk_prob, unsafe, safe):
+        unsafe_risk = frame_risk[frame_unsafe & torch.isfinite(frame_risk)]
+        safe_risk = frame_risk[frame_safe & torch.isfinite(frame_risk)]
+        if unsafe_risk.numel() == 0 or safe_risk.numel() == 0:
+            continue
+        delta = unsafe_risk[:, None] - safe_risk[None, :]
+        correct += float((delta > 1e-7).sum().item())
+        correct += 0.5 * float((delta.abs() <= 1e-7).sum().item())
+        pair_count += int(delta.numel())
+    return correct, pair_count
 
 
 def load_policy(args, device):
@@ -153,6 +230,8 @@ def evaluate(args):
     seen_batches = 0
     seen_samples = 0
     hazard_bin_counts = [0 for _ in range(int(args.rm_critic_hazard_bins or 0))]
+    monotonic_comparisons = 0
+    monotonic_violations = 0
 
     with torch.inference_mode():
         for batch_id, (depth, pos, rot, obs_b, map_id, labels) in enumerate(loader):
@@ -219,6 +298,32 @@ def evaluate(args):
             progress = -OARMLoss.goal_progress_cost(start_state_w, end_state_w, goal_w, flat["traj_time"]).detach()
             progress = progress.reshape(batch_size, traj_num)
 
+            label_known = progress_mask & (interaction_valid | no_entry)
+            predicted_risk = {}
+            critic_keys = ("validity_logit", "zero_window_logit", "hazard_logits")
+            if all(key in flat for key in critic_keys):
+                validity_logit = flat["validity_logit"].reshape(batch_size, traj_num)
+                zero_window_logit = flat["zero_window_logit"].reshape(batch_size, traj_num)
+                hazard_logits = flat["hazard_logits"].reshape(batch_size, traj_num, -1)
+                validity_eval = label_known & torch.isfinite(validity_logit)
+                _append_value(value_acc, "validity_prob", torch.sigmoid(validity_logit)[validity_eval])
+                _append_value(value_acc, "validity_label", interaction_valid[validity_eval].float())
+                for tau in tau_s:
+                    predicted_risk[tau] = two_stage_risk_probability(
+                        validity_logit,
+                        zero_window_logit,
+                        hazard_logits,
+                        reaction_budget_s=tau,
+                        hazard_max_time_s=args.rm_critic_hazard_max_time_s,
+                    )
+                ordered_tau = sorted(predicted_risk)
+                for lower_tau, upper_tau in zip(ordered_tau[:-1], ordered_tau[1:]):
+                    lower = predicted_risk[lower_tau]
+                    upper = predicted_risk[upper_tau]
+                    comparison_mask = label_known & torch.isfinite(lower) & torch.isfinite(upper)
+                    monotonic_comparisons += int(comparison_mask.sum().item())
+                    monotonic_violations += int(((upper + 1e-7 < lower) & comparison_mask).sum().item())
+
             selected_window = reaction_window[batch_range, selected_id]
             selected_usable = usable[batch_range, selected_id]
             selected_progress = progress[batch_range, selected_id]
@@ -246,25 +351,57 @@ def evaluate(args):
                 ctr["no_entry_candidates"] += int(no_entry.sum().item())
                 ctr["zero_window_candidates"] += int((zero_window & interaction_valid).sum().item())
 
-                selected_violation = selected_usable & (selected_window < tau)
+                known, unsafe, safe = phase3_oracle_masks(
+                    interaction_valid,
+                    no_entry,
+                    progress_mask,
+                    reaction_window,
+                    tau,
+                )
+                selected_known = known[batch_range, selected_id]
+                selected_violation = unsafe[batch_range, selected_id]
+                ctr["selected_known"] += int(selected_known.sum().item())
                 ctr["selected_usable"] += int(selected_usable.sum().item())
                 ctr["selected_violation"] += int(selected_violation.sum().item())
+                ctr["known_candidates"] += int(known.sum().item())
 
-                safe_alt = usable & (reaction_window >= tau)
-                selected_mask = torch.zeros_like(safe_alt)
+                selected_mask = torch.zeros_like(safe)
                 selected_mask[batch_range, selected_id] = True
-                safe_alt = safe_alt & (~selected_mask)
+                safe_alt = safe & (~selected_mask)
                 if args.progress_rho > 0.0:
                     progress_threshold = args.progress_rho * selected_progress[:, None]
                     safe_alt = safe_alt & torch.isfinite(progress) & torch.isfinite(progress_threshold) & (progress >= progress_threshold)
                 safe_alt_available = safe_alt.any(dim=1)
+                no_entry_safe_alt_available = (safe_alt & no_entry).any(dim=1)
                 rescuable = selected_violation & safe_alt_available
                 ctr["safe_alt_available"] += int(safe_alt_available.sum().item())
+                ctr["no_entry_safe_alt_available"] += int(no_entry_safe_alt_available.sum().item())
                 ctr["rescuable_violation"] += int(rescuable.sum().item())
+                ctr["no_entry_rescuable_violation"] += int((rescuable & no_entry_safe_alt_available).sum().item())
 
-                oracle_window = reaction_window.masked_fill(~safe_alt, -torch.inf).max(dim=1).values
+                tau_key = int(round(tau * 1000))
+                if tau in predicted_risk:
+                    risk_prob = predicted_risk[tau]
+                    risk_eval = known & torch.isfinite(risk_prob)
+                    _append_value(value_acc, f"tau_{tau_key}_risk_prob", risk_prob[risk_eval])
+                    _append_value(value_acc, f"tau_{tau_key}_risk_label", unsafe[risk_eval].float())
+                    frame_eval = risk_eval.any(dim=1) & safe.any(dim=1)
+                    predicted_safest = risk_prob.masked_fill(~risk_eval, torch.inf).argmin(dim=1)
+                    predicted_safest_safe = safe[batch_range, predicted_safest]
+                    ctr["predicted_safest_eval_frames"] += int(frame_eval.sum().item())
+                    ctr["predicted_safest_safe_frames"] += int((frame_eval & predicted_safest_safe).sum().item())
+                    pairwise_correct, pairwise_count = unsafe_safe_pairwise_counts(
+                        risk_prob,
+                        unsafe,
+                        safe,
+                    )
+                    ctr["unsafe_safe_pairwise_correct"] += pairwise_correct
+                    ctr["unsafe_safe_pairwise_count"] += pairwise_count
+
+                interacting_safe_alt = safe_alt & interaction_valid & torch.isfinite(reaction_window)
+                oracle_window = reaction_window.masked_fill(~interacting_safe_alt, -torch.inf).max(dim=1).values
                 oracle_valid = torch.isfinite(oracle_window)
-                _append_value(value_acc, f"tau_{int(round(tau * 1000))}_oracle_window_s", oracle_window[oracle_valid])
+                _append_value(value_acc, f"tau_{tau_key}_oracle_window_s", oracle_window[oracle_valid])
 
     per_tau = []
     for tau in tau_s:
@@ -272,21 +409,44 @@ def evaluate(args):
         samples = ctr["samples"]
         candidates = ctr["candidates"]
         selected_violation = ctr["selected_violation"]
+        tau_key = int(round(tau * 1000))
+        risk_metrics = binary_probability_metrics(
+            value_acc[f"tau_{tau_key}_risk_prob"],
+            value_acc[f"tau_{tau_key}_risk_label"],
+        )
         per_tau.append(
             {
-                "tau_ms": int(round(tau * 1000)),
+                "tau_ms": tau_key,
                 "samples": samples,
                 "candidates": candidates,
+                "known_candidate_rate": _safe_div(ctr["known_candidates"], candidates),
                 "interaction_valid_candidate_rate": _safe_div(ctr["usable_candidates"], candidates),
                 "positive_window_candidate_rate": _safe_div(ctr["positive_window_candidates"], candidates),
                 "no_entry_candidate_rate": _safe_div(ctr["no_entry_candidates"], candidates),
                 "zero_window_candidate_rate": _safe_div(ctr["zero_window_candidates"], candidates),
+                "selected_known_rate": _safe_div(ctr["selected_known"], samples),
                 "selected_interaction_valid_rate": _safe_div(ctr["selected_usable"], samples),
                 "R_sel_selected_violation_rate": _safe_div(selected_violation, samples),
+                "R_sel_given_selected_known": _safe_div(selected_violation, ctr["selected_known"]),
                 "R_sel_given_selected_valid": _safe_div(selected_violation, ctr["selected_usable"]),
                 "safe_alt_available_rate": _safe_div(ctr["safe_alt_available"], samples),
+                "no_entry_safe_alt_available_rate": _safe_div(ctr["no_entry_safe_alt_available"], samples),
                 "R_rescue_rescuable_violation_rate": _safe_div(ctr["rescuable_violation"], samples),
                 "R_rescue_given_violation": _safe_div(ctr["rescuable_violation"], selected_violation),
+                "R_rescue_via_no_entry_given_violation": _safe_div(
+                    ctr["no_entry_rescuable_violation"],
+                    selected_violation,
+                ),
+                "predicted_safest_is_horizon_safe_rate": _safe_div(
+                    ctr["predicted_safest_safe_frames"],
+                    ctr["predicted_safest_eval_frames"],
+                ),
+                "within_frame_unsafe_safe_pairwise_accuracy": _safe_div(
+                    ctr["unsafe_safe_pairwise_correct"],
+                    ctr["unsafe_safe_pairwise_count"],
+                ),
+                "within_frame_unsafe_safe_pair_count": ctr["unsafe_safe_pairwise_count"],
+                "risk_model": risk_metrics,
             }
         )
 
@@ -307,6 +467,14 @@ def evaluate(args):
         "eval_points": args.eval_points,
         "batches": seen_batches,
         "samples": seen_samples,
+        "no_entry_semantics": "horizon-safe: no labeled risk point is entered during the sampled candidate trajectory",
+        "validity_model": binary_probability_metrics(
+            value_acc["validity_prob"],
+            value_acc["validity_label"],
+        ),
+        "risk_monotonic_comparisons": monotonic_comparisons,
+        "risk_monotonic_violations": monotonic_violations,
+        "risk_monotonic_violation_rate": _safe_div(monotonic_violations, monotonic_comparisons),
         "per_tau": per_tau,
         "hazard_bin_counts": hazard_bin_counts,
         "hazard_bin_edges_s": [

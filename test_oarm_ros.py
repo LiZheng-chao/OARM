@@ -304,11 +304,13 @@ class OARMNet:
                 )
         if self.main_experiment and self.enable_intervention_selector and not self.brake_latch.config.enabled:
             raise ValueError("Formal intervention requires the brake latch; remove --disable-brake-latch.")
-        if self.main_experiment and self.enable_intervention_selector and (
-            not self.brake_probe_enabled or not self.brake_latch.config.require_release_evidence
+        if (
+            self.main_experiment
+            and self.enable_intervention_selector
+            and not self.brake_latch.config.require_release_evidence
         ):
             raise ValueError(
-                "Formal intervention requires the stationary visibility probe before releasing BRAKE.")
+                "Formal intervention requires release evidence; with PROBE disabled, BRAKE is a terminal fallback.")
         self.intervention_selector = OARMInterventionSelector(
             InterventionSelectorConfig(
                 delta_keep=risk_threshold_keep,

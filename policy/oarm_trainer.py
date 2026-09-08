@@ -36,6 +36,10 @@ def _null_record_function(*_args, **_kwargs):
     yield
 
 
+def validation_metric_improved(value, best_value, min_delta=0.0):
+    return bool(np.isfinite(value) and value < best_value - max(float(min_delta), 0.0))
+
+
 class OARMTrainer:
     def __init__(
         self,
@@ -49,6 +53,8 @@ class OARMTrainer:
         num_workers=4,
         max_train_batches=None,
         max_val_batches=None,
+        early_stopping_patience=0,
+        early_stopping_min_delta=0.0,
         dataset_root=None,
         candidate_mode=oarm_cfg.candidate_mode,
         backbone_mode=oarm_cfg.backbone_mode,
@@ -130,6 +136,8 @@ class OARMTrainer:
         self.traj_num = cfg["traj_num"]
         self.max_train_batches = max_train_batches
         self.max_val_batches = max_val_batches
+        self.early_stopping_patience = max(int(early_stopping_patience), 0)
+        self.early_stopping_min_delta = max(float(early_stopping_min_delta), 0.0)
         self.dataset_root = resolve_dataset_dir(dataset_root)
         self.log_interval = max(1, int(log_interval)) if log_interval else None
         self.grad_clip_norm = float(grad_clip_norm) if grad_clip_norm is not None else 0.0
@@ -229,6 +237,8 @@ class OARMTrainer:
                 raise ValueError("YOPO-preserve modes keep yaw policy fixed; disable yaw visibility training")
         self.experiment_options = dict(experiment_options or {})
         self.best_val_loss = float("inf")
+        self.best_epoch = None
+        self.epochs_without_improvement = 0
         self.validation_metric_name = "rm_critic_selection_metric" if self.train_probabilistic_rm_critic else "total_loss"
         if save_on_exit:
             self._exit_func = atexit.register(self.save_model)
@@ -457,12 +467,51 @@ class OARMTrainer:
                     f"Valid {self.validation_metric_name}: {val_loss:.4g}"
                 )
                 self.save_checkpoint("last.pth")
-                if val_loss < self.best_val_loss:
+                improved = validation_metric_improved(
+                    val_loss,
+                    self.best_val_loss,
+                    self.early_stopping_min_delta,
+                )
+                if improved:
                     self.best_val_loss = val_loss
+                    self.best_epoch = self.epoch_i
+                    self.epochs_without_improvement = 0
                     self.save_checkpoint("best_val.pth")
+                else:
+                    self.epochs_without_improvement += 1
+                stopped_early = bool(
+                    self.early_stopping_patience > 0
+                    and self.epochs_without_improvement >= self.early_stopping_patience
+                )
+                self.write_training_state(stopped_early=stopped_early)
+                if stopped_early:
+                    best_epoch_text = "none" if self.best_epoch is None else str(self.best_epoch + 1)
+                    best_value_text = "none" if not np.isfinite(self.best_val_loss) else f"{self.best_val_loss:.6g}"
+                    self.progress_log.console.log(
+                        f"Early stopping after epoch {self.epoch_i + 1}: "
+                        f"no {self.validation_metric_name} improvement greater than "
+                        f"{self.early_stopping_min_delta:g} for {self.early_stopping_patience} epochs; "
+                        f"best epoch={best_epoch_text}, best value={best_value_text}"
+                    )
+                    break
             total_time = time.time() - train_start
             self.progress_log.console.log(f"Train OARM Finish! Total Time: {self._format_seconds(total_time)}")
             self.progress_log.remove_task(total_progress)
+
+    def write_training_state(self, stopped_early=False):
+        state = {
+            "completed_epochs": int(self.epoch_i + 1),
+            "best_epoch": None if self.best_epoch is None else int(self.best_epoch + 1),
+            "best_validation_metric": None if not np.isfinite(self.best_val_loss) else float(self.best_val_loss),
+            "validation_metric_name": self.validation_metric_name,
+            "epochs_without_improvement": int(self.epochs_without_improvement),
+            "early_stopping_patience": int(self.early_stopping_patience),
+            "early_stopping_min_delta": float(self.early_stopping_min_delta),
+            "stopped_early": bool(stopped_early),
+        }
+        path = os.path.join(self.tensorboard_path, "training_state.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
 
     def train_one_epoch(self, epoch, total_progress=None):
         losses = []
@@ -537,7 +586,7 @@ class OARMTrainer:
             self.progress_log.update(one_epoch_progress, advance=1)
             self.log_progress("Eval", epoch, step, total_steps, losses, epoch_start, one_epoch_progress)
         self.progress_log.remove_task(one_epoch_progress)
-        return float(np.mean(losses)) if losses else 0.0
+        return float(np.mean(losses)) if losses else float("inf")
 
     def forward_and_compute_loss(self, batch):
         depth, pos, rot, obs_b, map_id, labels = batch

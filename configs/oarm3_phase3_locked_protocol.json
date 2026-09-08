@@ -1,8 +1,8 @@
 {
   "protocol": "oarm3_phase3_locked",
-  "version": 4,
-  "status": "code_ready_closed_loop_validation_pending",
-  "checkpoint": "OARM/saved/OARM_53/last.pth",
+  "version": 5,
+  "status": "seed77_code_regression_then_offline_model_validation",
+  "checkpoint": "OARM/saved/OARM_53/best_val.pth",
   "calibration_file": "OARM/results/oarm3_calibration/ceiling_gate_v1_s0/risk_calibration.json",
   "candidate_mode": "yopo_preserve",
   "backbone_mode": "yopo_original",
@@ -37,7 +37,7 @@
     "fixed_anchor": true,
     "default_brake_target_z": "current_odometry_z",
     "require_release_evidence": true,
-    "probe_enabled": true,
+    "probe_enabled": false,
     "probe_yaw_deg": 30.0,
     "probe_period_s": 2.0,
     "probe_min_stationary_s": 2.0
@@ -45,7 +45,8 @@
   "validation": {
     "scene": "oarm_blind_gate_v4_s0",
     "next_seed": 77,
-    "data_split": "validation"
+    "data_split": "validation",
+    "purpose": "single code-regression run only; do not tune thresholds from this seed"
   },
   "held_out_test": {
     "scene": "oarm_ceiling_gate_v1_s1",
