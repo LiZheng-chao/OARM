@@ -61,12 +61,16 @@ def check_preset_route():
     assert validation_metric_improved(0.89, 1.0, min_delta=0.1)
     assert not validation_metric_improved(float("nan"), 1.0, min_delta=0.0)
 
-    from OARM.test_oarm_ros import parser as ros_parser
+    from OARM.test_oarm_ros import parser as ros_parser, resolve_rm_critic_hazard_max_time_s
 
     ros_args = ros_parser().parse_args(["--main-experiment", "--disable-brake-probe"])
     assert ros_args.main_experiment is True
     assert ros_args.brake_probe_enabled is False
     assert ros_args.brake_latch_require_release_evidence is True
+    assert ros_args.rm_critic_hazard_max_time_s is None
+    metadata = {"training_options": {"rm_critic_hazard_max_time_s": 5.0 / 3.0}}
+    assert math.isclose(resolve_rm_critic_hazard_max_time_s(None, metadata), 5.0 / 3.0)
+    assert math.isclose(resolve_rm_critic_hazard_max_time_s(1.25, metadata), 1.25)
 
 
 def check_offline_probability_and_oracle_metrics():

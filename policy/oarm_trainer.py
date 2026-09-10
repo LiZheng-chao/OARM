@@ -1006,10 +1006,7 @@ class OARMTrainer:
 
             loss_dict["total_loss_full_objective_detached"] = loss_dict["total_loss"].detach()
             loss_dict["oarm3_s2_critic_only"] = torch.tensor(bool(self.train_probabilistic_rm_critic), device=self.device, dtype=torch.float32)
-            loss_dict["rm_critic_selection_metric"] = (
-                loss_dict.get("rm_critic_window_nll", torch.zeros((), device=self.device))
-                + oarm_cfg.rm_critic_validity_bce_weight * loss_dict.get("rm_critic_validity_bce", torch.zeros((), device=self.device))
-            )
+            loss_dict["rm_critic_selection_metric"] = rm_critic_loss
             loss_dict["total_loss"] = (
                 aux_loss
                 + rerank_loss

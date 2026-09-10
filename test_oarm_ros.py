@@ -56,6 +56,18 @@ except ModuleNotFoundError as exc:
         ROS_IMPORT_ERROR = exc
 
 
+def resolve_rm_critic_hazard_max_time_s(configured_value, checkpoint_metadata, default=2.5):
+    if configured_value is not None:
+        return float(configured_value)
+    metadata = checkpoint_metadata or {}
+    training_options = metadata.get("training_options") or {}
+    stored_value = metadata.get(
+        "rm_critic_hazard_max_time_s",
+        training_options.get("rm_critic_hazard_max_time_s"),
+    )
+    return float(default if stored_value is None else stored_value)
+
+
 class OARMNet:
     """ROS inference node for OARM.
 
@@ -216,7 +228,11 @@ class OARMNet:
         self.enable_rm_critic = bool(enable_rm_critic)
         self.config["enable_rm_critic"] = self.enable_rm_critic
         self.rm_critic_hazard_bins = int(self.config.get("rm_critic_hazard_bins") or 0)
-        self.rm_critic_hazard_max_time_s = float(self.config.get("rm_critic_hazard_max_time_s", 2.5))
+        configured_hazard_horizon = self.config.get("rm_critic_hazard_max_time_s")
+        self.rm_critic_hazard_max_time_s = resolve_rm_critic_hazard_max_time_s(
+            configured_hazard_horizon,
+            None,
+        )
         if self.checkpoint_path and os.path.isfile(self.checkpoint_path):
             try:
                 state_for_hazard, metadata_for_hazard = load_oarm_checkpoint(self.checkpoint_path, map_location="cpu")
@@ -224,9 +240,10 @@ class OARMNet:
                 meta_bins = metadata_for_hazard.get("rm_critic_hazard_bins", training_options.get("rm_critic_hazard_bins"))
                 if meta_bins is not None and self.rm_critic_hazard_bins <= 0:
                     self.rm_critic_hazard_bins = int(meta_bins)
-                meta_horizon = metadata_for_hazard.get("rm_critic_hazard_max_time_s", training_options.get("rm_critic_hazard_max_time_s"))
-                if meta_horizon is not None and "rm_critic_hazard_max_time_s" not in self.config:
-                    self.rm_critic_hazard_max_time_s = float(meta_horizon)
+                self.rm_critic_hazard_max_time_s = resolve_rm_critic_hazard_max_time_s(
+                    configured_hazard_horizon,
+                    metadata_for_hazard,
+                )
                 final_bias = state_for_hazard.get("preserve_network.rm_critic.mlp.4.bias")
                 if final_bias is not None:
                     inferred_bins = max(0, int(final_bias.numel()) - 4)
@@ -2498,7 +2515,12 @@ def parser():
     parser.add_argument("--latency-window", type=int, default=128)
     parser.add_argument("--latency-quantile", type=float, default=0.95)
     parser.add_argument("--rm-critic-hazard-bins", type=int, default=None)
-    parser.add_argument("--rm-critic-hazard-max-time-s", type=float, default=2.5)
+    parser.add_argument(
+        "--rm-critic-hazard-max-time-s",
+        type=float,
+        default=None,
+        help="positive-window hazard horizon; defaults to checkpoint metadata, then 2.5 s",
+    )
     parser.add_argument("--sensor-age-ms", type=float, default=0.0)
     parser.add_argument("--queue-latency-ms", type=float, default=0.0)
     parser.add_argument("--selector-latency-ms", type=float, default=0.0)
