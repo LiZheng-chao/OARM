@@ -139,3 +139,43 @@ def test_binned_upper_slack_does_not_collapse_on_calibrated_population():
     slack = fit_conformal_slack(probabilities, labels, alpha=0.1, n_bins=15)
 
     assert 0.0 < slack < 0.1
+
+def test_benchmark_summarizes_shadow_selector_diagnostics():
+    rows = [
+        {
+            "time": 1.0,
+            "candidate_type": "progress",
+            "intervention_type": "KEEP",
+            "selector_shadow_mode": True,
+            "proposed_intervention_type": "RERANK",
+            "selector_candidate_switch": False,
+            "selector_fallback_requested": False,
+            "proposed_risk_improvement": 0.08,
+            "top1_risk": 0.76,
+            "min_candidate_risk": 0.42,
+        },
+        {
+            "time": 2.0,
+            "candidate_type": "progress",
+            "intervention_type": "KEEP",
+            "selector_shadow_mode": True,
+            "proposed_intervention_type": "KEEP",
+            "selector_candidate_switch": True,
+            "selector_fallback_requested": True,
+            "proposed_risk_improvement": 0.0,
+            "top1_risk": 0.64,
+            "min_candidate_risk": 0.40,
+        },
+    ]
+
+    summary = scenario_benchmark.summarize_run(rows)
+
+    assert summary["keep_rate"] == 1.0
+    assert summary["shadow_mode_rate"] == 1.0
+    assert summary["proposed_rerank_rate"] == 0.5
+    assert summary["proposed_keep_rate"] == 0.5
+    assert summary["candidate_switch_rate"] == 0.5
+    assert summary["fallback_request_rate"] == 0.5
+    assert abs(summary["proposed_risk_improvement_mean"] - 0.04) < 1e-9
+    assert abs(summary["top1_risk_mean"] - 0.70) < 1e-9
+    assert abs(summary["min_candidate_risk_mean"] - 0.41) < 1e-9

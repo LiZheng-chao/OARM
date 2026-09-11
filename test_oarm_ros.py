@@ -34,6 +34,7 @@ from OARM.policy.oarm_network import OARMNetwork
 from OARM.policy.oarm_intervention_selector import (
     BrakeInterventionLatch,
     BrakeLatchConfig,
+    InterventionSelection,
     InterventionSelectorConfig,
     OARMInterventionSelector,
 )
@@ -286,14 +287,44 @@ class OARMNet:
             self.calibration_version = "identity"
         if self.config.get("risk_conformal_slack", None) is not None:
             self.risk_calibration.conformal_slack = float(self.config.get("risk_conformal_slack"))
-        self.enable_intervention_selector = bool(self.config.get("enable_intervention_selector", False))
-        risk_threshold_keep = float(self.config.get("risk_threshold_keep", 0.10))
-        risk_threshold_safe = float(self.config.get("risk_threshold_safe", 0.20))
-        if not 0.0 <= risk_threshold_keep <= risk_threshold_safe <= 1.0:
-            raise ValueError(
-                "Intervention risk thresholds must satisfy "
-                f"0 <= keep <= safe <= 1, got keep={risk_threshold_keep}, safe={risk_threshold_safe}"
+        self.selector_risk_mode = str(self.config.get("selector_risk_mode", "point"))
+        if self.selector_risk_mode not in {"point", "upper"}:
+            raise ValueError(f"selector_risk_mode must be point or upper, got {self.selector_risk_mode!r}")
+        self.selector_shadow_mode = bool(self.config.get("selector_shadow_mode", False))
+        self.selector_fallback_mode = str(self.config.get("selector_fallback_mode", "keep_top1"))
+        self.enable_intervention_selector = bool(
+            self.config.get("enable_intervention_selector", False) or self.selector_shadow_mode
+        )
+        legacy_keep = float(self.config.get("risk_threshold_keep", 0.10))
+        legacy_safe = float(self.config.get("risk_threshold_safe", 0.20))
+        configured_threshold = self.config.get("risk_threshold", None)
+        if configured_threshold is None:
+            # Legacy keep/safe values are interpreted as temporal hysteresis.
+            self.selector_risk_threshold = legacy_safe
+            self.selector_risk_release_threshold = legacy_keep
+        else:
+            self.selector_risk_threshold = float(configured_threshold)
+            configured_release = self.config.get("risk_release_threshold", None)
+            self.selector_risk_release_threshold = (
+                self.selector_risk_threshold
+                if configured_release is None
+                else float(configured_release)
             )
+        if not 0.0 <= self.selector_risk_release_threshold <= self.selector_risk_threshold <= 1.0:
+            raise ValueError(
+                "Selector thresholds must satisfy 0 <= release <= risk_threshold <= 1, "
+                f"got release={self.selector_risk_release_threshold}, "
+                f"risk_threshold={self.selector_risk_threshold}"
+            )
+        self.config["risk_threshold"] = self.selector_risk_threshold
+        self.config["risk_release_threshold"] = self.selector_risk_release_threshold
+        self.brake_latch.config.release_risk = self.selector_risk_release_threshold
+        self.selector_previous_index = None
+        self.selector_previous_since_s = None
+        self.selector_intervention_active = False
+        self.selector_intervention_since_s = None
+        self.selector_switch_count = 0
+        self.selector_decision_count = 0
         if self.main_experiment and self.enable_intervention_selector:
             if not calibration_file or not self.use_calibrated_risk:
                 raise ValueError(
@@ -319,21 +350,30 @@ class OARMNet:
                     "Formal intervention calibration must contain candidate-level reaction-risk labels, "
                     "the calibration split, and at least two explicitly identified episodes."
                 )
-        if self.main_experiment and self.enable_intervention_selector and not self.brake_latch.config.enabled:
+        self.selector_can_execute_brake = (
+            not self.selector_shadow_mode and self.selector_fallback_mode == "brake"
+        )
+        if self.main_experiment and self.enable_intervention_selector and self.selector_can_execute_brake and not self.brake_latch.config.enabled:
             raise ValueError("Formal intervention requires the brake latch; remove --disable-brake-latch.")
         if (
             self.main_experiment
             and self.enable_intervention_selector
+            and self.selector_can_execute_brake
             and not self.brake_latch.config.require_release_evidence
         ):
             raise ValueError(
                 "Formal intervention requires release evidence; with PROBE disabled, BRAKE is a terminal fallback.")
         self.intervention_selector = OARMInterventionSelector(
             InterventionSelectorConfig(
-                delta_keep=risk_threshold_keep,
-                delta_safe=risk_threshold_safe,
+                risk_threshold=self.selector_risk_threshold,
+                risk_release_threshold=self.selector_risk_release_threshold,
                 risk_improvement_min=float(self.config.get("risk_improvement_min", 0.02)),
-                lambda_risk=float(self.config.get("selector_lambda_risk", 1.0)),
+                lambda_deviation=float(self.config.get("selector_lambda_deviation", 0.0)),
+                lambda_risk=float(self.config.get("selector_lambda_risk", 0.0)),
+                max_yopo_cost_increase=self.config.get("selector_max_yopo_cost_increase", None),
+                candidate_switch_penalty=float(self.config.get("selector_candidate_switch_penalty", 0.0)),
+                min_candidate_hold_s=float(self.config.get("selector_min_candidate_hold_s", 0.0)),
+                fallback_mode=self.selector_fallback_mode,
             )
         )
         agile_bonus_enabled = any(
@@ -809,13 +849,17 @@ class OARMNet:
         else:
             calibrated_risk_t = validity_fused_risk_t
         risk_upper_t = risk_upper_bound(calibrated_risk_t, self.risk_calibration).to(device=validity_fused_risk_t.device)
+        selector_risk_t = calibrated_risk_t if self.selector_risk_mode == "point" else risk_upper_t
+        if self.selector_risk_mode == "upper":
+            risk_source = risk_source + "+upper_slack"
         margin_pred = margin_pred_t.detach().cpu().numpy()
         raw_risk_prob = raw_risk_prob_t.detach().cpu().numpy()
         hazard_risk_prob = None if hazard_risk_prob_t is None else hazard_risk_prob_t.detach().cpu().numpy()
         validity_fused_risk_prob = validity_fused_risk_t.detach().cpu().numpy()
         calibrated_risk_prob = calibrated_risk_t.detach().cpu().numpy()
         risk_upper = risk_upper_t.detach().cpu().numpy()
-        risk_prob = risk_upper if (self.enable_intervention_selector or self.use_calibrated_risk) else validity_fused_risk_prob
+        selector_risk = selector_risk_t.detach().cpu().numpy()
+        risk_prob = selector_risk if (self.enable_intervention_selector or self.use_calibrated_risk) else validity_fused_risk_prob
         reaction_window_mean = None if reaction_window_mean_t is None else reaction_window_mean_t.detach().cpu().numpy()
         reaction_window_logvar = None if reaction_window_logvar_t is None else reaction_window_logvar_t.detach().cpu().numpy()
         validity_prob = None if validity_prob_t is None else validity_prob_t.detach().cpu().numpy()
@@ -854,7 +898,7 @@ class OARMNet:
                 endstate_w,
                 traj_time,
                 candidate_type,
-                risk_upper,
+                selector_risk,
                 depth_clearance,
                 altitude_violation,
                 original_yopo_top1,
@@ -1599,7 +1643,7 @@ class OARMNet:
         endstate_w,
         traj_time,
         candidate_type,
-        risk_upper,
+        selector_risk,
         depth_clearance,
         altitude_violation,
         original_yopo_top1,
@@ -1615,6 +1659,8 @@ class OARMNet:
             geometry_admissible &= np.isfinite(depth_clearance) & (depth_clearance >= self.depth_clearance_min)
         if altitude_violation is not None:
             geometry_admissible &= altitude_violation <= 1e-6
+        self.last_selector_geometry_admissible = geometry_admissible.copy()
+
         top_endpoint = endstate_w[original_yopo_top1, :, 0]
         deviation = np.linalg.norm(endstate_w[:, :, 0] - top_endpoint[None, :], axis=1)
         brake_risk_upper = None if brake_candidate is None else float(brake_candidate.get("risk_upper_bound", 1.0))
@@ -1622,17 +1668,109 @@ class OARMNet:
             brake_candidate is not None
             and brake_candidate.get("feasible", False)
             and brake_risk_upper is not None
-            and brake_risk_upper <= float(self.config.get("risk_threshold_safe", 0.20))
+            and brake_risk_upper <= self.selector_risk_threshold
         )
-        decision = self.intervention_selector.select(
-            risk_upper_bound=risk_upper,
+        now_s = time.time()
+        previous_age_s = (
+            None
+            if self.selector_previous_since_s is None
+            else max(now_s - float(self.selector_previous_since_s), 0.0)
+        )
+        proposed = self.intervention_selector.select(
+            risk_upper_bound=selector_risk,
             yopo_cost=-utility,
             geometry_admissible=geometry_admissible,
             deviation_from_top1=deviation,
             brake_feasible=brake_feasible,
             brake_risk_upper_bound=brake_risk_upper,
             top1_index=original_yopo_top1,
+            intervention_active=self.selector_intervention_active,
+            previous_selected_index=self.selector_previous_index,
+            previous_selection_age_s=previous_age_s,
         )
+
+        proposed_index = proposed.selected_index
+        candidate_switch = bool(
+            proposed_index is not None
+            and self.selector_previous_index is not None
+            and int(proposed_index) != int(self.selector_previous_index)
+        )
+        self.selector_decision_count += 1
+        if candidate_switch:
+            self.selector_switch_count += 1
+        if proposed_index is not None:
+            if self.selector_previous_index is None or int(proposed_index) != int(self.selector_previous_index):
+                self.selector_previous_since_s = now_s
+            self.selector_previous_index = int(proposed_index)
+        next_intervention_active = bool(
+            proposed.intervention_type != "KEEP"
+            or (
+                proposed.risk_before is not None
+                and float(proposed.risk_before) > self.selector_risk_threshold
+            )
+        )
+        if next_intervention_active and not self.selector_intervention_active:
+            self.selector_intervention_since_s = now_s
+        elif not next_intervention_active:
+            self.selector_intervention_since_s = None
+        self.selector_intervention_active = next_intervention_active
+        intervention_duration_s = (
+            0.0
+            if self.selector_intervention_since_s is None
+            else max(now_s - float(self.selector_intervention_since_s), 0.0)
+        )
+
+        metadata = dict(proposed.metadata or {})
+        metadata.update(
+            {
+                "selector_risk_mode": self.selector_risk_mode,
+                "shadow_mode": bool(self.selector_shadow_mode),
+                "proposed_candidate_id": None if proposed_index is None else int(proposed_index),
+                "proposed_intervention_type": proposed.intervention_type,
+                "proposed_intervention_reason": proposed.intervention_reason,
+                "proposed_risk": None if proposed.risk_after is None else float(proposed.risk_after),
+                "proposed_risk_improvement": (
+                    None
+                    if proposed.risk_before is None or proposed.risk_after is None
+                    else float(proposed.risk_before) - float(proposed.risk_after)
+                ),
+                "candidate_switch": candidate_switch,
+                "selector_switch_count": int(self.selector_switch_count),
+                "selector_decision_count": int(self.selector_decision_count),
+                "intervention_duration_s": float(intervention_duration_s),
+                "selector_switch_rate": float(self.selector_switch_count)
+                / max(float(self.selector_decision_count), 1.0),
+                "fallback_requested": bool(
+                    metadata.get("fallback_requested", False)
+                    or proposed.intervention_type in {"BRAKE", "DEGRADED"}
+                ),
+            }
+        )
+        proposed.metadata = metadata
+
+        selection_score = utility.astype(np.float32).copy()
+        if self.selector_shadow_mode:
+            top1_risk = float(selector_risk[original_yopo_top1])
+            shadow_metadata = dict(metadata)
+            shadow_metadata.update(
+                {
+                    "actual_candidate_id": int(original_yopo_top1),
+                    "actual_intervention_type": "KEEP",
+                    "actual_risk": top1_risk,
+                }
+            )
+            decision = InterventionSelection(
+                int(original_yopo_top1),
+                "KEEP",
+                "SHADOW_MODE_KEEP_YOPO",
+                top1_risk,
+                top1_risk,
+                float(-utility[original_yopo_top1]),
+                metadata=shadow_metadata,
+            )
+            return int(original_yopo_top1), selection_score, decision
+
+        decision = proposed
         release_index = decision.selected_index
         release_admissible = bool(
             release_index is not None
@@ -1640,7 +1778,6 @@ class OARMNet:
             and geometry_admissible[int(release_index)]
         )
         brake_duration_s = 0.0 if brake_candidate is None else float(brake_candidate.get("duration", 0.0))
-        now_s = time.time()
         _odom_pos, odom_vel, _odom_yaw = self.get_odom_state()
         speed_mps = float(np.linalg.norm(odom_vel))
         if self.brake_latch.active and speed_mps <= self.brake_latch.config.release_speed_mps:
@@ -1675,7 +1812,7 @@ class OARMNet:
             self.brake_latch_anchor_time_s = None
             self.brake_probe_stationary_start_s = None
             self.brake_probe_yaw_center = None
-        selection_score = utility.astype(np.float32).copy()
+
         selected = decision.selected_index
         if decision.intervention_type == "BRAKE":
             brake_idx = None
@@ -1689,7 +1826,6 @@ class OARMNet:
         elif selected is None:
             selected = original_yopo_top1
         return int(selected), selection_score, decision
-
     def visualize_trajectory(self, utility, pred_endstate, traj_time, action_id, candidate_type=None):
         start_pos = self.get_start_pos()
         start_vel = self.get_start_vel()
@@ -2052,6 +2188,15 @@ class OARMNet:
     ):
         if self.log_jsonl_file is None:
             return
+        intervention_metadata = {} if intervention is None else dict(intervention.metadata or {})
+        finite_risks = np.asarray(risk_prob, dtype=np.float64)
+        finite_risks = finite_risks[np.isfinite(finite_risks)]
+        min_candidate_risk = None if finite_risks.size == 0 else float(np.min(finite_risks))
+        top1_risk = (
+            None
+            if original_yopo_top1 is None
+            else float(risk_prob[int(original_yopo_top1)])
+        )
         selected_type = self.candidate_type_name(candidate_type[action_id] if candidate_type is not None else None)
         selected_depth_clearance = None
         if depth_clearance is not None and np.isfinite(depth_clearance[action_id]):
@@ -2134,10 +2279,19 @@ class OARMNet:
             "enable_rm_critic": bool(self.enable_rm_critic),
             "enable_latency_aware_risk": bool(self.enable_latency_aware_risk),
             "risk_source": risk_source,
+            "risk_threshold": float(self.selector_risk_threshold),
+            "risk_release_threshold": float(self.selector_risk_release_threshold),
             "risk_threshold_keep": float(self.config.get("risk_threshold_keep", 0.10)),
             "risk_threshold_safe": float(self.config.get("risk_threshold_safe", 0.20)),
             "risk_improvement_min": float(self.config.get("risk_improvement_min", 0.02)),
-            "selector_lambda_risk": float(self.config.get("selector_lambda_risk", 1.0)),
+            "selector_risk_mode": self.selector_risk_mode,
+            "selector_shadow_mode": bool(self.selector_shadow_mode),
+            "selector_fallback_mode": self.selector_fallback_mode,
+            "selector_max_yopo_cost_increase": self.config.get("selector_max_yopo_cost_increase", None),
+            "selector_candidate_switch_penalty": float(self.config.get("selector_candidate_switch_penalty", 0.0)),
+            "selector_min_candidate_hold_s": float(self.config.get("selector_min_candidate_hold_s", 0.0)),
+            "selector_lambda_deviation": float(self.config.get("selector_lambda_deviation", 0.0)),
+            "selector_lambda_risk": float(self.config.get("selector_lambda_risk", 0.0)),
             "use_calibrated_risk": bool(self.use_calibrated_risk),
             "use_validity_risk_fusion": bool(self.use_validity_risk_fusion),
             "reaction_budget_margin_ms": float(self.config.get("reaction_budget_margin_ms", 0.0)),
@@ -2328,11 +2482,29 @@ class OARMNet:
             "uses_privileged_online": False,
             "mapless_online_inference": True,
             "original_yopo_top1": None if original_yopo_top1 is None else int(original_yopo_top1),
+            "top1_risk": top1_risk,
+            "min_candidate_risk": min_candidate_risk,
             "intervention_type": None if intervention is None else intervention.intervention_type,
             "intervention_reason": None if intervention is None else intervention.intervention_reason,
             "risk_before": None if intervention is None or intervention.risk_before is None else float(intervention.risk_before),
             "risk_after": None if intervention is None or intervention.risk_after is None else float(intervention.risk_after),
             "intervention_score": None if intervention is None or intervention.score is None else float(intervention.score),
+            "proposed_candidate_id": intervention_metadata.get("proposed_candidate_id"),
+            "proposed_intervention_type": intervention_metadata.get("proposed_intervention_type"),
+            "proposed_intervention_reason": intervention_metadata.get("proposed_intervention_reason"),
+            "proposed_risk": intervention_metadata.get("proposed_risk"),
+            "proposed_risk_improvement": intervention_metadata.get("proposed_risk_improvement"),
+            "selector_candidate_switch": bool(intervention_metadata.get("candidate_switch", False)),
+            "selector_fallback_requested": bool(intervention_metadata.get("fallback_requested", False)),
+            "selector_intervention_duration_s": float(intervention_metadata.get("intervention_duration_s", 0.0)),
+            "selector_switch_count": int(intervention_metadata.get("selector_switch_count", self.selector_switch_count)),
+            "selector_decision_count": int(intervention_metadata.get("selector_decision_count", self.selector_decision_count)),
+            "selector_switch_rate": float(
+                intervention_metadata.get(
+                    "selector_switch_rate",
+                    float(self.selector_switch_count) / max(float(self.selector_decision_count), 1.0),
+                )
+            ),
             "intervention_metadata": None if intervention is None else intervention.metadata,
         }
         if latency_budget is not None:
@@ -2355,6 +2527,7 @@ class OARMNet:
                     "selection_score": float(selection_score[i]),
                     "margin_pred": float(margin_pred[i]),
                     "risk_prob": float(risk_prob[i]),
+                    "geometry_admissible": bool(self.last_selector_geometry_admissible[i]) if self.enable_intervention_selector else None,
                     "raw_risk_prob": None if raw_risk_prob is None else float(raw_risk_prob[i]),
                     "hazard_risk_prob": None if hazard_risk_prob is None else float(hazard_risk_prob[i]),
                     "validity_fused_risk_prob": None if validity_fused_risk_prob is None else float(validity_fused_risk_prob[i]),
@@ -2533,14 +2706,35 @@ def parser():
     parser.add_argument("--reaction-budget-margin-ms", type=float, default=0.0)
     parser.add_argument("--calibration-file", type=str, default="")
     parser.add_argument("--use-calibrated-risk", action="store_true")
-    parser.add_argument("--risk-conformal-slack", type=float, default=None)
+    parser.add_argument(
+        "--risk-upper-slack",
+        "--risk-conformal-slack",
+        dest="risk_conformal_slack",
+        type=float,
+        default=None,
+        help="optional conservative upper-slack ablation; the legacy name is retained for compatibility",
+    )
     parser.add_argument("--use-validity-risk-fusion", action="store_true", default=None)
     parser.add_argument("--validity-unknown-risk", type=float, default=0.5)
     parser.add_argument("--enable-intervention-selector", action="store_true")
-    parser.add_argument("--risk-threshold-keep", type=float, default=0.10)
-    parser.add_argument("--risk-threshold-safe", type=float, default=0.20)
+    parser.add_argument("--risk-threshold", type=float, default=None, help="single candidate feasibility risk budget epsilon")
+    parser.add_argument("--risk-release-threshold", type=float, default=None, help="optional lower hysteresis release threshold")
+    parser.add_argument("--risk-threshold-keep", type=float, default=0.10, help="legacy hysteresis release threshold")
+    parser.add_argument("--risk-threshold-safe", type=float, default=0.20, help="legacy single risk threshold")
     parser.add_argument("--risk-improvement-min", type=float, default=0.02)
-    parser.add_argument("--selector-lambda-risk", type=float, default=1.0)
+    parser.add_argument("--selector-risk-mode", choices=["point", "upper"], default="point")
+    parser.add_argument("--selector-shadow-mode", action="store_true", help="log selector proposals while YOPO top-1 remains in control")
+    parser.add_argument(
+        "--selector-fallback-mode",
+        choices=["keep_top1", "lowest_risk", "brake"],
+        default="keep_top1",
+        help="action when no risk-feasible rerank exists; brake is an explicit legacy/ablation mode",
+    )
+    parser.add_argument("--selector-max-yopo-cost-increase", type=float, default=None)
+    parser.add_argument("--selector-candidate-switch-penalty", type=float, default=0.0)
+    parser.add_argument("--selector-min-candidate-hold-s", type=float, default=0.0)
+    parser.add_argument("--selector-lambda-deviation", type=float, default=0.0)
+    parser.add_argument("--selector-lambda-risk", type=float, default=0.0)
     parser.add_argument("--progress-bonus-weight", type=float, default=0.0)
     parser.add_argument("--agile-progress-weight", type=float, default=0.0)
     parser.add_argument("--agile-goal-distance-weight", type=float, default=0.0)
@@ -2680,8 +2874,17 @@ if __name__ == "__main__":
         "use_validity_risk_fusion": args.use_validity_risk_fusion,
         "validity_unknown_risk": args.validity_unknown_risk,
         "enable_intervention_selector": args.enable_intervention_selector,
+        "risk_threshold": args.risk_threshold,
+        "risk_release_threshold": args.risk_release_threshold,
         "risk_threshold_keep": args.risk_threshold_keep,
         "risk_threshold_safe": args.risk_threshold_safe,
+        "selector_risk_mode": args.selector_risk_mode,
+        "selector_shadow_mode": args.selector_shadow_mode,
+        "selector_fallback_mode": args.selector_fallback_mode,
+        "selector_max_yopo_cost_increase": args.selector_max_yopo_cost_increase,
+        "selector_candidate_switch_penalty": args.selector_candidate_switch_penalty,
+        "selector_min_candidate_hold_s": args.selector_min_candidate_hold_s,
+        "selector_lambda_deviation": args.selector_lambda_deviation,
         "selector_max_goal_retreat_m": args.selector_max_goal_retreat_m,
         "selector_progress_samples": args.selector_progress_samples,
         "risk_improvement_min": args.risk_improvement_min,

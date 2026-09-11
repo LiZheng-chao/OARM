@@ -40,6 +40,17 @@ OPTIONAL_GT_FIELDS = (
     "risk_upper_bound",
     "intervention_type",
     "intervention_reason",
+    "proposed_candidate_id",
+    "proposed_intervention_type",
+    "proposed_intervention_reason",
+    "proposed_risk",
+    "proposed_risk_improvement",
+    "selector_candidate_switch",
+    "selector_fallback_requested",
+    "selector_intervention_duration_s",
+    "selector_shadow_mode",
+    "top1_risk",
+    "min_candidate_risk",
     "reaction_budget_ms",
     "latency_violation",
     "first_visible_time_gt",
@@ -340,6 +351,20 @@ def summarize_run(rows: List[Dict]) -> Dict:
     risk_uppers = [risk_upper_bound(row) for row in rows]
     intervention_types = [intervention_type_name(row) for row in rows]
     intervention_known = [t for t in intervention_types if t != "unknown"]
+    proposed_intervention_types = [
+        str(row.get("proposed_intervention_type")).strip().lower()
+        for row in rows
+        if row.get("proposed_intervention_type") not in (None, "")
+    ]
+    selector_switches = bool_values(rows, "selector_candidate_switch")
+    fallback_requests = bool_values(rows, "selector_fallback_requested")
+    shadow_modes = bool_values(rows, "selector_shadow_mode")
+    intervention_durations = [parse_float(row.get("selector_intervention_duration_s")) for row in rows]
+    proposed_risk_improvements = [
+        parse_float(row.get("proposed_risk_improvement")) for row in rows
+    ]
+    top1_risks = [parse_float(row.get("top1_risk")) for row in rows]
+    min_candidate_risks = [parse_float(row.get("min_candidate_risk")) for row in rows]
     latency_violations = [latency_violation(row) for row in rows]
     latency_violations = [v for v in latency_violations if v is not None]
     intervention_pairs = []
@@ -416,6 +441,18 @@ def summarize_run(rows: List[Dict]) -> Dict:
         "rerank_rate": mean([float(t == "rerank") for t in intervention_known]),
         "probe_rate": mean([float(t == "probe") for t in intervention_known]),
         "brake_rate": mean([float(t == "brake") for t in intervention_known]),
+        "shadow_mode_rate": mean([float(value) for value in shadow_modes]),
+        "proposed_keep_rate": mean([float(t == "keep") for t in proposed_intervention_types]),
+        "proposed_rerank_rate": mean([float(t == "rerank") for t in proposed_intervention_types]),
+        "proposed_brake_rate": mean([float(t == "brake") for t in proposed_intervention_types]),
+        "proposed_degraded_rate": mean([float(t == "degraded") for t in proposed_intervention_types]),
+        "candidate_switch_rate": mean([float(value) for value in selector_switches]),
+        "fallback_request_rate": mean([float(value) for value in fallback_requests]),
+        "intervention_duration_s_mean": mean(intervention_durations),
+        "intervention_duration_s_max": max([v for v in intervention_durations if v is not None], default=None),
+        "proposed_risk_improvement_mean": mean(proposed_risk_improvements),
+        "top1_risk_mean": mean(top1_risks),
+        "min_candidate_risk_mean": mean(min_candidate_risks),
         "false_intervention_rate": mean(false_interventions),
         "missed_intervention_rate": mean(missed_interventions),
         "rmvr_source": 1.0 if gt_margins else 0.0,

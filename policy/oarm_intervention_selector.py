@@ -4,7 +4,9 @@ from typing import Any, Dict, Iterable, List, Optional
 
 KEEP_LOW_RISK = "KEEP_LOW_RISK"
 KEEP_GRAY_NO_RISK_IMPROVEMENT = "KEEP_GRAY_NO_RISK_IMPROVEMENT"
+KEEP_NO_RISK_FEASIBLE_ALTERNATIVE = "KEEP_NO_RISK_FEASIBLE_ALTERNATIVE"
 RERANK_TOP1_UNSAFE = "RERANK_TOP1_UNSAFE"
+RERANK_MIN_HOLD = "RERANK_MIN_HOLD"
 PROBE_VISIBILITY_GAIN = "PROBE_VISIBILITY_GAIN"
 BRAKE_NO_SAFE_CANDIDATE = "BRAKE_NO_SAFE_CANDIDATE"
 BRAKE_HIGH_UNCERTAINTY = "BRAKE_HIGH_UNCERTAINTY"
@@ -15,16 +17,39 @@ NO_VERIFIED_SAFE_ACTION = "NO_VERIFIED_SAFE_ACTION"
 
 @dataclass
 class InterventionSelectorConfig:
+    risk_threshold: Optional[float] = None
+    risk_release_threshold: Optional[float] = None
     delta_keep: float = 0.10
     delta_safe: float = 0.20
     delta_probe: float = 0.25
-    lambda_deviation: float = 0.25
-    lambda_risk: float = 1.0
+    lambda_deviation: float = 0.0
+    lambda_risk: float = 0.0
     risk_improvement_min: float = 0.02
+    max_yopo_cost_increase: Optional[float] = None
+    candidate_switch_penalty: float = 0.0
+    min_candidate_hold_s: float = 0.0
+    fallback_mode: str = "keep_top1"
     lambda_probe_risk: float = 1.0
     lambda_probe_margin_gain: float = 0.5
     lambda_probe_time: float = 0.05
     min_probe_margin_gain_s: float = 0.05
+
+    def __post_init__(self):
+        # Legacy delta_safe becomes the single feasibility budget until callers
+        # migrate to the explicit risk_threshold option.
+        threshold = self.delta_safe if self.risk_threshold is None else self.risk_threshold
+        release = threshold if self.risk_release_threshold is None else self.risk_release_threshold
+        self.risk_threshold = float(threshold)
+        self.risk_release_threshold = float(release)
+        if not 0.0 <= self.risk_release_threshold <= self.risk_threshold <= 1.0:
+            raise ValueError(
+                "selector thresholds must satisfy 0 <= release <= risk_threshold <= 1, "
+                f"got release={self.risk_release_threshold}, risk_threshold={self.risk_threshold}"
+            )
+        if self.max_yopo_cost_increase is not None and float(self.max_yopo_cost_increase) < 0.0:
+            raise ValueError("max_yopo_cost_increase must be non-negative or None")
+        if self.fallback_mode not in {"brake", "keep_top1", "lowest_risk"}:
+            raise ValueError(f"unsupported selector fallback_mode={self.fallback_mode!r}")
 
 
 @dataclass
@@ -131,7 +156,7 @@ def _as_list(values: Optional[Iterable], default_len: int = 0, default: float = 
 
 
 class OARMInterventionSelector:
-    """Layered KEEP/Rerank/Probe/Brake selector driven by calibrated risk bounds."""
+    """Project YOPO top-1 onto a single calibrated-risk feasible candidate set."""
 
     def __init__(self, config: InterventionSelectorConfig = None):
         self.config = config or InterventionSelectorConfig()
@@ -148,6 +173,9 @@ class OARMInterventionSelector:
         top1_index: int = 0,
         latency_spike: bool = False,
         high_uncertainty: bool = False,
+        intervention_active: bool = False,
+        previous_selected_index: Optional[int] = None,
+        previous_selection_age_s: Optional[float] = None,
     ) -> InterventionSelection:
         risks = [float(v) for v in _as_list(risk_upper_bound)]
         if not risks:
@@ -162,55 +190,135 @@ class OARMInterventionSelector:
             return self._brake(top1_index, risk_before, BRAKE_LATENCY_SPIKE, brake_feasible, brake_risk_upper_bound)
         if high_uncertainty:
             return self._brake(top1_index, risk_before, BRAKE_HIGH_UNCERTAINTY, brake_feasible, brake_risk_upper_bound)
-        if admissible[top1_index] and risk_before <= self.config.delta_keep:
-            return InterventionSelection(top1_index, "KEEP", KEEP_LOW_RISK, risk_before, risk_before, costs[top1_index])
+
+        risk_threshold = float(self.config.risk_threshold)
+        release_threshold = float(self.config.risk_release_threshold)
+        keep_threshold = release_threshold if intervention_active else risk_threshold
+        common_metadata = {
+            "risk_threshold": risk_threshold,
+            "risk_release_threshold": release_threshold,
+            "effective_keep_threshold": keep_threshold,
+            "intervention_active_before": bool(intervention_active),
+            "fallback_mode": self.config.fallback_mode,
+        }
+        if admissible[top1_index] and risk_before <= keep_threshold:
+            return InterventionSelection(
+                top1_index,
+                "KEEP",
+                KEEP_LOW_RISK,
+                risk_before,
+                risk_before,
+                costs[top1_index],
+                metadata=common_metadata,
+            )
+
         improvement_min = max(float(self.config.risk_improvement_min), 0.0)
-        safe = [
+        cost_limit = None
+        if self.config.max_yopo_cost_increase is not None:
+            cost_limit = costs[top1_index] + float(self.config.max_yopo_cost_increase)
+        feasible = [
             idx
             for idx, risk in enumerate(risks)
             if idx != top1_index
             and admissible[idx]
-            and risk <= self.config.delta_safe
+            and risk <= risk_threshold
             and risk <= risk_before - improvement_min
+            and (cost_limit is None or costs[idx] <= cost_limit)
         ]
-        if safe:
-            best = min(
-                safe,
-                key=lambda idx: costs[idx]
-                + self.config.lambda_deviation * deviation[idx]
-                + self.config.lambda_risk * risks[idx],
+        if feasible:
+            previous = None if previous_selected_index is None else int(previous_selected_index)
+            previous_age = None if previous_selection_age_s is None else max(float(previous_selection_age_s), 0.0)
+            hold_previous = bool(
+                previous in feasible
+                and previous_age is not None
+                and previous_age < max(float(self.config.min_candidate_hold_s), 0.0)
             )
-            score = costs[best] + self.config.lambda_deviation * deviation[best] + self.config.lambda_risk * risks[best]
+            switch_penalty = max(float(self.config.candidate_switch_penalty), 0.0)
+
+            def selection_score(idx):
+                switching = previous is not None and idx != previous
+                return (
+                    costs[idx]
+                    + self.config.lambda_deviation * deviation[idx]
+                    + self.config.lambda_risk * risks[idx]
+                    + (switch_penalty if switching else 0.0)
+                )
+
+            best = min(
+                feasible,
+                key=selection_score,
+            )
+            reason = RERANK_TOP1_UNSAFE
+            if hold_previous:
+                best = previous
+                reason = RERANK_MIN_HOLD
+            score = selection_score(best)
+            metadata = dict(common_metadata)
+            metadata.update(
+                {
+                    "risk_improvement_min": improvement_min,
+                    "risk_improvement": risk_before - risks[best],
+                    "risk_feasible_count": len(feasible),
+                    "top1_yopo_cost": costs[top1_index],
+                    "selected_yopo_cost": costs[best],
+                    "yopo_cost_increase": costs[best] - costs[top1_index],
+                    "max_yopo_cost_increase": self.config.max_yopo_cost_increase,
+                    "previous_selected_index": previous,
+                    "previous_selection_age_s": previous_age,
+                    "candidate_switch": previous is not None and best != previous,
+                    "candidate_switch_penalty": switch_penalty,
+                    "min_candidate_hold_s": float(self.config.min_candidate_hold_s),
+                }
+            )
             return InterventionSelection(
                 best,
                 "RERANK",
-                RERANK_TOP1_UNSAFE,
+                reason,
                 risk_before,
                 risks[best],
                 score,
-                metadata={"risk_improvement_min": improvement_min},
+                metadata=metadata,
             )
-        if admissible[top1_index] and risk_before <= self.config.delta_safe:
+
+        fallback_metadata = dict(common_metadata)
+        fallback_metadata.update(
+            {
+                "risk_improvement_min": improvement_min,
+                "risk_feasible_count": 0,
+                "fallback_requested": True,
+            }
+        )
+        if admissible[top1_index] and self.config.fallback_mode == "keep_top1":
             return InterventionSelection(
                 top1_index,
                 "KEEP",
-                KEEP_GRAY_NO_RISK_IMPROVEMENT,
+                KEEP_NO_RISK_FEASIBLE_ALTERNATIVE,
                 risk_before,
                 risk_before,
-                costs[top1_index] + self.config.lambda_risk * risk_before,
-                metadata={"risk_improvement_min": improvement_min},
+                costs[top1_index],
+                metadata=fallback_metadata,
             )
+
         probe = self._select_probe(probe_candidates or [], risk_before)
         if probe is not None:
             return probe
-        if not brake_feasible:
-            feasible = [idx for idx in range(n) if admissible[idx]]
-            if feasible:
+
+        if self.config.fallback_mode == "lowest_risk" or not brake_feasible:
+            admissible_indices = [idx for idx in range(n) if admissible[idx]]
+            if admissible_indices:
                 best = min(
-                    feasible,
+                    admissible_indices,
                     key=lambda idx: risks[idx] + 0.01 * costs[idx] + 0.01 * self.config.lambda_deviation * deviation[idx],
                 )
                 score = risks[best] + 0.01 * costs[best] + 0.01 * self.config.lambda_deviation * deviation[best]
+                metadata = dict(fallback_metadata)
+                metadata.update(
+                    {
+                        "brake_feasible": bool(brake_feasible),
+                        "brake_risk_upper_bound": None if brake_risk_upper_bound is None else float(brake_risk_upper_bound),
+                        "fallback": "lowest_risk_admissible_candidate",
+                    }
+                )
                 return InterventionSelection(
                     best,
                     "DEGRADED",
@@ -218,23 +326,23 @@ class OARMInterventionSelector:
                     risk_before,
                     risks[best],
                     score,
-                    metadata={
-                        "brake_feasible": False,
-                        "brake_risk_upper_bound": None if brake_risk_upper_bound is None else float(brake_risk_upper_bound),
-                        "fallback": "lowest_risk_admissible_candidate",
-                    },
+                    metadata=metadata,
                 )
+            metadata = dict(fallback_metadata)
+            metadata.update(
+                {
+                    "brake_feasible": bool(brake_feasible),
+                    "brake_risk_upper_bound": None if brake_risk_upper_bound is None else float(brake_risk_upper_bound),
+                    "fallback": "top1_no_admissible_candidate",
+                }
+            )
             return InterventionSelection(
                 top1_index,
                 "DEGRADED",
                 NO_VERIFIED_SAFE_ACTION,
                 risk_before,
                 risk_before,
-                metadata={
-                    "brake_feasible": False,
-                    "brake_risk_upper_bound": None if brake_risk_upper_bound is None else float(brake_risk_upper_bound),
-                    "fallback": "top1_no_admissible_candidate",
-                },
+                metadata=metadata,
             )
         return self._brake(top1_index, risk_before, BRAKE_NO_SAFE_CANDIDATE, brake_feasible, brake_risk_upper_bound)
 

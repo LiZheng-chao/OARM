@@ -297,50 +297,98 @@ def check_latency_budget_margin():
 
 
 def check_intervention_selector_excludes_top1_rerank():
-    selector = OARMInterventionSelector(InterventionSelectorConfig(delta_keep=0.10, delta_safe=0.20, risk_improvement_min=0.02))
-    decision = selector.select(
-        risk_upper_bound=[0.15, 0.35, 0.40],
-        yopo_cost=[0.0, 0.1, 0.2],
-        geometry_admissible=[True, True, True],
-        top1_index=0,
+    selector = OARMInterventionSelector(
+        InterventionSelectorConfig(
+            risk_threshold=0.20,
+            risk_release_threshold=0.20,
+            risk_improvement_min=0.02,
+            fallback_mode="keep_top1",
+        )
     )
-    assert decision.intervention_type == "KEEP"
-    assert decision.intervention_reason == "KEEP_GRAY_NO_RISK_IMPROVEMENT"
-    assert decision.risk_after <= decision.risk_before
-
     decision = selector.select(
-        risk_upper_bound=[0.15, 0.19, 0.40],
+        risk_upper_bound=[0.15, 0.05, 0.40],
         yopo_cost=[0.0, -10.0, 0.2],
         geometry_admissible=[True, True, True],
         top1_index=0,
     )
     assert decision.intervention_type == "KEEP"
-    assert decision.risk_after <= decision.risk_before
+    assert decision.intervention_reason == "KEEP_LOW_RISK"
+    assert decision.selected_index == 0
 
     decision = selector.select(
-        risk_upper_bound=[0.15, 0.12, 0.40],
-        yopo_cost=[0.0, 0.3, 0.2],
+        risk_upper_bound=[0.30, 0.19, 0.10],
+        yopo_cost=[0.0, 0.1, 0.2],
         geometry_admissible=[True, True, True],
         top1_index=0,
     )
     assert decision.intervention_type == "RERANK"
     assert decision.selected_index == 1
+    assert decision.risk_after <= 0.20
     assert decision.risk_after <= decision.risk_before - 0.02
 
-    risk_weighted = OARMInterventionSelector(
-        InterventionSelectorConfig(delta_keep=0.10, delta_safe=0.20, risk_improvement_min=0.02, lambda_risk=10.0)
-    )
-    decision = risk_weighted.select(
-        risk_upper_bound=[0.18, 0.14, 0.05],
-        yopo_cost=[0.0, 0.0, 0.5],
+    no_improvement = selector.select(
+        risk_upper_bound=[0.30, 0.29, 0.40],
+        yopo_cost=[0.0, -10.0, 0.2],
         geometry_admissible=[True, True, True],
         top1_index=0,
     )
-    assert decision.intervention_type == "RERANK"
-    assert decision.selected_index == 2
-    assert decision.risk_after < decision.risk_before
+    assert no_improvement.intervention_type == "KEEP"
+    assert no_improvement.intervention_reason == "KEEP_NO_RISK_FEASIBLE_ALTERNATIVE"
+    assert no_improvement.metadata["fallback_requested"] is True
 
-    decision = selector.select(
+    bounded = OARMInterventionSelector(
+        InterventionSelectorConfig(
+            risk_threshold=0.20,
+            risk_improvement_min=0.02,
+            max_yopo_cost_increase=0.10,
+            fallback_mode="keep_top1",
+        )
+    )
+    decision = bounded.select(
+        risk_upper_bound=[0.30, 0.10],
+        yopo_cost=[0.0, 0.20],
+        geometry_admissible=[True, True],
+        top1_index=0,
+    )
+    assert decision.intervention_type == "KEEP"
+    assert decision.metadata["risk_feasible_count"] == 0
+
+    held = OARMInterventionSelector(
+        InterventionSelectorConfig(
+            risk_threshold=0.20,
+            risk_improvement_min=0.02,
+            min_candidate_hold_s=1.0,
+            fallback_mode="keep_top1",
+        )
+    ).select(
+        risk_upper_bound=[0.40, 0.15, 0.10],
+        yopo_cost=[0.0, 0.5, 0.0],
+        geometry_admissible=[True, True, True],
+        top1_index=0,
+        previous_selected_index=1,
+        previous_selection_age_s=0.2,
+    )
+    assert held.intervention_type == "RERANK"
+    assert held.intervention_reason == "RERANK_MIN_HOLD"
+    assert held.selected_index == 1
+
+    brake_selector = OARMInterventionSelector(
+        InterventionSelectorConfig(risk_threshold=0.20, fallback_mode="brake")
+    )
+    brake = brake_selector.select(
+        risk_upper_bound=[0.70, 0.55],
+        yopo_cost=[0.0, 0.2],
+        geometry_admissible=[True, True],
+        brake_feasible=True,
+        brake_risk_upper_bound=0.10,
+        top1_index=0,
+    )
+    assert brake.intervention_type == "BRAKE"
+
+    degraded_selector = OARMInterventionSelector(
+        InterventionSelectorConfig(risk_threshold=0.20, fallback_mode="lowest_risk")
+    )
+    degraded = degraded_selector.select(
         risk_upper_bound=[0.70, 0.55, 0.60],
         yopo_cost=[0.0, 0.2, 0.1],
         geometry_admissible=[True, True, True],
@@ -348,11 +396,9 @@ def check_intervention_selector_excludes_top1_rerank():
         brake_risk_upper_bound=1.0,
         top1_index=0,
     )
-    assert decision.intervention_type == "DEGRADED"
-    assert decision.intervention_reason == "NO_VERIFIED_SAFE_ACTION"
-    assert decision.selected_index == 1
-    assert decision.metadata["brake_feasible"] is False
-
+    assert degraded.intervention_type == "DEGRADED"
+    assert degraded.intervention_reason == "NO_VERIFIED_SAFE_ACTION"
+    assert degraded.selected_index == 1
 
 def check_brake_intervention_latch():
     latch = BrakeInterventionLatch(
@@ -511,6 +557,12 @@ def check_fit_risk_calibration_cli_core():
         assert payload["validity_fusion"] is True
         assert payload["label_key"] == "insufficient_reaction_gt"
         assert payload["input_stats"]["episode_count"] == 2
+        assert payload["positive_label_count"] == 2
+        assert payload["negative_label_count"] == 2
+        assert abs(payload["positive_label_rate"] - 0.5) < 1e-9
+        assert payload["tau_diagnostic_sample_count"] == 4
+        assert len(payload["metrics_by_tau_bin"]) == 8
+        assert sum(row["sample_count"] for row in payload["metrics_by_tau_bin"]) == 4
         assert payload["conformal_slack"] >= 0.0
         loaded = TemperatureCalibration.from_file(out_path)
         assert loaded.temperature == payload["temperature"]

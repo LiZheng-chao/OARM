@@ -2,7 +2,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -122,9 +122,10 @@ def _extract_arrays(
     episode_key: str,
     require_split: bool,
     require_episode_id: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, int]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     labels: List[float] = []
     risks: List[float] = []
+    budgets: List[float] = []
     if not label_key:
         raise ValueError("risk calibration requires an explicit candidate-level --label-key, e.g. insufficient_reaction_gt")
     if label_key in GENERIC_LABEL_KEYS:
@@ -143,6 +144,7 @@ def _extract_arrays(
         "episode_count": 0,
         "missing_reaction_window": 0,
         "missing_reaction_budget": 0,
+        "missing_reaction_budget_diagnostic": 0,
         "no_entry_negative_labels": 0,
         "validity_fusion_skipped_two_stage": 0,
     }
@@ -169,6 +171,8 @@ def _extract_arrays(
                     continue
             else:
                 episode_ids.add(str(episode_id))
+
+            label_budget = None
             if label_key == "reaction_window_lt_budget":
                 no_entry = _first_label(record, ("rm_no_entry_gt",))
                 if no_entry == 1.0:
@@ -176,20 +180,21 @@ def _extract_arrays(
                     stats["no_entry_negative_labels"] += 1
                 else:
                     window = _first_number(record, REACTION_WINDOW_KEYS)
-                    budget = _first_number(record, REACTION_BUDGET_KEYS)
+                    label_budget = _first_number(record, REACTION_BUDGET_KEYS)
                     if window is None:
                         stats["missing_reaction_window"] += 1
-                    if budget is None:
+                    if label_budget is None:
                         stats["missing_reaction_budget"] += 1
-                    if window is None or budget is None:
+                    if window is None or label_budget is None:
                         stats["missing_label"] += 1
                         continue
-                    label = 1.0 if window < budget else 0.0
+                    label = 1.0 if window < label_budget else 0.0
             else:
                 label = _first_label(record, (label_key,))
                 if label is None:
                     stats["missing_label"] += 1
                     continue
+
             risk_key_used, risk = _first_number_with_key(record, risk_keys)
             if risk is None:
                 stats["missing_risk"] += 1
@@ -205,6 +210,14 @@ def _extract_arrays(
                     continue
                 validity = min(max(validity, 0.0), 1.0)
                 risk = validity * risk + (1.0 - validity) * float(validity_unknown_risk)
+
+            if label_budget is None:
+                label_budget = _first_number(record, REACTION_BUDGET_KEYS)
+            if label_budget is None:
+                stats["missing_reaction_budget_diagnostic"] += 1
+                budgets.append(math.nan)
+            else:
+                budgets.append(float(label_budget))
             labels.append(label)
             risks.append(risk)
             stats["records_used"] += 1
@@ -218,10 +231,76 @@ def _extract_arrays(
         raise ValueError(f"calibration rows missing episode id key {episode_key!r}; stats={stats}")
     if not risks:
         raise ValueError(f"no usable calibration records found; stats={stats}")
+
     probs = torch.tensor(risks, dtype=torch.float32)
     y = torch.tensor(labels, dtype=torch.float32)
-    return probs, y, stats
+    tau_s = torch.tensor(budgets, dtype=torch.float32)
+    positive_count = int((y >= 0.5).sum().item())
+    stats["positive_label_count"] = positive_count
+    stats["negative_label_count"] = int(y.numel()) - positive_count
+    stats["positive_label_rate"] = float(positive_count) / float(y.numel())
+    return probs, y, tau_s, stats
 
+
+def _metrics_by_tau_bin(
+    before_probs: torch.Tensor,
+    after_probs: torch.Tensor,
+    labels: torch.Tensor,
+    tau_s: torch.Tensor,
+    n_bins: int,
+) -> List[Dict[str, Any]]:
+    edges = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, math.inf)
+    rows: List[Dict[str, Any]] = []
+    finite_tau = torch.isfinite(tau_s)
+    for index, (lower, upper) in enumerate(zip(edges[:-1], edges[1:])):
+        mask = finite_tau & (tau_s >= lower)
+        if math.isfinite(upper):
+            mask = mask & (tau_s < upper)
+        count = int(mask.sum().item())
+        before = binary_calibration_metrics(before_probs[mask], labels[mask], n_bins=n_bins)
+        after = binary_calibration_metrics(after_probs[mask], labels[mask], n_bins=n_bins)
+        rows.append(
+            {
+                "bin": index,
+                "tau_lower_s": float(lower),
+                "tau_upper_s": None if not math.isfinite(upper) else float(upper),
+                "sample_count": count,
+                "positive_label_rate": None if count == 0 else float(labels[mask].mean().item()),
+                "metrics_before": before.__dict__,
+                "metrics_after_platt": after.__dict__,
+            }
+        )
+    return rows
+
+
+def _write_reliability_diagram(path: str, bins: List[Dict[str, Any]]) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required when --reliability-output is set") from exc
+
+    populated = [row for row in bins if row["count"] > 0]
+    fig, ax = plt.subplots(figsize=(5.5, 5.0))
+    ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", color="0.45", label="ideal")
+    if populated:
+        ax.plot(
+            [row["confidence"] for row in populated],
+            [row["empirical_rate"] for row in populated],
+            marker="o",
+            linewidth=1.5,
+            label="calibrated",
+        )
+    ax.set(xlim=(0.0, 1.0), ylim=(0.0, 1.0), xlabel="Predicted risk", ylabel="Empirical positive rate")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=180)
+    plt.close(fig)
 
 def _logit_from_prob(probabilities: torch.Tensor) -> torch.Tensor:
     probs = torch.clamp(probabilities.float(), min=1e-6, max=1.0 - 1e-6)
@@ -250,6 +329,7 @@ def fit_calibration_from_jsonl(
     calibration_manifest: Optional[str] = None,
     test_manifest: Optional[str] = None,
     ignore_map_overlap: bool = False,
+    reliability_output: Optional[str] = None,
 ) -> Dict:
     paths = [Path(p) for p in inputs]
     split_check = None
@@ -268,7 +348,7 @@ def fit_calibration_from_jsonl(
             episode_key=episode_key,
             check_maps=not ignore_map_overlap,
         )
-    probs, labels, stats = _extract_arrays(
+    probs, labels, tau_s, stats = _extract_arrays(
         paths,
         label_key=label_key,
         risk_key=risk_key,
@@ -299,6 +379,8 @@ def fit_calibration_from_jsonl(
     calibration.fitted_on = ",".join(str(p) for p in paths)
     upper = torch.clamp(calibrated + float(slack), min=0.0, max=1.0)
     upper_metrics = binary_calibration_metrics(upper, labels, n_bins=n_bins)
+    reliability_rows = reliability_bins(calibrated, labels, n_bins=n_bins)
+    tau_metrics = _metrics_by_tau_bin(probs, calibrated, labels, tau_s, n_bins=n_bins)
 
     payload = calibration.state_dict()
     payload.update(
@@ -316,12 +398,17 @@ def fit_calibration_from_jsonl(
             "require_episode_id": bool(require_episode_id),
             "split_manifest_check": split_check,
             "sample_count": int(labels.numel()),
+            "positive_label_count": int(stats["positive_label_count"]),
+            "negative_label_count": int(stats["negative_label_count"]),
+            "positive_label_rate": float(stats["positive_label_rate"]),
+            "tau_diagnostic_sample_count": int(torch.isfinite(tau_s).sum().item()),
             "metrics_before": before.__dict__,
             "metrics_after_platt": after.__dict__,
             "metrics_after_temperature": after.__dict__,
             "metrics_after_empirical_upper": upper_metrics.__dict__,
-            "reliability_bins_after_platt": reliability_bins(calibrated, labels, n_bins=n_bins),
-            "reliability_bins_after_temperature": reliability_bins(calibrated, labels, n_bins=n_bins),
+            "reliability_bins_after_platt": reliability_rows,
+            "reliability_bins_after_temperature": reliability_rows,
+            "metrics_by_tau_bin": tau_metrics,
             "input_stats": stats,
             "note": "conformal_slack is a binned one-sided empirical calibration-gap bound, not a formal conformal guarantee.",
         }
@@ -330,6 +417,8 @@ def fit_calibration_from_jsonl(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+    if reliability_output:
+        _write_reliability_diagram(reliability_output, reliability_rows)
     return payload
 
 
@@ -337,6 +426,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Fit OARM risk temperature calibration and empirical conservative upper slack from JSONL logs.")
     p.add_argument("--input", nargs="+", required=True, help="calibration JSONL file(s); rows may contain a candidates array")
     p.add_argument("--output", required=True, help="output calibration JSON path")
+    p.add_argument("--reliability-output", default=None, help="optional reliability diagram PNG path")
     p.add_argument("--label-key", required=True, choices=CANDIDATE_LABEL_KEYS, help="candidate-level calibration label; use reaction_window_lt_budget to derive y=1[reaction_window < tau]")
     p.add_argument("--risk-key", default=None, help="override risk probability key; default uses raw risk when validity fusion is enabled")
     p.add_argument("--validity-key", default=None, help="override validity probability key")
@@ -385,10 +475,14 @@ def main() -> None:
         calibration_manifest=args.calibration_manifest,
         test_manifest=args.test_manifest,
         ignore_map_overlap=args.ignore_map_overlap,
+        reliability_output=args.reliability_output,
     )
     summary = {
         "output": args.output,
         "sample_count": payload["sample_count"],
+        "positive_label_rate": payload["positive_label_rate"],
+        "tau_diagnostic_sample_count": payload["tau_diagnostic_sample_count"],
+        "reliability_output": args.reliability_output,
         "temperature": payload["temperature"],
         "bias": payload["bias"],
         "empirical_conservative_upper_slack": payload["conformal_slack"],
