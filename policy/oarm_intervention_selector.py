@@ -6,6 +6,7 @@ KEEP_LOW_RISK = "KEEP_LOW_RISK"
 KEEP_GRAY_NO_RISK_IMPROVEMENT = "KEEP_GRAY_NO_RISK_IMPROVEMENT"
 KEEP_NO_RISK_FEASIBLE_ALTERNATIVE = "KEEP_NO_RISK_FEASIBLE_ALTERNATIVE"
 RERANK_TOP1_UNSAFE = "RERANK_TOP1_UNSAFE"
+RERANK_TOP1_INADMISSIBLE = "RERANK_TOP1_INADMISSIBLE"
 RERANK_MIN_HOLD = "RERANK_MIN_HOLD"
 PROBE_VISIBILITY_GAIN = "PROBE_VISIBILITY_GAIN"
 BRAKE_NO_SAFE_CANDIDATE = "BRAKE_NO_SAFE_CANDIDATE"
@@ -216,13 +217,14 @@ class OARMInterventionSelector:
         cost_limit = None
         if self.config.max_yopo_cost_increase is not None:
             cost_limit = costs[top1_index] + float(self.config.max_yopo_cost_increase)
+        top1_admissible = admissible[top1_index]
         feasible = [
             idx
             for idx, risk in enumerate(risks)
             if idx != top1_index
             and admissible[idx]
             and risk <= risk_threshold
-            and risk <= risk_before - improvement_min
+            and (not top1_admissible or risk <= risk_before - improvement_min)
             and (cost_limit is None or costs[idx] <= cost_limit)
         ]
         if feasible:
@@ -248,7 +250,7 @@ class OARMInterventionSelector:
                 feasible,
                 key=selection_score,
             )
-            reason = RERANK_TOP1_UNSAFE
+            reason = RERANK_TOP1_UNSAFE if top1_admissible else RERANK_TOP1_INADMISSIBLE
             if hold_previous:
                 best = previous
                 reason = RERANK_MIN_HOLD
@@ -258,6 +260,7 @@ class OARMInterventionSelector:
                 {
                     "risk_improvement_min": improvement_min,
                     "risk_improvement": risk_before - risks[best],
+                    "top1_geometry_admissible": top1_admissible,
                     "risk_feasible_count": len(feasible),
                     "top1_yopo_cost": costs[top1_index],
                     "selected_yopo_cost": costs[best],

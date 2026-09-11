@@ -326,6 +326,19 @@ def check_intervention_selector_excludes_top1_rerank():
     assert decision.risk_after <= 0.20
     assert decision.risk_after <= decision.risk_before - 0.02
 
+    geometry_recovery = selector.select(
+        risk_upper_bound=[0.10, 0.12, 0.18],
+        yopo_cost=[0.0, 0.05, 0.10],
+        geometry_admissible=[False, True, True],
+        top1_index=0,
+    )
+    assert geometry_recovery.intervention_type == "RERANK"
+    assert geometry_recovery.intervention_reason == "RERANK_TOP1_INADMISSIBLE"
+    assert geometry_recovery.selected_index == 1
+    assert geometry_recovery.risk_after == 0.12
+    assert geometry_recovery.risk_after > geometry_recovery.risk_before
+    assert geometry_recovery.metadata["top1_geometry_admissible"] is False
+
     no_improvement = selector.select(
         risk_upper_bound=[0.30, 0.29, 0.40],
         yopo_cost=[0.0, -10.0, 0.2],
