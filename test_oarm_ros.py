@@ -886,7 +886,6 @@ class OARMNet:
         intervention = None
         intervention_brake = False
         brake_candidate = None
-        brake_anchor_created = False
         if self.enable_intervention_selector:
             brake_candidate = self.build_and_evaluate_brake_candidate(
                 depth_m,
@@ -905,13 +904,6 @@ class OARMNet:
                 brake_candidate=brake_candidate,
             )
             intervention_brake = intervention is not None and intervention.intervention_type == "BRAKE"
-            if intervention_brake and self.brake_latch.active and self.brake_latch_anchor_w is None:
-                if brake_candidate is not None:
-                    self.brake_latch_anchor_w = np.asarray(
-                        brake_candidate["command"].end_pos, dtype=np.float32
-                    ).copy()
-                    self.brake_latch_anchor_time_s = time.time()
-                    brake_anchor_created = True
         else:
             self.last_brake_candidate_info = None
             self.last_brake_command = None
@@ -936,11 +928,17 @@ class OARMNet:
                         brake_command, start_pos, start_vel, start_acc, _brake_generation_ms = brake_bundle
                     else:
                         brake_command, start_pos, start_vel, start_acc, brake_generation_latency_ms = self.build_constrained_brake_command()
-                if self.brake_latch.active and self.brake_latch_anchor_w is None:
+                stationary_latch = bool(
+                    self.brake_latch.active
+                    and self.brake_probe_stationary_start_s is not None
+                    and self.brake_latch_anchor_w is not None
+                )
+                if self.brake_latch.active and not stationary_latch:
+                    # Keep braking from the latest measured state. Reusing the
+                    # first predicted stop point can command a backwards return.
                     self.brake_latch_anchor_w = np.asarray(brake_command.end_pos, dtype=np.float32).copy()
                     self.brake_latch_anchor_time_s = time.time()
-                    brake_anchor_created = True
-                if self.brake_latch.active and self.brake_latch_anchor_w is not None and not brake_anchor_created:
+                if stationary_latch:
                     selected_time = max(float(self.depth_emergency_traj_time), 0.3)
                     end_pos = np.asarray(self.brake_latch_anchor_w, dtype=np.float32).copy()
                     end_vel = np.zeros(3, dtype=np.float32)
@@ -1784,7 +1782,10 @@ class OARMNet:
             if self.brake_probe_stationary_start_s is None:
                 self.brake_probe_stationary_start_s = now_s
                 try:
-                    self.brake_probe_yaw_center = float(self.get_odom_state()[2])
+                    stationary_pos, _stationary_vel, stationary_yaw = self.get_odom_state()
+                    self.brake_latch_anchor_w = np.asarray(stationary_pos, dtype=np.float32).copy()
+                    self.brake_latch_anchor_time_s = now_s
+                    self.brake_probe_yaw_center = float(stationary_yaw)
                 except Exception:
                     self.brake_probe_yaw_center = float(self.last_yaw)
         else:
